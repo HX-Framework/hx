@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "hx-ui",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["--cwd", "ui", "dev"],
+      "port": 5199
+    }
+  ]
+}

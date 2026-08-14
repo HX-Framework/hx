@@ -1,0 +1,9 @@
+# OSV-Scanner configuration — documented, time-boxed dependency exceptions.
+# Every entry is a security decision with an owner and an expiry; when
+# ignoreUntil passes, the finding resurfaces in CI and must be re-triaged.
+# See the HX OSS Readiness Plan §1.3 (documented exception per CVE).
+#
+# hx ships zero production dependencies and a small dev toolchain, so there are
+# no active exceptions today. Add an [[IgnoredVulns]] block here — with an id,
+# an ignoreUntil review date, and a reason justifying non-reachability — only
+# when OSV-Scanner flags an advisory that is genuinely not exploitable here.

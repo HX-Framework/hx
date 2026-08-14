@@ -1,0 +1,40 @@
+# Continuous dependency hygiene (HX OSS Readiness Plan, Part 4.5 / §2.3).
+# The bun ecosystem tracks package.json AND updates bun.lock; a separate updater
+# keeps GitHub Actions current.
+#
+# NB: must be "bun", not "npm" — the npm ecosystem does not understand bun.lock,
+# so it bumps package.json but leaves the lockfile stale and every dep PR then
+# fails `bun install --frozen-lockfile`. Dependabot GA'd native bun support
+# (updates bun.lock) in Feb 2025.
+#
+# cooldown holds back updates for a few days after a release so a freshly
+# published (and possibly compromised) version isn't proposed the moment it
+# lands — a small supply-chain safeguard.
+#
+# groups batch coupled dependencies into a single PR. hx ships zero production
+# dependencies, so the only groups needed are dev-dependencies (one tidy tooling
+# PR) and all github-actions together — the latter keeps github/codeql-action
+# init and analyze on the same version (a lone init bump fails the CodeQL run).
+# There is no docker ecosystem: hx builds standalone binaries, not an image.
+version: 2
+updates:
+  - package-ecosystem: "bun" # updates package.json + bun.lock together
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      dev-dependencies: # tooling bumps in one tidy PR
+        dependency-type: "development"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions: # bump every action together (keeps codeql init/analyze in sync)
+        patterns:
+          - "*"

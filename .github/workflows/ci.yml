@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Typecheck, lint, and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # ui/ is its own package: install pinned deps, build (which typechecks it
+      # via `tsc -b`), then generate the embed manifest so the root typecheck
+      # below also covers src/ui-assets.gen.ts exactly as a release build sees it.
+      - name: Build web UI
+        run: |
+          cd ui
+          bun install --frozen-lockfile
+          bun run build
+          cd ..
+          bun run gen:ui
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Blocking lint = style + security rules (eslint-plugin-security).
+      # See eslint.config.js and the OSS Readiness Plan, Part 4.3.
+      - name: Lint (incl. security rules)
+        run: bun run lint
+
+      - name: Test
+        run: bun test
+
+  # Windows runs as a SEPARATE job, not a matrix leg of the one above.
+  #
+  # The repo ruleset requires a status check named exactly "Typecheck, lint, and
+  # test". A matrix renames the context to "... (ubuntu-latest)", so the required
+  # check would never report again and every PR — not just this one — would block
+  # forever. A separate job keeps that contract intact and makes Windows additive:
+  # promote it into the ruleset whenever the team wants it blocking.
+  #
+  # Why have it at all: the platform-dependent logic takes `platform` as a
+  # defaulted parameter (pathnorm, windowsServiceBinary, ccdAppDir,
+  # browserCommandFor), so win32 semantics are already covered from Linux. This
+  # catches what that cannot — real path handling, real fs behavior, a real Bun.
+  windows:
+    name: Test (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build web UI
+        shell: bash
+        run: |
+          cd ui
+          bun install --frozen-lockfile
+          bun run build
+          cd ..
+          bun run gen:ui
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Lint stays on the Linux job only: the rules are platform-independent and
+      # running eslint twice buys nothing.
+      - name: Test
+        run: bun test
