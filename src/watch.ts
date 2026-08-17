@@ -20,9 +20,11 @@ import {
   type DiscoveredChildFile,
   type DiscoveredFile,
   type DiscoveredWorkflowRun,
+  STAT_CONCURRENCY,
   discoverClaudeChildren,
   discoverClaudeFiles,
   discoverCodexFiles,
+  mapPool,
   readHead,
 } from "./sources.js";
 import {
@@ -61,6 +63,8 @@ import {
   stampEffectiveRoots,
   touchMtime,
   upsertFileState,
+  getChunkCap,
+  setChunkCap,
   clearDestinationUploadError,
   recordDestinationUploadError,
   clearGenericBackoffs,
@@ -70,6 +74,7 @@ import {
   hasDirtyState,
 } from "./state.js";
 import { catalogFor } from "./catalog.js";
+import { ByteSemaphore, runPool } from "./upload-scheduler.js";
 import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
@@ -130,10 +135,28 @@ const FILE_RETRY_BASE_MS = 30_000;
 // genuine outage stops burning round trips. This is the "a few quick retries,
 // then back off" the skip path wants, using the existing exponential.
 const SESSION_SKIP_RETRY_BASE_MS = 20_000;
-// How many chunk rounds ONE file may drain within a single pass (x 4 MB chunk
-// limit = up to 64 MB per destination per pass). Enough that a big backlog
-// moves at line speed, capped so one huge file can't starve the rest.
-const DRAIN_ROUNDS_PER_PASS = 16;
+// How many bytes ONE file may drain per DESTINATION within a single pass —
+// numerically today's historical cap (16 rounds × 4 MB). A byte budget rather
+// than a round count so adaptive chunk growth changes the round COUNT, never
+// the pass pacing or the starvation guarantee; whatever is left continues
+// next pass. There is deliberately no global per-pass total: a 200-file
+// backlog still moves up to 200 × this per pass.
+const PASS_BYTE_BUDGET = 64 * 1024 * 1024;
+// Upload parallelism (LETAIR-144 WS3): files in flight concurrently, each
+// file's rounds strictly sequential (offset dependency) and its destinations
+// sequential within a round (partial-failure abort semantics preserved).
+// Overridable via settings `tuning.uploadConcurrency` / `tuning.childConcurrency`
+// (re-read per tick; 1 restores the historical strictly-sequential pass).
+const FILE_CONCURRENCY_DEFAULT = 4;
+const CHILD_CONCURRENCY_DEFAULT = 4;
+// Adaptive chunk growth (DARK by default — enable via tuning.chunkGrowth after
+// the live prod probe): cloud-lane (vaultOrgId === null, non-fortress) chunks
+// double per clean round from DEFAULT_CHUNK_LIMIT up to this, clamped by the
+// destination's learned cap (state.chunkCaps). Fortress-direct stays pinned at
+// DEFAULT_CHUNK_LIMIT.
+const MAX_GROWN_CHUNK = 32 * 1024 * 1024;
+// Process-global in-flight chunk-buffer budget, shared across tee lanes (M8).
+const uploadBytesSemaphore = new ByteSemaphore(64 * 1024 * 1024);
 // How often the daemon announces liveness when idle. Uploads already refresh
 // lastSeenAt, so a beat only fires when nothing has contacted the gateway for
 // this long — keeping idle traffic to ~1 tiny request/minute. The gateway's
@@ -249,10 +272,15 @@ function describeSkip(reason: FileSkipReason): string {
 export interface WatchOptions {
   /** Limit to a single file (debugging). */
   only?: string;
-  /** Maximum bytes per chunk. Splits a huge backlog into multiple commits. */
+  /** Maximum bytes per chunk. Splits a huge backlog into multiple commits.
+   *  An ABSOLUTE override: adaptive growth never exceeds it. */
   chunkLimitBytes?: number;
   /** Run once and exit (smoke test). */
   oneShot?: boolean;
+  /** Adaptive chunk growth (tuning.chunkGrowth) — dark by default; resolved
+   *  per tick in tickOnce and threaded here so ingestOne needs no settings
+   *  read of its own. */
+  chunkGrowth?: boolean;
 }
 
 const DEFAULT_CHUNK_LIMIT = 4 * 1024 * 1024;
@@ -261,6 +289,15 @@ const DEFAULT_CHUNK_LIMIT = 4 * 1024 * 1024;
 // The `--local` tee runs the same pipeline against the local dev gateway with
 // its own offsets, so the per-gateway latches below are also keyed by scope.
 const scopeOf = (cfg: HxConfig): StateScope => cfg.stateScope ?? "main";
+
+/** Integer tuning knob with a sane clamp (1..16); anything absent or
+ *  mistyped reads as the default — settings must never brick the daemon. */
+function tuningInt(settings: HxSettings, key: string, fallback: number): number {
+  const v = tuningValue(settings, key);
+  return typeof v === "number" && Number.isFinite(v) && v >= 1
+    ? Math.min(16, Math.floor(v))
+    : fallback;
+}
 
 // Per-repo route cache, keyed by config scope so the `--local` tee and the main
 // lane never share a Fortress token. Lives for the daemon's lifetime; resolveRoute
@@ -281,12 +318,29 @@ function routeCacheFor(scope: StateScope): Map<string, Route> {
   return cache;
 }
 
+// Single-flight per (scope, repo): under the upload pool, N workers hitting
+// the same cold repo must share ONE route-discovery fetch — identical result,
+// no stampede. resolveRoute never rejects (it falls back internally), so a
+// shared promise is safe to hand to every waiter.
+const routeInFlight = new Map<string, Promise<Route>>();
+function resolveRouteShared(
+  scope: StateScope,
+  params: Parameters<typeof resolveRoute>[0],
+): Promise<Route> {
+  const key = `${scope}:${params.repo}`;
+  const inflight = routeInFlight.get(key);
+  if (inflight) return inflight;
+  const p = resolveRoute(params).finally(() => routeInFlight.delete(key));
+  routeInFlight.set(key, p);
+  return p;
+}
+
 async function uploadConfigFor(
   cfg: HxConfig,
   repoSlug: string | null | undefined,
 ): Promise<{ cfg: HxConfig; fortress: boolean; attributedOrgIds?: string[] }> {
   if (!repoSlug || !cfg.accessToken) return { cfg, fortress: false };
-  const route = await resolveRoute({
+  const route = await resolveRouteShared(scopeOf(cfg), {
     repo: repoSlug,
     gatewayBaseUrl: cfg.gatewayBaseUrl,
     accessToken: cfg.accessToken,
@@ -471,7 +525,40 @@ export function uploadErrorCode(err: HxHttpError): string {
   return m ? `${err.status} ${m[1]}` : String(err.status);
 }
 
-async function ingestOne(
+// Adaptive-chunk growth ladder, in-memory per (scope, destination): the next
+// cloud-lane chunk size, doubled after each clean full-size commit up to
+// MAX_GROWN_CHUNK and the destination's learned cap. DARK unless
+// tuning.chunkGrowth is true; fortress-direct and vault destinations stay at
+// the base size unconditionally.
+const grownChunk = new Map<string, number>();
+const chunkCapLogged = new Set<string>();
+
+/** Test seam — forget the in-memory growth ladder and cap-log dedupe. */
+export function resetChunkGrowthForTests(): void {
+  grownChunk.clear();
+  chunkCapLogged.clear();
+}
+
+async function chunkSizeFor(
+  vaultOrgId: string | null,
+  fortress: boolean,
+  opts: WatchOptions,
+  scope: StateScope,
+): Promise<number> {
+  const base = opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT;
+  if (opts.chunkGrowth !== true || fortress || vaultOrgId !== null) return base;
+  const dk = destKey(vaultOrgId);
+  const learned = await getChunkCap(dk, scope);
+  const grown = grownChunk.get(`${scope}:${dk}`) ?? DEFAULT_CHUNK_LIMIT;
+  // An explicitly-passed chunkLimitBytes is an ABSOLUTE override — growth
+  // never exceeds it, even when it equals the default.
+  const hardCap = opts.chunkLimitBytes !== undefined ? opts.chunkLimitBytes : Infinity;
+  return Math.min(grown, learned ?? Infinity, MAX_GROWN_CHUNK, hardCap);
+}
+
+/** Exported for the drain tests (budget pacing, growth ladder, probe
+ *  cleanliness) — production callers stay inside this module. */
+export async function ingestOne(
   cfg: HxConfig,
   file: DiscoveredFile,
   opts: WatchOptions,
@@ -548,15 +635,22 @@ async function ingestOne(
   // Drain rounds: a backlogged file uploads chunk after chunk within ONE pass
   // (fresh signed URLs each round) instead of one chunk per 1.5 s poll — the
   // old pacing capped any session at ~2.7 MB/s regardless of bandwidth. The
-  // per-pass cap keeps one huge file from starving the rest of the backlog;
+  // per-(file, destination) BYTE budget keeps one huge file from starving the
+  // rest of the backlog (historically 16 rounds × 4 MB — the same 64 MB);
   // whatever is left continues next pass.
   //
   // Wrap the whole drain: any error that means THIS session's store is
   // unavailable (a direct-route store's 5xx/network failure, or the gateway's
   // vault_offline) is re-thrown as SessionUpstreamUnavailable so tickOnce skips
   // just this file and keeps the pass going. Everything else propagates as-is.
+  const sentByDest = new Map<string, number>();
+  // Parse dedupe (fixes C5): fan-out steps at the SAME offset re-read the
+  // same byte range — the JSON.parse of every line must run once, not once
+  // per destination. Keyed (stepOffset, want): same range ⇒ same trim ⇒ same
+  // bytes, even if the file grew meanwhile (endOffset was fixed by the trim).
+  const sliceSummaries = new Map<string, { endOffset: number; text: string; summary: ReturnType<typeof summariseChunk> }>();
   try {
-  for (let round = 0; round < DRAIN_ROUNDS_PER_PASS; round++) {
+  for (let round = 0; round < 1024; round++) {
     // Get signed staging URLs for EVERY store this repo fans out to. repoSlug lets
     // the gateway attribute + resolve the destination set; each is echoed back as
     // its own vaultOrgId so commit replays it into the same store. A gateway that
@@ -599,7 +693,9 @@ async function ingestOne(
     }
 
     const steps = planFanout(append, fState).filter(
-      (step) => !unavailableDests.has(destKey(step.vaultOrgId)),
+      (step) =>
+        !unavailableDests.has(destKey(step.vaultOrgId)) &&
+        (sentByDest.get(destKey(step.vaultOrgId)) ?? 0) < PASS_BYTE_BUDGET,
     );
 
     let roundProgress = false;
@@ -608,34 +704,82 @@ async function ingestOne(
       // previously-offline vault back-fills from zero (replace) while the others
       // append, so one store's lag never blocks another.
       const stepOffset = offsetFor(fState, step.vaultOrgId);
-      const want = Math.min(st.size - stepOffset, opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT);
+      const chunkSize = await chunkSizeFor(step.vaultOrgId, route.fortress, opts, scope);
+      const want = Math.min(st.size - stepOffset, chunkSize);
       if (want <= 0) continue;
+      // Chunk buffers ride the process-global byte budget (M8): admission caps
+      // concurrent RSS across pooled files and both tee lanes.
+      const release = await uploadBytesSemaphore.acquire(want);
+      let trimmed: Buffer;
+      let endOffset: number;
+      try {
       const slice = await readSlice(file.path, stepOffset, want);
-      const { trimmed, endOffset } = trimAtLastNewline(slice, stepOffset);
+      ({ trimmed, endOffset } = trimAtLastNewline(slice, stepOffset));
       if (trimmed.length === 0) continue;
-      const text = trimmed.toString("utf8");
-      const summary = summariseChunk(text);
-      let title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
-      let titleSource: "user" | "ai" | "fallback" | undefined;
-      if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
-      else if (summary.title) titleSource = summary.titleSource ?? undefined;
-      else if (head.title) titleSource = "ai";
-      // No user/AI title anywhere — synthesize a readable label so the session
-      // shows something meaningful instead of a bare id downstream. Only on a
-      // from-zero upload: a later appended chunk must not overwrite it with a
-      // mid-conversation message. Stamped "fallback" so the provenance stays
-      // honest.
-      if (!title && stepOffset === 0) {
-        const derived = deriveFallbackTitle(summary.firstUserText, head.cwd, head.repoSlug);
-        if (derived) {
-          title = derived;
-          titleSource = "fallback";
-        }
+      const cacheKey = `${stepOffset}:${want}`;
+      let parsed = sliceSummaries.get(cacheKey);
+      if (!parsed || parsed.endOffset !== endOffset) {
+        const freshText = trimmed.toString("utf8");
+        parsed = { endOffset, text: freshText, summary: summariseChunk(freshText) };
+        sliceSummaries.set(cacheKey, parsed);
       }
+      let text = parsed.text;
+      let summary = parsed.summary;
+      // Title/meta derivation runs where `summary` is FINAL for this commit —
+      // the growth probe below can shrink the chunk, replacing text+summary,
+      // so the derivation lives in a helper called after the PUT settles.
+      const deriveTitleMeta = (): { title: string | undefined; titleSource: "user" | "ai" | "fallback" | undefined } => {
+        let title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
+        let titleSource: "user" | "ai" | "fallback" | undefined;
+        if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
+        else if (summary.title) titleSource = summary.titleSource ?? undefined;
+        else if (head.title) titleSource = "ai";
+        // No user/AI title anywhere — synthesize a readable label so the session
+        // shows something meaningful instead of a bare id downstream. Only on a
+        // from-zero upload: a later appended chunk must not overwrite it with a
+        // mid-conversation message. Stamped "fallback" so the provenance stays
+        // honest.
+        if (!title && stepOffset === 0) {
+          const derived = deriveFallbackTitle(summary.firstUserText, head.cwd, head.repoSlug);
+          if (derived) {
+            title = derived;
+            titleSource = "fallback";
+          }
+        }
+        return { title, titleSource };
+      };
 
       try {
         // Upload bytes directly to this destination's store, then compose.
-        await putChunk(step.uploadUrl, trimmed);
+        // Growth probe (dark unless tuning.chunkGrowth): a failure at a GROWN
+        // size retries this same step in place at the base size — no throw,
+        // no destination-error latch, no file backoff, no [error] line. The
+        // learned cap persists (state.chunkCaps) so restarts never re-probe;
+        // only a failure at the base size takes the normal error path.
+        const baseChunk = Math.min(opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT, DEFAULT_CHUNK_LIMIT);
+        try {
+          await putChunk(step.uploadUrl, trimmed);
+        } catch (growErr) {
+          if (!(opts.chunkGrowth === true) || chunkSize <= baseChunk) throw growErr;
+          const dk = destKey(step.vaultOrgId);
+          const shrunkWant = Math.min(st.size - stepOffset, baseChunk);
+          const shrunkSlice = await readSlice(file.path, stepOffset, shrunkWant);
+          const shrunk = trimAtLastNewline(shrunkSlice, stepOffset);
+          if (shrunk.trimmed.length === 0) throw growErr;
+          await putChunk(step.uploadUrl, shrunk.trimmed);
+          trimmed = shrunk.trimmed;
+          endOffset = shrunk.endOffset;
+          text = trimmed.toString("utf8");
+          summary = summariseChunk(text);
+          sliceSummaries.set(`${stepOffset}:${shrunkWant}`, { endOffset, text, summary });
+          await setChunkCap(dk, baseChunk, scope);
+          grownChunk.set(`${scope}:${dk}`, baseChunk);
+          if (!chunkCapLogged.has(dk)) {
+            chunkCapLogged.add(dk);
+            log(`[hx] chunk size settled at ${Math.round(baseChunk / (1024 * 1024))} MB for ${dk}`);
+          }
+        }
+        const { title, titleSource } = deriveTitleMeta();
         const commit = await commitChunk(uploadCfg, {
           family: fState.family as never,
           sessionId: fState.sessionId,
@@ -715,6 +859,26 @@ async function ingestOne(
         await clearDestinationUploadError(destKey(step.vaultOrgId), scope);
         anyProgress = true;
         roundProgress = true;
+        {
+          const dk = destKey(step.vaultOrgId);
+          sentByDest.set(dk, (sentByDest.get(dk) ?? 0) + trimmed.length);
+          // Growth ladder: a clean commit of a FULL-SIZE chunk (not the file
+          // tail) doubles the next cloud-lane chunk, up to the max and any
+          // learned cap. Dark unless tuning.chunkGrowth.
+          if (
+            opts.chunkGrowth === true &&
+            !route.fortress &&
+            step.vaultOrgId === null &&
+            want === chunkSize &&
+            trimmed.length === want
+          ) {
+            const learned = await getChunkCap(dk, scope);
+            const next = Math.min(chunkSize * 2, MAX_GROWN_CHUNK, learned ?? Infinity);
+            if (next > (grownChunk.get(`${scope}:${dk}`) ?? DEFAULT_CHUNK_LIMIT)) {
+              grownChunk.set(`${scope}:${dk}`, next);
+            }
+          }
+        }
         log(
           `  ${path.relative(homedir(), file.path)} (+${trimmed.length}B → ${step.vaultOrgId ?? "let.ai"}, ${fState.family}, ${fState.sessionId.slice(0, 8)}…)`,
         );
@@ -752,16 +916,21 @@ async function ingestOne(
         }
         throw err;
       }
+      } finally {
+        release();
+      }
     }
 
     if (!roundProgress) break;
-    // Caught up on every reachable destination? Then this pass is done. A
-    // diverged/healing destination (offset reset to 0) simply drains in the
-    // remaining rounds like any other backlog.
+    // Caught up on every reachable destination — or out of this pass's byte
+    // budget for all of them? Then this pass is done. A diverged/healing
+    // destination (offset reset to 0) simply drains in the remaining rounds
+    // like any other backlog; whatever the budget leaves continues next pass.
     const remaining = steps.some(
       (step) =>
         !unavailableDests.has(destKey(step.vaultOrgId)) &&
-        offsetFor(fState, step.vaultOrgId) < st.size,
+        offsetFor(fState, step.vaultOrgId) < st.size &&
+        (sentByDest.get(destKey(step.vaultOrgId)) ?? 0) < PASS_BYTE_BUDGET,
     );
     if (!remaining) break;
   }
@@ -1838,17 +2007,42 @@ export async function tickOnce(
       log(`[hx] backfill sweep skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  // Seed-then-elect (R5): every file with no state entry is seeded BEFORE
+  // election, so unseeded twins collapse to one winner before any pooled
+  // worker starts — two stateless copies of one session uploading in
+  // parallel would interleave replace/append writes into one canonical,
+  // permanently on vault/fortress lanes (no divergence heal there). This is
+  // the same lazy seeding ingestOne always did per file, done up front. An
+  // unreadable head is left for ingestOne's own error taxonomy — its twin,
+  // if readable, is seeded and wins the election regardless.
+  {
+    const unseeded = files.filter((f) => !state.files[f.path]);
+    if (unseeded.length > 0) {
+      await mapPool(unseeded, STAT_CONCURRENCY, async (f) => {
+        await ensureFileState(f, scope).catch(() => {});
+      });
+    }
+  }
   files = filterWatched(electUploaders(files, state, log), state, settings);
   onProgress?.(snapshotFrom(files, state));
 
+  // Adaptive chunk growth is resolved once per pass and threaded via opts —
+  // dark unless tuning.chunkGrowth is exactly true.
+  const effOpts: WatchOptions =
+    tuningValue(settings, "chunkGrowth") === true ? { ...opts, chunkGrowth: true } : opts;
+  const fileConcurrency = tuningInt(settings, "uploadConcurrency", FILE_CONCURRENCY_DEFAULT);
+  const childConcurrency = tuningInt(settings, "childConcurrency", CHILD_CONCURRENCY_DEFAULT);
+
   let uploaded = 0;
   let failed = 0;
+  let completed = 0;
   // Distinct files that hit a gateway-shaped 5xx this pass — see the
   // serverUnavailable branch below: one file's unrecognized 5xx must not be
-  // read as a wholesale outage.
+  // read as a wholesale outage. Shared across pooled workers; latching stops
+  // DEQUEUEING while in-flight workers settle (≤ concurrency−1 extra, M4).
   const gatewayUnavailableFiles = new Set<string>();
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i]!;
+  let stopPass = false;
+  const processParent = async (f: DiscoveredFile): Promise<void> => {
     // Per-file backoff: a file that keeps failing (bad request, offline vault)
     // sits out its window instead of burning a gateway round trip every poll.
     const pending = state.files[f.path];
@@ -1859,7 +2053,7 @@ export async function tickOnce(
         `waiting out a retry backoff for another ${mins} min (${pending.consecutiveFailures ?? 0} consecutive failures${pending.skipReason ? `, ${pending.skipReason}` : ""})`,
         log,
       );
-      continue;
+      return;
     }
     // A file seen for the first time has no state entry for filterWatched to
     // match — seed it now and re-check before any byte leaves the machine.
@@ -1874,7 +2068,7 @@ export async function tickOnce(
         seeded.attributed === undefined &&
         cfg.accessToken
       ) {
-        const r = await resolveRoute({
+        const r = await resolveRouteShared(scope, {
           repo: seeded.repoSlug,
           gatewayBaseUrl: cfg.gatewayBaseUrl,
           accessToken: cfg.accessToken,
@@ -1893,7 +2087,7 @@ export async function tickOnce(
           `excluded by settings — personalSync=${settings.personalSync}, repoSlug=${seeded.repoSlug ?? "null"}, attributed=${seeded.attributed}`,
           log,
         );
-        continue;
+        return;
       }
     }
     // Server-side permanent delete: terminal per-session stop — no request, no
@@ -1903,11 +2097,11 @@ export async function tickOnce(
       const entry = state.files[f.path];
       if (entry && isDeletedSession(state, entry.family, entry.sessionId)) {
         logStuck(f.path, "session was permanently deleted on the server — it will never upload again", log);
-        continue;
+        return;
       }
     }
     try {
-      const did = await ingestOne(cfg, f, opts, log);
+      const did = await ingestOne(cfg, f, effOpts, log);
       if (did) uploaded += 1;
       else if (pending && pending.lastKnownSize !== undefined && minOffset(pending) < f.size) {
         // Asked the gateway, got a plan, and it produced no committable bytes —
@@ -1944,7 +2138,7 @@ export async function tickOnce(
           err.blocker,
         );
         log(`  [hx] ${describeSkip(err.reason)}; retrying ${path.basename(f.path)} in ${Math.round(delay / 1000)}s`);
-        continue;
+        return;
       }
       if (err instanceof HxHttpError && err.sessionDeleted) {
         // Permanent server-side delete (410 tombstone): record the terminal
@@ -1958,7 +2152,7 @@ export async function tickOnce(
             `  [hx] ${entry.sessionId.slice(0, 8)}… permanently deleted on the server — uploads stopped (local file kept)`,
           );
         }
-        continue;
+        return;
       }
       if (err instanceof HxHttpError && err.serverUnavailable) {
         // A wholesale gateway outage and a per-session 5xx this client does not
@@ -1974,7 +2168,10 @@ export async function tickOnce(
           log(
             `  [hx] gateway unavailable (${err.status}) on ${gatewayUnavailableFiles.size} files; pausing this pass`,
           );
-          break;
+          // Stop DEQUEUEING; already-launched workers settle (M4's ≤
+          // concurrency−1 bound) — the sequential loop's `break`, pooled.
+          stopPass = true;
+          return;
         }
         // Fixed bench, NOT recordFileFailure: the probe is not this file's
         // fault, so it must not accrue a compounding (and restart-surviving)
@@ -1982,16 +2179,25 @@ export async function tickOnce(
         // quietly replace the 5-min pass backoff with a 30-min bench.
         await benchFileProbe(f.path, FILE_RETRY_BASE_MS, scope);
         log(`  [hx] 5xx (${err.status}) on one file; probing another before pausing the pass`);
-        continue;
+        return;
       }
       // A genuine per-file fault (4xx, parse error, a doomed sidecar): back it
       // off so it doesn't burn a gateway round trip every poll.
       await recordFileFailure(f.path, FILE_RETRY_BASE_MS, scope);
     }
-    if (onProgress && (i + 1) % SYNC_PROGRESS_EVERY === 0) {
-      onProgress(snapshotFrom(files, state));
-    }
-  }
+  };
+  await runPool(
+    files,
+    fileConcurrency,
+    async (f) => {
+      await processParent(f);
+      completed += 1;
+      if (onProgress && completed % SYNC_PROGRESS_EVERY === 0) {
+        onProgress(snapshotFrom(files, state));
+      }
+    },
+    () => stopPass,
+  );
 
   // Child lanes + workflow sidecars (Claude only; Codex has no equivalent).
   // Runs after the parent pass so a brand-new session's parent commit lands
@@ -2029,7 +2235,8 @@ export async function tickOnce(
         state.childUploaders = lanePlan.nextMap;
         await persistState(scope);
       }
-      for (const c of electedChildren) {
+      let stopChildren = false;
+      const processChild = async (c: DiscoveredChildFile): Promise<void> => {
         let pendingChild = state.files[c.path];
         if (pendingChild) {
           const reconciled = reconcileChildParent(
@@ -2041,13 +2248,13 @@ export async function tickOnce(
             await upsertFileState(reconciled, scope);
           }
         }
-        if (pendingChild?.nextAttemptAtMs && pendingChild.nextAttemptAtMs > Date.now()) continue;
+        if (pendingChild?.nextAttemptAtMs && pendingChild.nextAttemptAtMs > Date.now()) return;
         // A deleted parent blocks every child lane (the stop-flag matches the
         // bare sessionId, so a stale child family can't slip past it either).
         if (
           isDeletedSession(state, pendingChild?.family ?? "", pendingChild?.sessionId ?? c.parentSessionId)
         ) {
-          continue;
+          return;
         }
         try {
           const did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
@@ -2067,7 +2274,7 @@ export async function tickOnce(
             const family = pendingChild?.family ?? "claude-cli";
             await recordDeletedSession(family, pendingChild?.sessionId ?? c.parentSessionId, scope);
             await clearFileFailure(c.path, scope);
-            continue;
+            return;
           }
           if (err instanceof HxHttpError && err.vaultOffline) {
             // The child's session vault is offline (child lanes route through the
@@ -2080,16 +2287,24 @@ export async function tickOnce(
               err.vaultBlockReason ?? "vault_offline",
               err.blocker,
             );
-            continue;
+            return;
           }
           // A wholesale lane pause (404/401/403) or gateway-wide outage is not
           // this child's fault — don't give it a per-file backoff that would
-          // make it lag once the gateway recovers.
-          if (latchChildLanePause(err, scope, log)) break;
-          if (err instanceof HxHttpError && err.serverUnavailable) break;
+          // make it lag once the gateway recovers. Stop DEQUEUEING; in-flight
+          // children settle (M4's child half: ≤ concurrency−1 extra POSTs).
+          if (latchChildLanePause(err, scope, log)) {
+            stopChildren = true;
+            return;
+          }
+          if (err instanceof HxHttpError && err.serverUnavailable) {
+            stopChildren = true;
+            return;
+          }
           await recordFileFailure(c.path, FILE_RETRY_BASE_MS, scope);
         }
-      }
+      };
+      await runPool(electedChildren, childConcurrency, processChild, () => stopChildren);
       for (const r of runs) {
         try {
           await syncWorkflowRun(cfg, r, parentByArtifactSession, log);

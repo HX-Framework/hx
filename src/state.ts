@@ -382,6 +382,12 @@ export interface HxState {
    *  and falls back to its own resolution when the stamp is absent (daemon
    *  not yet upgraded / never ran). Additive; older binaries ignore it. */
   effectiveRoots?: EffectiveRootsStamp;
+  /** Learned per-destination chunk-size caps (bytes), keyed by {@link destKey}
+   *  — written by the adaptive-chunk probe when a destination's PUT path
+   *  rejects a grown size, so restarts never re-probe. Additive; older
+   *  binaries round-trip it untouched (loadState keeps unknown top-level
+   *  keys and persist rewrites the whole object). */
+  chunkCaps?: Record<string, number>;
   /** Last elected uploader path per child lane (`parent:agent:runId`). Child
    *  election is stateless (newest mtime wins); when a lane's winner FLIPS
    *  (a copied tree raced the live file), the new winner must re-upload from
@@ -1017,6 +1023,28 @@ export function isDeletedSession(
   const suffix = `:${sessionId}`;
   for (const k of Object.keys(map)) if (k.endsWith(suffix)) return true;
   return false;
+}
+
+/** Learned chunk cap for one destination, if any (see HxState.chunkCaps). */
+export async function getChunkCap(
+  key: string,
+  scope: StateScope = "main",
+): Promise<number | undefined> {
+  const state = await loadState(scope);
+  return state.chunkCaps?.[key];
+}
+
+/** Persist a learned chunk cap. Coalesce-eligible: a cap lost to a hard kill
+ *  merely re-probes once, and the probe is side-effect-free by design. */
+export async function setChunkCap(
+  key: string,
+  capBytes: number,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  if (!state.chunkCaps) state.chunkCaps = {};
+  state.chunkCaps[key] = capBytes;
+  await persistOrMark(state, scope);
 }
 
 export async function getArtifactHash(
