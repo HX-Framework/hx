@@ -30,7 +30,7 @@ import {
   type ResolvedRoots,
 } from "./roots.js";
 
-const RECENT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+export const RECENT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 // Bounded fan-out for the discovery stat() storm. The watch loop sweeps these
 // dirs every FAST_POLL_MS (1.5s); statting ~100k recent files one-await-at-a-
@@ -38,14 +38,14 @@ const RECENT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 // burned a full core sweeping back-to-back. Batching to a bounded pool brings a
 // sweep back under a second. Bounded (not an unbounded Promise.all over every
 // path) so a pathological dir can't open tens of thousands of FDs at once.
-const STAT_CONCURRENCY = 64;
+export const STAT_CONCURRENCY = 64;
 
 /**
  * Run `fn` over `items` with at most `limit` in flight at a time. Results are
  * collected by side effect inside `fn` (callers push into a shared array), so
  * the return is void; ordering is not preserved.
  */
-async function mapPool<T>(
+export async function mapPool<T>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<void>,
@@ -170,7 +170,7 @@ export interface DiscoveredWorkflowRun {
 const AGENT_FILE_RE = /^agent-([a-zA-Z0-9_-]+)\.jsonl$/;
 const SCRIPT_FILE_RE = /^(.+)-(wf_[a-zA-Z0-9-]+)\.js$/;
 
-async function statSafe(p: string): Promise<{ size: number; mtimeMs: number; isDir: boolean } | null> {
+export async function statSafe(p: string): Promise<{ size: number; mtimeMs: number; isDir: boolean } | null> {
   try {
     const st = await stat(p);
     return { size: st.size, mtimeMs: st.mtimeMs, isDir: st.isDirectory() };
@@ -179,7 +179,7 @@ async function statSafe(p: string): Promise<{ size: number; mtimeMs: number; isD
   }
 }
 
-async function readdirSafe(p: string): Promise<string[]> {
+export async function readdirSafe(p: string): Promise<string[]> {
   try {
     return await readdir(p);
   } catch {
@@ -240,83 +240,100 @@ export async function discoverClaudeChildren(roots: DataRoot[]): Promise<{
       const sessionDir = path.join(projectDir, entry);
       const sst = await statSafe(sessionDir);
       if (!sst?.isDir) continue;
-      const sessionId = entry;
-
-      // Interactive subagents.
-      const subagentsDir = path.join(sessionDir, "subagents");
-      await collectAgentFiles(subagentsDir, sessionId, null, now, root.configDir, children);
-
-      // Workflow runs: per-run agent transcripts + journal.
-      const wfRoot = path.join(subagentsDir, "workflows");
-      for (const runId of await readdirSafe(wfRoot)) {
-        const runDir = path.join(wfRoot, runId);
-        const rst = await statSafe(runDir);
-        if (!rst?.isDir) continue;
-        await collectAgentFiles(runDir, sessionId, runId, now, root.configDir, children);
-        const journalPath = path.join(runDir, "journal.jsonl");
-        const jst = await statSafe(journalPath);
-        // One session can appear under SEVERAL project dirs (the cwd changed
-        // mid-session — e.g. into a worktree) — and, with multiple data roots,
-        // under several ROOTS — splitting a run's artifacts: journal under one
-        // project dir, script under another. Merge into any entry the script
-        // scan already created instead of pushing a twin — two entries share
-        // the upload key (sessionId+runId) and alternating content hashes
-        // re-upload the sidecar every pass, forever. `runs` spans all roots,
-        // so the merge covers the cross-root split for free.
-        const existing = runs.find(
-          (r) => r.parentSessionId === sessionId && r.runId === runId,
-        );
-        if (existing) {
-          // Only fill a MISSING journal — don't clobber a journal already found
-          // under another project dir (a run split across dirs can have a
-          // journal in each; keep the first and let mtime track the newest).
-          if (jst && !jst.isDir) {
-            if (!existing.journalPath) existing.journalPath = journalPath;
-            existing.mtimeMs = Math.max(existing.mtimeMs, jst.mtimeMs);
-          }
-          continue;
-        }
-        runs.push({
-          parentSessionId: sessionId,
-          runId,
-          journalPath: jst && !jst.isDir ? journalPath : null,
-          mtimeMs: jst?.mtimeMs ?? rst.mtimeMs,
-          scriptPath: null,
-          scriptName: null,
-        });
-      }
-
-      // Persisted workflow scripts (<name>-<runId>.js) — attach to their run,
-      // or surface as a script-only run if the run dir hasn't appeared yet.
-      const scriptsDir = path.join(sessionDir, "workflows", "scripts");
-      for (const f of await readdirSafe(scriptsDir)) {
-        const m = SCRIPT_FILE_RE.exec(f);
-        if (!m) continue;
-        const scriptPath = path.join(scriptsDir, f);
-        const sstat = await statSafe(scriptPath);
-        if (!sstat || sstat.isDir) continue;
-        const existing = runs.find(
-          (r) => r.parentSessionId === sessionId && r.runId === m[2],
-        );
-        if (existing) {
-          existing.scriptPath = scriptPath;
-          existing.scriptName = m[1]!;
-          existing.mtimeMs = Math.max(existing.mtimeMs, sstat.mtimeMs);
-        } else {
-          runs.push({
-            parentSessionId: sessionId,
-            runId: m[2]!,
-            journalPath: null,
-            mtimeMs: sstat.mtimeMs,
-            scriptPath,
-            scriptName: m[1]!,
-          });
-        }
-      }
+      await scanSessionArtifacts(sessionDir, entry, root.configDir, now, children, runs);
     }
   }
   }
   return { children, runs };
+}
+
+/**
+ * Scan ONE session-artifact directory (`<projectDir>/<sessionId>/`) for child
+ * transcripts + workflow runs, appending into the caller's SHARED arrays —
+ * shared on purpose: the runs merge below matches against everything already
+ * collected, which is what folds a run split across project dirs (or roots)
+ * into one entry. Extracted verbatim from discoverClaudeChildren so the
+ * tiered catalog and the full walk share one implementation.
+ */
+export async function scanSessionArtifacts(
+  sessionDir: string,
+  sessionId: string,
+  rootDir: string,
+  now: number,
+  children: DiscoveredChildFile[],
+  runs: DiscoveredWorkflowRun[],
+): Promise<void> {
+  // Interactive subagents.
+  const subagentsDir = path.join(sessionDir, "subagents");
+  await collectAgentFiles(subagentsDir, sessionId, null, now, rootDir, children);
+
+  // Workflow runs: per-run agent transcripts + journal.
+  const wfRoot = path.join(subagentsDir, "workflows");
+  for (const runId of await readdirSafe(wfRoot)) {
+    const runDir = path.join(wfRoot, runId);
+    const rst = await statSafe(runDir);
+    if (!rst?.isDir) continue;
+    await collectAgentFiles(runDir, sessionId, runId, now, rootDir, children);
+    const journalPath = path.join(runDir, "journal.jsonl");
+    const jst = await statSafe(journalPath);
+    // One session can appear under SEVERAL project dirs (the cwd changed
+    // mid-session — e.g. into a worktree) — and, with multiple data roots,
+    // under several ROOTS — splitting a run's artifacts: journal under one
+    // project dir, script under another. Merge into any entry the script
+    // scan already created instead of pushing a twin — two entries share
+    // the upload key (sessionId+runId) and alternating content hashes
+    // re-upload the sidecar every pass, forever. `runs` spans all roots,
+    // so the merge covers the cross-root split for free.
+    const existing = runs.find(
+      (r) => r.parentSessionId === sessionId && r.runId === runId,
+    );
+    if (existing) {
+      // Only fill a MISSING journal — don't clobber a journal already found
+      // under another project dir (a run split across dirs can have a
+      // journal in each; keep the first and let mtime track the newest).
+      if (jst && !jst.isDir) {
+        if (!existing.journalPath) existing.journalPath = journalPath;
+        existing.mtimeMs = Math.max(existing.mtimeMs, jst.mtimeMs);
+      }
+      continue;
+    }
+    runs.push({
+      parentSessionId: sessionId,
+      runId,
+      journalPath: jst && !jst.isDir ? journalPath : null,
+      mtimeMs: jst?.mtimeMs ?? rst.mtimeMs,
+      scriptPath: null,
+      scriptName: null,
+    });
+  }
+
+  // Persisted workflow scripts (<name>-<runId>.js) — attach to their run,
+  // or surface as a script-only run if the run dir hasn't appeared yet.
+  const scriptsDir = path.join(sessionDir, "workflows", "scripts");
+  for (const f of await readdirSafe(scriptsDir)) {
+    const m = SCRIPT_FILE_RE.exec(f);
+    if (!m) continue;
+    const scriptPath = path.join(scriptsDir, f);
+    const sstat = await statSafe(scriptPath);
+    if (!sstat || sstat.isDir) continue;
+    const existing = runs.find(
+      (r) => r.parentSessionId === sessionId && r.runId === m[2],
+    );
+    if (existing) {
+      existing.scriptPath = scriptPath;
+      existing.scriptName = m[1]!;
+      existing.mtimeMs = Math.max(existing.mtimeMs, sstat.mtimeMs);
+    } else {
+      runs.push({
+        parentSessionId: sessionId,
+        runId: m[2]!,
+        journalPath: null,
+        mtimeMs: sstat.mtimeMs,
+        scriptPath,
+        scriptName: m[1]!,
+      });
+    }
+  }
 }
 
 /** All recent Codex rollout jsonls (sessions + archived) across the roots.

@@ -69,13 +69,14 @@ import {
   flushStateIfDirty,
   hasDirtyState,
 } from "./state.js";
+import { catalogFor } from "./catalog.js";
 import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
 import { buildLedger, type SyncLedger } from "./ledger.js";
 import { backfillDue, discoverBackfill, markBackfillRun } from "./backfill.js";
-import { collapseHome, isPaused, readSettings, shouldSkipFile, type HxSettings } from "./settings.js";
+import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
 import {
@@ -1776,14 +1777,27 @@ export async function tickOnce(
   // one poll interval, no restart.
   const settings = await readSettings();
   const roots = resolveDataRoots(settings);
-  const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(roots.claude),
-    discoverCodexFiles(roots.codex),
-  ]);
-  let files = [...claude, ...codex];
-  if (opts.only) files = files.filter((f) => f.path === opts.only);
-
   const scope = scopeOf(cfg);
+  // Tiered catalog by default; `tuning.sweep: "legacy"` (settings, re-read per
+  // tick so it reaches installed daemons) or HX_SWEEP=legacy (dev shells)
+  // restores the historical full-sweep-per-tick verbatim. A fresh catalog's
+  // first sweep IS a full discovery, so one-shot callers (`hx tick`,
+  // `watch --once`) see identical results either way.
+  const legacySweep =
+    tuningValue(settings, "sweep") === "legacy" || process.env["HX_SWEEP"] === "legacy";
+  const catalog = legacySweep ? null : catalogFor(scope);
+  let files: DiscoveredFile[];
+  if (catalog) {
+    await catalog.sweep(roots, Date.now());
+    files = catalog.listFiles();
+  } else {
+    const [claude, codex] = await Promise.all([
+      discoverClaudeFiles(roots.claude),
+      discoverCodexFiles(roots.codex),
+    ]);
+    files = [...claude, ...codex];
+  }
+  if (opts.only) files = files.filter((f) => f.path === opts.only);
   // Report before uploading anything so a freshly connected device shows its
   // full backlog ("0 / 1,203") immediately, not only after the first pass.
   const state = await loadState(scope);
@@ -1987,7 +2001,9 @@ export async function tickOnce(
   if (!opts.only && Date.now() >= (childEndpointsMissingUntilMs.get(scope) ?? 0)) {
     const parentByArtifactSession = buildChildParentIndex(state);
     try {
-      const { children, runs } = await discoverClaudeChildren(roots.claude);
+      const { children, runs } = catalog
+        ? catalog.listChildren()
+        : await discoverClaudeChildren(roots.claude);
       const electedChildren = electChildUploaders(children, log);
       const lanePlan = planChildLaneResets(
         electedChildren,
