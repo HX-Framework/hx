@@ -39,7 +39,8 @@
 // the long-running loop's cadence.
 
 import path from "node:path";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import {
   RECENT_WINDOW_MS,
   STAT_CONCURRENCY,
@@ -84,20 +85,26 @@ interface FileEntry {
   sessionId: string;
 }
 
-/** A Claude path seen on disk but not currently admissible (size 0, or its
- *  own mtime beyond the window). The base swept every candidate every tick,
- *  so these self-healed within 1.5 s; the catalog must not FORGET them —
- *  appends never bump the dir mtime, so a forgotten path would stay
- *  invisible until unrelated dir churn or a restart. Re-statted at the cold
- *  cadence: size-0 files that grow and aged-out files that get re-appended
- *  re-admit within ≤60 s (M1's cold bound). Dir-level age-out drops are NOT
- *  routed here — D-A replicates the dir prune exactly, and dir re-admission
- *  happens through the dir's own mtime, as today. Codex needs no such lane:
- *  its walk re-stats every not-yet-admitted rollout file every tick. */
+/** A path (Claude or codex) seen on disk but not currently admissible
+ *  (size 0, or its own mtime beyond the window). The base swept every
+ *  candidate every tick, so these self-healed within 1.5 s; the catalog must
+ *  not FORGET them — appends never bump the dir mtime, so a forgotten path
+ *  would stay invisible until unrelated dir churn or a restart. Re-statted
+ *  at the cold cadence (LIVE sessions every tick — the size-0 admission race
+ *  is a session-start race and M1 promises live ⇒ tick cadence): size-0
+ *  files that grow and aged-out files that get re-appended re-admit within
+ *  ≤60 s (M1's cold bound). Dir-level age-out drops are NOT routed here —
+ *  D-A replicates the dir prune exactly, and dir re-admission happens
+ *  through the dir's own mtime, as today. Codex rides the same lane: its
+ *  readdir is mtime-gated, so a quiet dir's not-yet-admitted rollouts are
+ *  never re-statted by the walk itself. */
 interface ExcludedEntry {
   source: "claude" | "codex";
   rootDir: string;
   lastStatMs: number;
+  /** Cached at insert (claude: basename; codex: "" — never live-promoted),
+   *  so the per-tick liveness check costs a Set lookup, not a basename. */
+  sessionId: string;
 }
 
 interface ChildEntry {
@@ -127,6 +134,16 @@ function staggerFor(p: string, interval: number): number {
   return Math.abs(h) % interval;
 }
 
+/** readdirSafe with dirents — classification without following symlinks. */
+async function readdirTypedSafe(p: string): Promise<Dirent[]> {
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- path under a watched config root
+    return await readdir(p, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
 /** Alive-pid probe: ESRCH ⇒ dead; EPERM or any other error ⇒ treat alive
  *  (fail-hot, cost-only — a live pid owned by another user, or a platform
  *  quirk, must never demote a genuinely live session). */
@@ -149,10 +166,11 @@ export class DiscoveryCatalog {
    *  across project dirs (or roots) still folds into one entry even when the
    *  two halves were walked on different ticks. */
   private runsByDir = new Map<string, DiscoveredWorkflowRun[]>();
-  /** Claude project dirs + codex date dirs we know, with their last dir mtime.
-   *  `aged` marks a dir already past the window — the D-A member drop runs on
-   *  the TRANSITION into aged, never per tick (an aged dir with nothing left
-   *  to drop must not pay a full-map prefix scan forever). */
+  /** Claude PROJECT dirs we know, with their last dir mtime (codex dirs live
+   *  in codexListings, not here). `aged` marks a dir already past the window —
+   *  the D-A member drop runs on the TRANSITION into aged, never per tick (an
+   *  aged dir with nothing left to drop must not pay a full-map prefix scan
+   *  forever). */
   private dirs = new Map<string, { mtimeMs: number; aged?: boolean }>();
   /** Per-codex-dir listing + the dir mtime it was taken at. Readdirs (and
    *  the local deletion diff) run ONLY when the dir's mtime moved — file
@@ -247,11 +265,15 @@ export class DiscoveryCatalog {
     this.liveSessionIds.clear();
     for (const root of roots.claude) {
       const dir = path.join(root.configDir, "sessions");
-      for (const f of await readdirSafe(dir)) {
-        if (!f.endsWith(".json")) continue; // skips *.key siblings too
+      const names = (await readdirSafe(dir)).filter((f) => f.endsWith(".json")); // skips *.key too
+      // POOLED, like every other stat surface: a machine with hundreds of
+      // stale tracker files (the population the parse-cache eviction was
+      // sized for) would pay ~100 µs of sequential syscall latency per file
+      // per tick otherwise. liveSessionIds.add is order-independent.
+      await mapPool(names, STAT_CONCURRENCY, async (f) => {
         const p = path.join(dir, f);
         const st = await statSafe(p);
-        if (!st || st.isDir) continue;
+        if (!st || st.isDir) return;
         let rec = this.trackerCache.get(p);
         if (!rec || rec.mtimeMs !== st.mtimeMs) {
           rec = { mtimeMs: st.mtimeMs, pid: null, sessionId: null, startedAt: null };
@@ -276,13 +298,13 @@ export class DiscoveryCatalog {
           }
           this.trackerCache.set(p, rec);
         }
-        if (!rec.sessionId || rec.pid === null) continue;
+        if (!rec.sessionId || rec.pid === null) return;
         // startedAt guard: a tracker older than the max age is ignored unless
         // the session's transcript is warm anyway (recycled-pid bound). A
         // MISSING/unparseable startedAt ⇒ treat live (fail-hot, cost-only).
-        if (rec.startedAt !== null && nowMs - rec.startedAt > TRACKER_MAX_AGE_MS) continue;
+        if (rec.startedAt !== null && nowMs - rec.startedAt > TRACKER_MAX_AGE_MS) return;
         if (pidAlive(rec.pid)) this.liveSessionIds.add(rec.sessionId);
-      }
+      });
     }
   }
 
@@ -353,9 +375,13 @@ export class DiscoveryCatalog {
     for (const p of [...this.runsByDir.keys()]) {
       if (p === dirPath || p.startsWith(prefix)) this.runsByDir.delete(p);
     }
-    // Descendant DIR bookkeeping goes too — a deleted year/month dir would
-    // otherwise leak its day-dir entries (and their listings) forever, since
-    // their parent is never walked again.
+    // DIR bookkeeping goes too, so the drop is self-contained ("this dir and
+    // everything under it is forgotten"). codexListings is where it earns its
+    // keep: a deleted year/month dir would otherwise leak its day-dir
+    // listings forever, since their parent is never walked again. this.dirs
+    // holds only flat claude project dirs today, so its prefix arm is
+    // defensive; the d === dirPath arm is what an aged/deleted claude dir
+    // actually exercises.
     for (const d of [...this.dirs.keys()]) {
       if (d === dirPath || d.startsWith(prefix)) this.dirs.delete(d);
     }
@@ -412,6 +438,7 @@ export class DiscoveryCatalog {
           source: "claude",
           rootDir,
           lastStatMs: nowMs - staggerFor(p, COLD_STAT_INTERVAL_MS),
+          sessionId: path.basename(p, ".jsonl"),
         });
       }
     });
@@ -432,7 +459,12 @@ export class DiscoveryCatalog {
     for (const [p, sd] of [...this.sessionDirs.entries()]) {
       if (path.dirname(p) === dirPath && !present.has(p)) {
         this.sessionDirs.delete(p);
-        this.childHotSessions.delete(sd.sessionId);
+        // Through releaseChildMovement, NOT a direct childHotSessions.delete:
+        // the direct delete both erased a surviving twin dir's legitimate
+        // promotion AND stranded this dir's own movement contribution — a
+        // stale entry no later walk could release, pinning split-dir
+        // sessions hot forever.
+        this.releaseChildMovement(sd.sessionId, p);
         this.dropDirMembers(p);
       }
     }
@@ -481,12 +513,18 @@ export class DiscoveryCatalog {
       // the previous listing (O(members-of-dir); a global-map scan here
       // measured ~100 ms/tick at 10k entries). A quiet dir costs exactly one
       // stat per tick — the same bill as a Claude project dir.
-      const entries = await readdirSafe(dir);
+      // withFileTypes, like the base walk: a dirent classifies WITHOUT
+      // following symlinks, so a symlinked dir or rollout file stays
+      // invisible exactly as it always was (name-based classification here
+      // would follow links via the later stat — new behavior, plus a
+      // symlink-cycle hang on the recursion).
+      const entries = await readdirTypedSafe(dir);
       const presentFiles = new Set<string>();
       const presentDirs = new Set<string>();
-      for (const name of entries) {
+      for (const ent of entries) {
+        const name = ent.name;
         const full = path.join(dir, name);
-        if (name.startsWith("rollout-") && name.endsWith(".jsonl")) {
+        if (ent.isFile() && name.startsWith("rollout-") && name.endsWith(".jsonl")) {
           presentFiles.add(full);
           if (!this.parents.has(full) && !this.excluded.has(full)) {
             const fst = await statSafe(full);
@@ -501,12 +539,15 @@ export class DiscoveryCatalog {
                 source: "codex",
                 rootDir,
                 lastStatMs: nowMs - staggerFor(full, COLD_STAT_INTERVAL_MS),
+                sessionId: "",
               });
             }
           }
-        } else {
+        } else if (ent.isDirectory()) {
           presentDirs.add(full);
         }
+        // Neither a plain file nor a plain dir (symlink, fifo, misnamed
+        // file): ignored, as the base's dirent walk ignored it.
       }
       if (listing) {
         for (const p of listing.files) {
@@ -579,6 +620,7 @@ export class DiscoveryCatalog {
           source: e.file.source,
           rootDir: e.file.rootDir,
           lastStatMs: nowMs,
+          sessionId: e.sessionId,
         });
         return;
       }
@@ -591,6 +633,7 @@ export class DiscoveryCatalog {
           source: e.file.source,
           rootDir: e.file.rootDir,
           lastStatMs: nowMs,
+          sessionId: e.sessionId,
         });
         return;
       }
@@ -606,7 +649,7 @@ export class DiscoveryCatalog {
   private async excludedStatPass(nowMs: number): Promise<void> {
     const due: Array<[string, ExcludedEntry]> = [];
     for (const [p, e] of this.excluded) {
-      const live = this.isLive(path.basename(p, ".jsonl"));
+      const live = e.sessionId !== "" && this.isLive(e.sessionId);
       if (live || nowMs - e.lastStatMs >= COLD_STAT_INTERVAL_MS) due.push([p, e]);
     }
     await mapPool(due, STAT_CONCURRENCY, async ([p, e]) => {

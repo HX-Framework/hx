@@ -20,6 +20,7 @@ import {
   mkdtempSync,
   renameSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -173,22 +174,27 @@ describe("catalog equivalence", () => {
     const p = mkFile("pa", "warm.jsonl", 100, at(-3 * H)); // warm: >5min, <48h
     const cat = new DiscoveryCatalog();
     await cat.sweep(roots, at(0));
+    // Settle sweep past the max insert stagger (60s): every entry is due, so
+    // lastStatMs normalizes to exactly this sweep's clock. Without it the
+    // mid-interval assert below is a dice roll on the tmpdir hash — a stagger
+    // in [3.5s, 5s) makes the warm file due 1.5s after insert.
+    await cat.sweep(roots, at(61_000));
 
     appendFileSync(p, "more!");
-    touch(p, at(1_000));
+    touch(p, at(62_000));
     touch(join(base, "claude", "projects", "pa"), at(-3 * H)); // appends don't bump dir mtimes
 
-    await cat.sweep(roots, at(1_500)); // inside the 5s warm interval
+    await cat.sweep(roots, at(62_500)); // 1.5s into the 5s warm interval
     assert.ok(catalogSet(cat).has(`${p}|100|${at(-3 * H)}`), "append invisible mid-interval");
 
-    await cat.sweep(roots, at(5_600)); // warm cadence elapsed
-    assert.ok(catalogSet(cat).has(`${p}|105|${at(1_000)}`), "append visible after ≤5s");
+    await cat.sweep(roots, at(66_100)); // warm cadence elapsed
+    assert.ok(catalogSet(cat).has(`${p}|105|${at(62_000)}`), "append visible after ≤5s");
 
     // Promoted hot by movement: the very next tick sees the following append.
     appendFileSync(p, "!!");
-    touch(p, at(6_000));
-    await cat.sweep(roots, at(7_100));
-    assert.ok(catalogSet(cat).has(`${p}|107|${at(6_000)}`), "hot after movement");
+    touch(p, at(66_500));
+    await cat.sweep(roots, at(67_600));
+    assert.ok(catalogSet(cat).has(`${p}|107|${at(66_500)}`), "hot after movement");
   });
 
   it("a live tracker (alive pid) pins an idle session hot", async () => {
@@ -214,14 +220,18 @@ describe("catalog equivalence", () => {
     mkFile("pa", "idle-dead-2.jsonl", 100, at(-6 * H));
     const cat = new DiscoveryCatalog();
     await cat.sweep(roots, at(0));
+    // Settle past the max insert stagger so lastStatMs is exactly this
+    // sweep's clock (see the tier-cadence test) — the negative assert below
+    // must not race the stagger dice.
+    await cat.sweep(roots, at(61_000));
 
     for (const f of ["idle-dead", "idle-dead-2"]) {
       const fp = join(base, "claude", "projects", "pa", `${f}.jsonl`);
       appendFileSync(fp, "x");
-      touch(fp, at(500));
+      touch(fp, at(61_500));
     }
     touch(join(base, "claude", "projects", "pa"), at(-6 * H));
-    await cat.sweep(roots, at(1_500)); // warm cadence not yet due
+    await cat.sweep(roots, at(62_500)); // warm cadence not yet due
     assert.ok(catalogSet(cat).has(`${p}|100|${at(-6 * H)}`), "no hot promotion from a dead pid");
   });
 
@@ -380,6 +390,82 @@ describe("catalog equivalence", () => {
       catalogSet(cat).has(`${p}|111|${at(2_000)}`),
       "childHot promotion survived the quiet twin dir's walk",
     );
+  });
+
+  it("a deleted session dir releases its movement contribution (no permanent childHot pin)", async () => {
+    const roots = mkRoots();
+    const sid = "ghost-sess";
+    const p = mkFile("pa", `${sid}.jsonl`, 100, at(-3 * H)); // warm parent
+    const paChild = mkChild("pa", sid, "a1", 40, at(-2 * H));
+    const pcChild = mkChild("pc", sid, "c1", 40, at(-2 * H)); // surviving twin dir
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    await cat.sweep(roots, at(1_500)); // quiet walk drains any first-walk movement
+
+    // Movement in pa promotes via pa's session dir (walks are warm-cadence
+    // now, so wait out the 5 s walk interval first).
+    appendFileSync(paChild, "x");
+    touch(paChild, at(2_000));
+    await cat.sweep(roots, at(6_600)); // movement seen: childHot via pa's dir
+
+    // pa's whole session dir vanishes. The release must go through
+    // releaseChildMovement — a direct childHotSessions.delete would strand
+    // pa's contribution in childMovementDirs, and any LATER movement in the
+    // surviving twin dir would then pin the session hot forever (the ghost
+    // entry can never drain: no walk ever visits the deleted dir again).
+    rmSync(join(base, "claude", "projects", "pa", sid), { recursive: true });
+    touch(join(base, "claude", "projects", "pa"), at(7_000));
+    await cat.sweep(roots, at(8_000));
+
+    appendFileSync(pcChild, "y");
+    touch(pcChild, at(8_500));
+    await cat.sweep(roots, at(12_000)); // pc walk due: movement → promoted
+    await cat.sweep(roots, at(13_500)); // pc quiet → its contribution releases
+
+    // With the ghost pin, the warm parent would now be statted EVERY tick;
+    // released correctly, it re-stats at the 5 s warm cadence.
+    appendFileSync(p, "parent-line");
+    touch(p, at(14_000));
+    await cat.sweep(roots, at(15_000)); // 1.5 s after the parent's last stat
+    assert.ok(
+      !catalogSet(cat).has(`${p}|111|${at(14_000)}`),
+      "warm parent statted at tick cadence — session is still pinned childHot",
+    );
+    await cat.sweep(roots, at(19_000)); // warm interval elapsed
+    assert.ok(
+      catalogSet(cat).has(`${p}|111|${at(14_000)}`),
+      "warm parent append must land once the warm interval elapses",
+    );
+  });
+
+  it("codex symlinks stay invisible (base dirent-walk parity)", async () => {
+    const roots = mkRoots();
+    const real = mkCodex("17", "rollout-2026-08-17T09-00-00-real.jsonl", 50, at(-1 * H));
+    // A dir-symlink into the tree and a rollout-named file-symlink: the base
+    // walk classified via dirents (no follow), so both were invisible. The
+    // catalog must not start following them (new uploads + cycle risk).
+    const outside = join(base, "outside");
+    mkdirSync(outside, { recursive: true });
+    const target = join(outside, "rollout-2026-08-17T10-00-00-tgt.jsonl");
+    writeFileSync(target, "t".repeat(60));
+    touch(target, at(-1 * H));
+    const day = join(base, "codex", "sessions", "2026", "08", "17");
+    try {
+      symlinkSync(outside, join(day, "linked"), "dir");
+      symlinkSync(target, join(day, "rollout-2026-08-17T11-00-00-link.jsonl"), "file");
+    } catch {
+      return; // platform without symlink privileges — nothing to test
+    }
+    touch(day, at(0));
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    const got = cat.listFiles().map((f) => f.path);
+    assert.ok(got.includes(real), "real rollout admitted");
+    assert.ok(
+      !got.some((pth) => pth.includes("linked") || pth.includes("-link.jsonl")),
+      "symlinked entries must stay invisible, as in the base walk",
+    );
+    assert.deepEqual(catalogSet(cat), await groundTruth(roots), "set-equal with fresh discovery");
   });
 
   it("codex deletions land within one tick (file and whole date dir)", async () => {

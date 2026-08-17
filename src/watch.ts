@@ -153,7 +153,11 @@ const CHILD_CONCURRENCY_DEFAULT = 4;
 // the live prod probe): cloud-lane (vaultOrgId === null, non-fortress) chunks
 // double per clean round from DEFAULT_CHUNK_LIMIT up to this, clamped by the
 // destination's learned cap (state.chunkCaps). Fortress-direct stays pinned at
-// DEFAULT_CHUNK_LIMIT.
+// DEFAULT_CHUNK_LIMIT. RSS note for the enable decision: the M8 semaphore
+// counts chunk BUFFERS, but the first committed chunk of a drain is also
+// decoded once to a string for the sidecar sync (artifactText) — at this cap
+// that's up to ~2× chunk size of additional transient RSS per draining file,
+// outside the 64 MB budget.
 const MAX_GROWN_CHUNK = 32 * 1024 * 1024;
 // Process-global in-flight chunk-buffer budget, shared across tee lanes (M8).
 const uploadBytesSemaphore = new ByteSemaphore(64 * 1024 * 1024);
