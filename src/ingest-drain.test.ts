@@ -90,16 +90,18 @@ function stubGateway(opts: StubOptions = {}): StubLedger {
 
 const cfg: HxConfig = { gatewayBaseUrl: "https://gw.test", accessToken: "tok" };
 
-/** A session file of `lines` newline-terminated 1 KiB lines, pre-seeded in
- *  state (so ingestOne's head read and seeding stay off the hot path under
- *  test) with all offsets at zero. */
-async function seedFile(totalBytes: number): Promise<DiscoveredFile> {
+/** A session file of newline-terminated lines, pre-seeded in state (so
+ *  ingestOne's head read and seeding stay off the hot path under test) with
+ *  all offsets at zero. `lineLen` defaults to 1024 (chunk-aligned, for exact
+ *  budget math); pass an UNALIGNED length to prove trim-shortfall paths —
+ *  real jsonl never lands chunk boundaries on newlines. */
+async function seedFile(totalBytes: number, lineLen = 1024): Promise<DiscoveredFile> {
   dir = mkdtempSync(join(tmpdir(), "hx-drain-"));
   setStateDirForTests(dir);
   resetStateCache("main");
   const p = join(dir, "session.jsonl");
-  const line = `${"x".repeat(1023)}\n`;
-  writeFileSync(p, line.repeat(Math.ceil(totalBytes / 1024)));
+  const line = `${"x".repeat(lineLen - 1)}\n`;
+  writeFileSync(p, line.repeat(Math.ceil(totalBytes / lineLen)));
   const fs: FileState = {
     path: p,
     family: "claude-cli",
@@ -112,8 +114,8 @@ async function seedFile(totalBytes: number): Promise<DiscoveredFile> {
     lastKnownSize: totalBytes,
   };
   await upsertFileState(fs);
-  const st = { size: Math.ceil(totalBytes / 1024) * 1024, mtimeMs: Date.now() };
-  return { path: p, size: st.size, mtimeMs: st.mtimeMs, source: "claude", rootDir: dir };
+  const size = Math.ceil(totalBytes / lineLen) * lineLen;
+  return { path: p, size, mtimeMs: Date.now(), source: "claude", rootDir: dir };
 }
 
 const silentLog = (): void => {};
@@ -138,38 +140,47 @@ describe("ingestOne drain", () => {
     assert.equal(state2.files[f.path]!.offsets["letai"], 68 * MB, "fully delivered next pass");
   });
 
-  it("grows the ladder 4→8→16 MB when enabled", async () => {
-    const f = await seedFile(28 * MB);
+  it("grows the ladder 4→8→16 MB when enabled — with UNALIGNED lines", async () => {
+    // 998-byte lines: no chunk boundary ever lands on a newline, so every
+    // chunk trims short of its request. The ladder must advance on FULL-SIZE
+    // REQUESTS, not on exact trimmed lengths (the defect class this pins).
+    const f = await seedFile(28 * MB, 998);
     const ledger = stubGateway();
     const did = await ingestOne(cfg, f, { chunkGrowth: true }, silentLog);
     assert.equal(did, true);
     assert.deepEqual(
-      ledger.putBodies.map((b) => Math.round(b / MB)),
+      ledger.putBodies.slice(0, 3).map((b) => Math.round(b / MB)),
       [4, 8, 16],
-      "doubling per clean full-size round",
+      "doubling per clean full-size round despite trim shortfalls",
     );
+    const sent = ledger.putBodies.reduce((a, b) => a + b, 0);
     const state = await loadState();
-    assert.equal(state.files[f.path]!.offsets["letai"], 28 * MB);
+    assert.equal(state.files[f.path]!.offsets["letai"], sent, "offsets track trimmed bytes");
+    assert.equal(sent, f.size, "fully delivered (tail chunks included)");
   });
 
   it("probe: a grown-size failure retries in place with zero side effects and persists the cap", async () => {
-    const f = await seedFile(28 * MB);
+    const f = await seedFile(28 * MB, 998); // unaligned — real-world trim shortfalls
     const ledger = stubGateway({ putMaxBytes: 8 * MB }); // 16 MB attempt 413s
     const logs: string[] = [];
     const did = await ingestOne(cfg, f, { chunkGrowth: true }, (m) => logs.push(m));
     assert.equal(did, true);
 
-    // The 16 MB attempt failed invisibly; the retry and everything after ran
-    // at the 4 MB base.
+    // The 16 MB attempt failed invisibly (never recorded — the stub logs only
+    // successful PUTs); the retry and everything after ran at the 4 MB base.
     assert.deepEqual(
-      ledger.putBodies.map((b) => Math.round(b / MB)),
-      [4, 8, 4, 4, 4, 4],
-      "ladder up to the failure, then base-size chunks",
+      ledger.putBodies.slice(0, 2).map((b) => Math.round(b / MB)),
+      [4, 8],
+      "ladder up to the failure",
+    );
+    assert.ok(
+      ledger.putBodies.slice(2).every((b) => b <= 4 * MB),
+      "every body after the probe is base-size",
     );
     assert.equal(await getChunkCap("letai"), 4 * MB, "learned cap persisted");
 
     const state = await loadState();
-    assert.equal(state.files[f.path]!.offsets["letai"], 28 * MB, "file fully delivered regardless");
+    assert.equal(state.files[f.path]!.offsets["letai"], f.size, "file fully delivered regardless");
     assert.equal(state.files[f.path]!.consecutiveFailures, undefined, "no file backoff");
     assert.equal(state.destinations?.["letai"]?.consecutiveErrors, undefined, "no registry latch");
     assert.ok(!logs.some((l) => l.includes("[error]")), "no [error] line");

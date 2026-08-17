@@ -74,9 +74,9 @@ const TRACKER_PARSE_CACHE = 512;
 
 interface FileEntry {
   file: DiscoveredFile;
+  /** Last re-stat time — back-dated by a per-path stagger at insert so cold
+   *  stats spread across ticks instead of spiking together. */
   lastStatMs: number;
-  /** Stagger offset so cold stats spread across ticks instead of spiking. */
-  stagger: number;
 }
 
 interface ChildEntry {
@@ -377,10 +377,14 @@ export class DiscoveryCatalog {
     rootDir: string,
     nowMs: number,
   ): void {
+    // The stagger back-dates lastStatMs ONCE, phase-shifting this entry's
+    // re-stat schedule so cold stats spread across ticks — the interval
+    // itself stays full-length for every entry (adding the stagger to the
+    // ELAPSED time at check-time would instead shorten some entries'
+    // effective interval toward zero).
     this.parents.set(p, {
       file: { path: p, size, mtimeMs, source, rootDir },
-      lastStatMs: nowMs,
-      stagger: staggerFor(p, COLD_STAT_INTERVAL_MS),
+      lastStatMs: nowMs - staggerFor(p, COLD_STAT_INTERVAL_MS),
     });
   }
 
@@ -401,8 +405,7 @@ export class DiscoveryCatalog {
       const sessionId =
         e.file.source === "claude" ? path.basename(e.file.path, ".jsonl") : "";
       const interval = this.tierInterval(e, sessionId, nowMs);
-      const jitter = interval === COLD_STAT_INTERVAL_MS ? e.stagger : 0;
-      if (interval === 0 || nowMs - e.lastStatMs + jitter >= interval) due.push(e);
+      if (interval === 0 || nowMs - e.lastStatMs >= interval) due.push(e);
     }
     await mapPool(due, STAT_CONCURRENCY, async (e) => {
       const st = await statSafe(e.file.path);

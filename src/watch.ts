@@ -705,7 +705,11 @@ export async function ingestOne(
       // append, so one store's lag never blocks another.
       const stepOffset = offsetFor(fState, step.vaultOrgId);
       const chunkSize = await chunkSizeFor(step.vaultOrgId, route.fortress, opts, scope);
-      const want = Math.min(st.size - stepOffset, chunkSize);
+      // Clamp to the remaining per-destination budget so a pass never sends
+      // MORE than the historical cap (16 rounds could never exceed 64 MB; an
+      // unclamped `sent < budget` admission could overshoot by one chunk).
+      const budgetLeft = PASS_BYTE_BUDGET - (sentByDest.get(destKey(step.vaultOrgId)) ?? 0);
+      const want = Math.min(st.size - stepOffset, chunkSize, budgetLeft);
       if (want <= 0) continue;
       // Chunk buffers ride the process-global byte budget (M8): admission caps
       // concurrent RSS across pooled files and both tee lanes.
@@ -862,15 +866,17 @@ export async function ingestOne(
         {
           const dk = destKey(step.vaultOrgId);
           sentByDest.set(dk, (sentByDest.get(dk) ?? 0) + trimmed.length);
-          // Growth ladder: a clean commit of a FULL-SIZE chunk (not the file
-          // tail) doubles the next cloud-lane chunk, up to the max and any
-          // learned cap. Dark unless tuning.chunkGrowth.
+          // Growth ladder: a clean commit of a FULL-SIZE request (want ===
+          // chunkSize, i.e. not the file tail) doubles the next cloud-lane
+          // chunk, up to the max and any learned cap. The TRIMMED length is
+          // deliberately not compared — real jsonl trims a partial line off
+          // nearly every chunk, which must not stall the ladder. Dark unless
+          // tuning.chunkGrowth.
           if (
             opts.chunkGrowth === true &&
             !route.fortress &&
             step.vaultOrgId === null &&
-            want === chunkSize &&
-            trimmed.length === want
+            want === chunkSize
           ) {
             const learned = await getChunkCap(dk, scope);
             const next = Math.min(chunkSize * 2, MAX_GROWN_CHUNK, learned ?? Infinity);
