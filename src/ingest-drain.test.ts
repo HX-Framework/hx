@@ -221,6 +221,35 @@ describe("ingestOne drain", () => {
     );
   });
 
+  it("a non-size 4xx at a grown size (expired presign 403) learns NO durable cap", async () => {
+    const f = await seedFile(28 * MB, 998);
+    let failed = false;
+    const ledger = stubGateway();
+    const inner = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (!failed && u.startsWith("https://blob.test/staging")) {
+        const body = init?.body as Uint8Array;
+        if (body && body.byteLength > 8 * MB) {
+          failed = true;
+          return new Response("<Error><Code>SignatureDoesNotMatch</Code></Error>", { status: 403 });
+        }
+      }
+      return (inner as typeof fetch)(url as string, init);
+    }) as unknown as typeof fetch;
+
+    const logs: string[] = [];
+    const did = await ingestOne(cfg, f, { chunkGrowth: true }, (m) => logs.push(m));
+    assert.equal(did, true);
+    assert.equal(failed, true, "the injected 403 fired at the grown size");
+    assert.equal(await getChunkCap("letai"), undefined, "no durable cap from an auth-shaped 4xx");
+    assert.ok(!logs.some((l) => l.includes("settled")), "no cap line");
+    assert.ok(!logs.some((l) => l.includes("[error]")), "probe stayed invisible");
+    const state = await loadState();
+    assert.equal(state.files[f.path]!.offsets["letai"], f.size, "delivered regardless");
+    assert.ok(ledger.putBodies.length > 0);
+  });
+
   it("a transient 5xx at a grown size steps the ladder back WITHOUT persisting a cap", async () => {
     const f = await seedFile(28 * MB, 998);
     // Fail exactly one PUT (the first 16 MB attempt) with a 500, then heal.

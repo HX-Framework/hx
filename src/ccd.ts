@@ -184,7 +184,16 @@ export async function readCcdRecentsCached(
     if (expectedFp === undefined || recordsCache.fp === expectedFp) return recordsCache.records;
     // TTL-fresh but fingerprint-stale — fall through to a forced refresh.
   }
-  if (recordsInFlight) return recordsInFlight;
+  if (recordsInFlight) {
+    if (expectedFp === undefined) return recordsInFlight;
+    // A with-fingerprint caller must not accept an in-flight read that
+    // STARTED before the change it just fingerprinted: await it, then
+    // re-check — one forced re-read on mismatch (the in-flight slot is
+    // clear by then, so the recursion takes the fresh path).
+    return recordsInFlight.then((r) =>
+      recordsCache?.fp === expectedFp ? r : readCcdRecentsCached(nowMs, expectedFp),
+    );
+  }
   recordsInFlight = (async () => {
     try {
       const fp = expectedFp ?? (await ccdSessionsFingerprint());

@@ -77,6 +77,11 @@ interface FileEntry {
   /** Last re-stat time — back-dated by a per-path stagger at insert so cold
    *  stats spread across ticks instead of spiking together. */
   lastStatMs: number;
+  /** Claude session id (jsonl basename), cached at insert — the tier scan
+   *  and the child pass consult it EVERY tick for EVERY entry; a
+   *  path.basename per entry per tick measured as real per-tick cost at a
+   *  10k inventory. Empty string for codex (no tracker, no children). */
+  sessionId: string;
 }
 
 /** A Claude path seen on disk but not currently admissible (size 0, or its
@@ -90,6 +95,7 @@ interface FileEntry {
  *  happens through the dir's own mtime, as today. Codex needs no such lane:
  *  its walk re-stats every not-yet-admitted rollout file every tick. */
 interface ExcludedEntry {
+  source: "claude" | "codex";
   rootDir: string;
   lastStatMs: number;
 }
@@ -143,15 +149,30 @@ export class DiscoveryCatalog {
    *  across project dirs (or roots) still folds into one entry even when the
    *  two halves were walked on different ticks. */
   private runsByDir = new Map<string, DiscoveredWorkflowRun[]>();
-  /** Claude project dirs + codex date dirs we know, with their last dir mtime. */
-  private dirs = new Map<string, { mtimeMs: number }>();
+  /** Claude project dirs + codex date dirs we know, with their last dir mtime.
+   *  `aged` marks a dir already past the window — the D-A member drop runs on
+   *  the TRANSITION into aged, never per tick (an aged dir with nothing left
+   *  to drop must not pay a full-map prefix scan forever). */
+  private dirs = new Map<string, { mtimeMs: number; aged?: boolean }>();
+  /** Per-codex-dir listing + the dir mtime it was taken at. Readdirs (and
+   *  the local deletion diff) run ONLY when the dir's mtime moved — file
+   *  creations and deletions both bump it, so ≤1-tick visibility holds while
+   *  a quiet dir costs one stat per tick, exactly like the Claude dir pass.
+   *  `aged` marks past-window date dirs (drop-on-transition, D-A analog). */
+  private codexListings = new Map<
+    string,
+    { files: Set<string>; dirs: Set<string>; mtimeMs: number; aged?: boolean }
+  >();
   private sessionDirs = new Map<string, SessionDirEntry>();
   private trackerCache = new Map<string, TrackerRecord>();
   private liveSessionIds = new Set<string>();
 
   /** Sessions promoted hot by observed child movement, until their walked
-   *  subtree goes quiet again. */
+   *  subtree goes quiet again. Derived from per-DIR movement contributions —
+   *  a session split across project dirs must not lose its promotion because
+   *  a quiet twin dir walked after the active one. */
   private childHotSessions = new Set<string>();
+  private childMovementDirs = new Map<string, Set<string>>();
 
   reset(): void {
     this.rootsSig = "";
@@ -160,9 +181,11 @@ export class DiscoveryCatalog {
     this.children.clear();
     this.runsByDir.clear();
     this.dirs.clear();
+    this.codexListings.clear();
     this.sessionDirs.clear();
     this.liveSessionIds.clear();
     this.childHotSessions.clear();
+    this.childMovementDirs.clear();
   }
 
   /** The complete windowed parent inventory — a drop-in for
@@ -269,20 +292,36 @@ export class DiscoveryCatalog {
     for (const root of roots.claude) {
       const projects = claudeProjectsDir(root.configDir);
       const seen = new Set<string>();
+      const candidates: string[] = [];
       for (const name of await readdirSafe(projects)) {
         if (name.startsWith(".") || name === "memory") continue;
         const dirPath = path.join(projects, name);
         seen.add(dirPath);
+        candidates.push(dirPath);
+      }
+      // Dir stats POOLED: a sequential await per dir costs its full syscall
+      // latency (~100 µs each on WSL — 32 ms/tick at 320 dirs, measured);
+      // pooling hides it the same way the file-stat pass does. Mutations stay
+      // OUT of the pool — results are applied sequentially below.
+      const stats = new Map<string, { mtimeMs: number } | null>();
+      await mapPool(candidates, STAT_CONCURRENCY, async (dirPath) => {
         const st = await statSafe(dirPath);
-        if (!st?.isDir) continue;
+        stats.set(dirPath, st && st.isDir ? { mtimeMs: st.mtimeMs } : null);
+      });
+      for (const dirPath of candidates) {
+        const st = stats.get(dirPath);
+        if (!st) continue;
         const known = this.dirs.get(dirPath);
         if (nowMs - st.mtimeMs > RECENT_WINDOW_MS) {
           // Dir-mtime age-out (D-A): acts on THIS tick's fresh dir stat and
           // drops every member regardless of member-file mtimes — exactly
-          // today's dir-level prune. The dir stays statted each tick, so a
-          // future mtime move re-admits it, as today.
-          if (known) this.dropDirMembers(dirPath);
-          this.dirs.set(dirPath, { mtimeMs: st.mtimeMs });
+          // today's dir-level prune. The drop runs ON THE TRANSITION into
+          // aged only: an already-aged dir has nothing left to drop, and
+          // re-scanning five maps for it every tick is a per-tick cost that
+          // grows with history. The dir stays statted each tick, so a future
+          // mtime move re-admits it, as today.
+          if (known && !known.aged) this.dropDirMembers(dirPath);
+          this.dirs.set(dirPath, { mtimeMs: st.mtimeMs, aged: true });
           continue;
         }
         if (!known || known.mtimeMs !== st.mtimeMs) {
@@ -314,49 +353,74 @@ export class DiscoveryCatalog {
     for (const p of [...this.runsByDir.keys()]) {
       if (p === dirPath || p.startsWith(prefix)) this.runsByDir.delete(p);
     }
+    // Descendant DIR bookkeeping goes too — a deleted year/month dir would
+    // otherwise leak its day-dir entries (and their listings) forever, since
+    // their parent is never walked again.
+    for (const d of [...this.dirs.keys()]) {
+      if (d === dirPath || d.startsWith(prefix)) this.dirs.delete(d);
+    }
+    for (const d of [...this.codexListings.keys()]) {
+      if (d === dirPath || d.startsWith(prefix)) this.codexListings.delete(d);
+    }
     for (const [p, sd] of [...this.sessionDirs.entries()]) {
       if (p === dirPath || p.startsWith(prefix)) {
         this.sessionDirs.delete(p);
-        // A vanished session dir must also release its hot promotion, or the
-        // still-present parent would be statted every tick forever.
-        this.childHotSessions.delete(sd.sessionId);
+        this.releaseChildMovement(sd.sessionId, p);
       }
     }
+  }
+
+  /** Remove one dir's movement contribution; the session stays promoted only
+   *  while SOME of its dirs still shows movement. */
+  private releaseChildMovement(sessionId: string, sessionDir: string): void {
+    const dirs = this.childMovementDirs.get(sessionId);
+    if (dirs) {
+      dirs.delete(sessionDir);
+      if (dirs.size === 0) this.childMovementDirs.delete(sessionId);
+    }
+    if (!this.childMovementDirs.has(sessionId)) this.childHotSessions.delete(sessionId);
   }
 
   private async readdirClaudeDir(dirPath: string, rootDir: string, nowMs: number): Promise<void> {
     const names = await readdirSafe(dirPath);
     const present = new Set<string>();
+    const newFiles: string[] = [];
+    const newDirs: Array<{ p: string; name: string }> = [];
     for (const name of names) {
       const p = path.join(dirPath, name);
       present.add(p);
       if (name.endsWith(".jsonl")) {
-        if (!this.parents.has(p) && !this.excluded.has(p)) {
-          const st = await statSafe(p);
-          if (!st || st.isDir) continue;
-          if (st.size > 0 && nowMs - st.mtimeMs <= RECENT_WINDOW_MS) {
-            this.insertParent(p, st.size, st.mtimeMs, "claude", rootDir, nowMs);
-          } else {
-            // Exists but not admissible (size 0 — freshly created, unwritten;
-            // or its own mtime beyond the window). Track it in the excluded
-            // lane: appends bump no dir mtime, so forgetting it here would
-            // make later growth invisible until unrelated dir churn.
-            this.excluded.set(p, {
-              rootDir,
-              lastStatMs: nowMs - staggerFor(p, COLD_STAT_INTERVAL_MS),
-            });
-          }
-        }
+        if (!this.parents.has(p) && !this.excluded.has(p)) newFiles.push(p);
         continue;
       }
       if (name.startsWith(".")) continue;
-      if (!this.sessionDirs.has(p)) {
-        const st = await statSafe(p);
-        if (st?.isDir) {
-          this.sessionDirs.set(p, { sessionDir: p, sessionId: name, rootDir, lastWalkMs: 0 });
-        }
-      }
+      if (!this.sessionDirs.has(p)) newDirs.push({ p, name });
     }
+    // Admission stats POOLED (the first sweep of a big tree is thousands of
+    // them — sequential awaits measured ~100 µs each on WSL).
+    await mapPool(newFiles, STAT_CONCURRENCY, async (p) => {
+      const st = await statSafe(p);
+      if (!st || st.isDir) return;
+      if (st.size > 0 && nowMs - st.mtimeMs <= RECENT_WINDOW_MS) {
+        this.insertParent(p, st.size, st.mtimeMs, "claude", rootDir, nowMs);
+      } else {
+        // Exists but not admissible (size 0 — freshly created, unwritten;
+        // or its own mtime beyond the window). Track it in the excluded
+        // lane: appends bump no dir mtime, so forgetting it here would
+        // make later growth invisible until unrelated dir churn.
+        this.excluded.set(p, {
+          source: "claude",
+          rootDir,
+          lastStatMs: nowMs - staggerFor(p, COLD_STAT_INTERVAL_MS),
+        });
+      }
+    });
+    await mapPool(newDirs, STAT_CONCURRENCY, async ({ p, name }) => {
+      const st = await statSafe(p);
+      if (st?.isDir) {
+        this.sessionDirs.set(p, { sessionDir: p, sessionId: name, rootDir, lastWalkMs: 0 });
+      }
+    });
     // Deletions/renames inside this dir: entries no longer present drop now —
     // the same ≤1-tick removal latency fresh discovery gave the snapshot.
     for (const p of [...this.parents.keys()]) {
@@ -377,7 +441,7 @@ export class DiscoveryCatalog {
   private async codexDirPass(roots: ResolvedRoots, nowMs: number): Promise<void> {
     for (const root of roots.codex) {
       for (const base of [codexSessionsDir(root.configDir), codexArchivedDir(root.configDir)]) {
-        await this.codexWalk(base, root.configDir, nowMs);
+        await this.codexWalk(base, root.configDir, nowMs, true);
       }
     }
   }
@@ -387,53 +451,81 @@ export class DiscoveryCatalog {
    *  Deletions surface ≤1 tick, matching the base and the Claude lane: each
    *  walked dir presence-diffs its direct member files, and known SUBDIRS
    *  that vanished from the listing drop with their members. */
-  private async codexWalk(dir: string, rootDir: string, nowMs: number): Promise<void> {
-    const entries = await readdirSafe(dir);
-    const subdirs: string[] = [];
-    const presentFiles = new Set<string>();
-    const presentDirs = new Set<string>();
-    for (const name of entries) {
-      const full = path.join(dir, name);
-      if (name.startsWith("rollout-") && name.endsWith(".jsonl")) {
-        presentFiles.add(full);
-        if (!this.parents.has(full)) {
-          const st = await statSafe(full);
-          if (st && !st.isDir && st.size > 0 && nowMs - st.mtimeMs <= RECENT_WINDOW_MS) {
-            this.insertParent(full, st.size, st.mtimeMs, "codex", rootDir, nowMs);
+  private async codexWalk(dir: string, rootDir: string, nowMs: number, isRoot: boolean): Promise<void> {
+    const st = await statSafe(dir);
+    if (!st?.isDir) {
+      // The dir itself vanished (incl. a removed root): everything under it
+      // goes, ≤1 tick — the base's fresh walk saw the same emptiness.
+      if (this.codexListings.has(dir)) this.dropDirMembers(dir);
+      return;
+    }
+    if (!isRoot && nowMs - st.mtimeMs > RECENT_WINDOW_MS) {
+      // Date-dir prune — the codex analog of the D-A dir age-out, drop on
+      // the TRANSITION only (roots are never pruned, matching the base's
+      // unconditional walk of sessions/ + archived_sessions/).
+      const known = this.codexListings.get(dir);
+      if (known && !known.aged) this.dropDirMembers(dir);
+      this.codexListings.set(dir, {
+        files: new Set(),
+        dirs: new Set(),
+        mtimeMs: st.mtimeMs,
+        aged: true,
+      });
+      return;
+    }
+    let listing = this.codexListings.get(dir);
+    if (!listing || listing.mtimeMs !== st.mtimeMs || listing.aged) {
+      // The dir CHANGED (creations and deletions both bump its mtime — that
+      // is what keeps deletion visibility ≤1 tick), or it re-entered the
+      // window: readdir, admit new files, and diff deletions LOCALLY against
+      // the previous listing (O(members-of-dir); a global-map scan here
+      // measured ~100 ms/tick at 10k entries). A quiet dir costs exactly one
+      // stat per tick — the same bill as a Claude project dir.
+      const entries = await readdirSafe(dir);
+      const presentFiles = new Set<string>();
+      const presentDirs = new Set<string>();
+      for (const name of entries) {
+        const full = path.join(dir, name);
+        if (name.startsWith("rollout-") && name.endsWith(".jsonl")) {
+          presentFiles.add(full);
+          if (!this.parents.has(full) && !this.excluded.has(full)) {
+            const fst = await statSafe(full);
+            if (!fst || fst.isDir) continue;
+            if (fst.size > 0 && nowMs - fst.mtimeMs <= RECENT_WINDOW_MS) {
+              this.insertParent(full, fst.size, fst.mtimeMs, "codex", rootDir, nowMs);
+            } else {
+              // Same H-1 recovery lane as Claude: appends bump no dir mtime,
+              // so a size-0/aged rollout must stay tracked or later growth
+              // would be invisible until unrelated dir churn.
+              this.excluded.set(full, {
+                source: "codex",
+                rootDir,
+                lastStatMs: nowMs - staggerFor(full, COLD_STAT_INTERVAL_MS),
+              });
+            }
+          }
+        } else {
+          presentDirs.add(full);
+        }
+      }
+      if (listing) {
+        for (const p of listing.files) {
+          if (!presentFiles.has(p)) {
+            this.parents.delete(p);
+            this.excluded.delete(p);
           }
         }
-      } else {
-        presentDirs.add(full);
-        subdirs.push(full);
-      }
-    }
-    // Direct member files deleted since the last walk drop now (≤1 tick).
-    for (const p of [...this.parents.keys()]) {
-      if (path.dirname(p) === dir && !presentFiles.has(p)) this.parents.delete(p);
-    }
-    // Known subdirs no longer listed (a date dir deleted outright) drop with
-    // their members — the staleness branch below only covers AGED dirs.
-    for (const d of [...this.dirs.keys()]) {
-      if (path.dirname(d) === dir && !presentDirs.has(d)) {
-        this.dropDirMembers(d);
-        this.dirs.delete(d);
-      }
-    }
-    await mapPool(subdirs, STAT_CONCURRENCY, async (d) => {
-      const st = await statSafe(d);
-      if (!st?.isDir) return;
-      if (nowMs - st.mtimeMs > RECENT_WINDOW_MS) {
-        // Date-dir prune — the codex analog of the D-A dir age-out.
-        const known = this.dirs.get(d);
-        if (known) {
-          this.dropDirMembers(d);
-          this.dirs.delete(d);
+        for (const d of listing.dirs) {
+          if (!presentDirs.has(d)) this.dropDirMembers(d); // prunes listings by prefix too
         }
-        return;
       }
-      this.dirs.set(d, { mtimeMs: st.mtimeMs });
-      await this.codexWalk(d, rootDir, nowMs);
-    });
+      listing = { files: presentFiles, dirs: presentDirs, mtimeMs: st.mtimeMs };
+      this.codexListings.set(dir, listing);
+    }
+    // Recurse into the known subdirs — each performs its own stat + gate.
+    await mapPool([...listing.dirs], STAT_CONCURRENCY, (d) =>
+      this.codexWalk(d, rootDir, nowMs, false),
+    );
   }
 
   private insertParent(
@@ -452,6 +544,7 @@ export class DiscoveryCatalog {
     this.parents.set(p, {
       file: { path: p, size, mtimeMs, source, rootDir },
       lastStatMs: nowMs - staggerFor(p, COLD_STAT_INTERVAL_MS),
+      sessionId: source === "claude" ? path.basename(p, ".jsonl") : "",
     });
   }
 
@@ -467,11 +560,7 @@ export class DiscoveryCatalog {
   private async fileStatPass(nowMs: number): Promise<void> {
     const due: FileEntry[] = [];
     for (const e of this.parents.values()) {
-      // Claude session id ≙ the jsonl basename; codex uses the rollout stem.
-      // Liveness promotion only needs the claude shape (codex has no tracker).
-      const sessionId =
-        e.file.source === "claude" ? path.basename(e.file.path, ".jsonl") : "";
-      const interval = this.tierInterval(e, sessionId, nowMs);
+      const interval = this.tierInterval(e, e.sessionId, nowMs);
       if (interval === 0 || nowMs - e.lastStatMs >= interval) due.push(e);
     }
     await mapPool(due, STAT_CONCURRENCY, async (e) => {
@@ -486,7 +575,11 @@ export class DiscoveryCatalog {
         // Truncated to empty (excluded by discovery today too) — keep it in
         // the excluded lane so regrowth re-admits within the cold cadence.
         this.parents.delete(e.file.path);
-        this.excluded.set(e.file.path, { rootDir: e.file.rootDir, lastStatMs: nowMs });
+        this.excluded.set(e.file.path, {
+          source: e.file.source,
+          rootDir: e.file.rootDir,
+          lastStatMs: nowMs,
+        });
         return;
       }
       if (nowMs - st.mtimeMs > RECENT_WINDOW_MS) {
@@ -494,7 +587,11 @@ export class DiscoveryCatalog {
         // excluded lane keeps watching, so a later resume-append re-admits
         // within the cold cadence even when the dir mtime never moves.
         this.parents.delete(e.file.path);
-        this.excluded.set(e.file.path, { rootDir: e.file.rootDir, lastStatMs: nowMs });
+        this.excluded.set(e.file.path, {
+          source: e.file.source,
+          rootDir: e.file.rootDir,
+          lastStatMs: nowMs,
+        });
         return;
       }
       e.file = { ...e.file, size: st.size, mtimeMs: st.mtimeMs };
@@ -502,11 +599,15 @@ export class DiscoveryCatalog {
   }
 
   /** Cold-cadence recovery lane for tracked-but-not-admissible Claude paths
-   *  (size 0 / own-mtime beyond the window). Promotion inserts as HOT. */
+   *  (size 0 / own-mtime beyond the window). Promotion inserts as HOT. A
+   *  LIVE session's excluded entry is due EVERY tick — the size-0 admission
+   *  race hits exactly at session start (jsonl created before its first
+   *  write), and M1 promises live sessions tick-cadence, not ≤60 s. */
   private async excludedStatPass(nowMs: number): Promise<void> {
     const due: Array<[string, ExcludedEntry]> = [];
     for (const [p, e] of this.excluded) {
-      if (nowMs - e.lastStatMs >= COLD_STAT_INTERVAL_MS) due.push([p, e]);
+      const live = this.isLive(path.basename(p, ".jsonl"));
+      if (live || nowMs - e.lastStatMs >= COLD_STAT_INTERVAL_MS) due.push([p, e]);
     }
     await mapPool(due, STAT_CONCURRENCY, async ([p, e]) => {
       const st = await statSafe(p);
@@ -517,7 +618,7 @@ export class DiscoveryCatalog {
       e.lastStatMs = nowMs;
       if (st.size > 0 && nowMs - st.mtimeMs <= RECENT_WINDOW_MS) {
         this.excluded.delete(p);
-        this.insertParent(p, st.size, st.mtimeMs, "claude", e.rootDir, nowMs);
+        this.insertParent(p, st.size, st.mtimeMs, e.source, e.rootDir, nowMs);
         // Fresh movement — make it hot immediately, not stagger-backdated.
         const entry = this.parents.get(p);
         if (entry) entry.lastStatMs = nowMs;
@@ -531,10 +632,9 @@ export class DiscoveryCatalog {
     // One hot-parent index per pass — sessionId → newest claude-parent mtime.
     const parentMtime = new Map<string, number>();
     for (const e of this.parents.values()) {
-      if (e.file.source !== "claude") continue;
-      const sid = path.basename(e.file.path, ".jsonl");
-      const prev = parentMtime.get(sid);
-      if (prev === undefined || e.file.mtimeMs > prev) parentMtime.set(sid, e.file.mtimeMs);
+      if (e.sessionId === "") continue;
+      const prev = parentMtime.get(e.sessionId);
+      if (prev === undefined || e.file.mtimeMs > prev) parentMtime.set(e.sessionId, e.file.mtimeMs);
     }
     const parentIsHot = (sid: string): boolean =>
       nowMs - (parentMtime.get(sid) ?? 0) <= HOT_AGE_MS;
@@ -573,8 +673,20 @@ export class DiscoveryCatalog {
           rs.map((r) => `${r.runId}:${r.mtimeMs}:${r.journalPath ?? ""}:${r.scriptPath ?? ""}`).sort().join("|");
         if (runFp(prevRuns) !== runFp(walkRuns)) movement = true;
       }
-      if (movement) this.childHotSessions.add(sd.sessionId);
-      else this.childHotSessions.delete(sd.sessionId);
+      // Per-DIR contribution: a session split across project dirs stays
+      // promoted while ANY of its dirs shows movement — a quiet twin dir
+      // walking later must not erase the active dir's promotion.
+      if (movement) {
+        let dirsWithMovement = this.childMovementDirs.get(sd.sessionId);
+        if (!dirsWithMovement) {
+          dirsWithMovement = new Set();
+          this.childMovementDirs.set(sd.sessionId, dirsWithMovement);
+        }
+        dirsWithMovement.add(sd.sessionDir);
+        this.childHotSessions.add(sd.sessionId);
+      } else {
+        this.releaseChildMovement(sd.sessionId, sd.sessionDir);
+      }
 
       // The walk is authoritative for its own subtree: replace it wholesale.
       const prefix = sd.sessionDir + path.sep;

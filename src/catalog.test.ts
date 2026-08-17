@@ -336,6 +336,52 @@ describe("catalog equivalence", () => {
     assert.deepEqual(catalogSet(cat), await groundTruth(roots));
   });
 
+  it("a LIVE session caught by the size-0 admission race admits at tick cadence, not cold", async () => {
+    const roots = mkRoots();
+    mkFile("pa", "other.jsonl", 100, at(-1 * H)); // keeps the dir in-window
+    const p = mkFile("pa", "live-born-empty.jsonl", 0, at(0));
+    mkTracker(process.pid, "live-born-empty", at(-60_000)); // session just started, pid alive
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    assert.ok(!cat.listFiles().some((f) => f.path === p), "size-0 not yet admitted");
+
+    appendFileSync(p, "first write");
+    touch(p, at(1_000));
+    touch(join(base, "claude", "projects", "pa"), at(0));
+    await cat.sweep(roots, at(1_500)); // ONE tick later — live overrides the cold cadence
+    assert.ok(
+      catalogSet(cat).has(`${p}|11|${at(1_000)}`),
+      "live session's excluded entry re-statted every tick (M1: live ⇒ hot)",
+    );
+  });
+
+  it("split-dir sessions keep their child-movement promotion despite a quiet twin dir", async () => {
+    const roots = mkRoots();
+    const sid = "split-sess";
+    const p = mkFile("pa", `${sid}.jsonl`, 100, at(-3 * H)); // warm parent
+    mkChild("pa", sid, "active", 40, at(0));
+    mkChild("pc", sid, "idle", 40, at(-2 * H)); // twin artifact dir, quiet
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+
+    // Movement in the ACTIVE dir promotes; the quiet twin's walk (same tick,
+    // later in iteration order) must not erase it — the parent's next append
+    // must be seen at TICK cadence, not the 5s warm cadence.
+    const cp = join(base, "claude", "projects", "pa", sid, "subagents", "agent-active.jsonl");
+    appendFileSync(cp, "x");
+    touch(cp, at(1_000));
+    await cat.sweep(roots, at(1_500)); // observes child movement in pa; pc quiet
+
+    appendFileSync(p, "parent-line");
+    touch(p, at(2_000));
+    touch(join(base, "claude", "projects", "pa"), at(-3 * H));
+    await cat.sweep(roots, at(3_000)); // one tick — promotion must hold
+    assert.ok(
+      catalogSet(cat).has(`${p}|111|${at(2_000)}`),
+      "childHot promotion survived the quiet twin dir's walk",
+    );
+  });
+
   it("codex deletions land within one tick (file and whole date dir)", async () => {
     const roots = mkRoots();
     const p1 = mkCodex("15", "rollout-2026-08-15T10-00-00-aaaa.jsonl", 50, at(-2 * H));

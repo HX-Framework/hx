@@ -787,8 +787,20 @@ export async function ingestOne(
             summary = summariseChunk(trimmed.toString("utf8"));
             sliceSummaries.set(`${stepOffset}:${shrunkWant}`, { endOffset, summary });
             grownChunk.set(`${scope}:${dk}`, lastGood);
+            // Only a genuinely SIZE-shaped rejection earns a durable cap:
+            // 413, or a 4xx whose body names a size limit. A presign that
+            // expired while a 16-32 MB slice was being read (403
+            // SignatureDoesNotMatch) must NOT permanently under-cap the
+            // destination — it steps the in-memory ladder back like a 5xx
+            // and may regrow.
             const sizeShaped =
-              growErr instanceof HxHttpError && growErr.status >= 400 && growErr.status < 500;
+              growErr instanceof HxHttpError &&
+              (growErr.status === 413 ||
+                (growErr.status >= 400 &&
+                  growErr.status < 500 &&
+                  /EntityTooLarge|MaxMessageLength|PayloadTooLarge|RequestEntityTooLarge|TooBig/i.test(
+                    growErr.message,
+                  )));
             if (sizeShaped) {
               await setChunkCap(dk, lastGood, scope);
               if (!chunkCapLogged.has(dk)) {
