@@ -1567,13 +1567,28 @@ export function collectSkipped(files: DiscoveredFile[], state: HxState): SyncSki
   return out;
 }
 
+/** Injectable inputs for {@link computeSyncReport} — the UI server passes its
+ *  cached UNWINDOWED discovery lists (and a settings snapshot) so its 5s poll
+ *  stops re-walking the whole disk; the CLI path passes nothing and stays
+ *  byte-identical (fresh unwindowed discovery + fresh settings). Injected
+ *  lists MUST be unwindowed-equivalent — the report's behind/incomplete math
+ *  is meaningless over a windowed subset. */
+export interface SyncReportInputs {
+  claude: DiscoveredFile[];
+  codex: DiscoveredFile[];
+  settings?: HxSettings;
+}
+
 /** Sync snapshot PLUS the sessions the snapshot can no longer see: entries
  *  whose source file vanished (or aged out of discovery) mid-upload — and the
  *  sessions currently skipped on a temporarily-unavailable store. Backs the
  *  honest `hx status` output — without these the bar reads 100% while the
  *  server holds partial transcripts or a store is down. */
-export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<SyncReport> {
-  const settings = await readSettings();
+export async function computeSyncReport(
+  rootsOverride?: ResolvedRoots,
+  injected?: SyncReportInputs,
+): Promise<SyncReport> {
+  const settings = injected?.settings ?? (await readSettings());
   const roots = rootsOverride ?? resolveDataRoots(settings);
   // UNWINDOWED — this is a REPORT, not the hot loop. The 30-day bound exists so
   // a 1.5s sweep stays cheap; describing the device is a once-per-invocation
@@ -1586,10 +1601,12 @@ export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<
   // neither gone nor unrecoverable; the backfill sweep will deliver it. Only
   // genuinely-vanished sources are incomplete, and that needs discovery to see
   // everything before it can tell the difference.
-  const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(roots.claude, { maxAgeMs: Infinity }),
-    discoverCodexFiles(roots.codex, { maxAgeMs: Infinity }),
-  ]);
+  const [claude, codex] = injected
+    ? [injected.claude, injected.codex]
+    : await Promise.all([
+        discoverClaudeFiles(roots.claude, { maxAgeMs: Infinity }),
+        discoverCodexFiles(roots.codex, { maxAgeMs: Infinity }),
+      ]);
   const all = [...claude, ...codex];
   const state = await loadState();
   const discovered = new Set(all.map((f) => f.path));
@@ -2080,6 +2097,25 @@ export async function tickOnce(
   return { uploaded, failed, snapshot };
 }
 
+/** Hourly perf-summary counters (see formatPerfLine / the perfTimer). */
+export interface PerfCounters {
+  passes: number;
+  passMs: number[];
+  uploads: number;
+  flushes: number;
+}
+
+/** The hourly `[hx] perf:` info line. Pure so the classifier golden can pin
+ *  it: the token format must never match the UI log classifier's warn/up
+ *  patterns (no "failed=", no "error", no "(+…B" — classifyLogLine in
+ *  ui/data.ts), or a healthy hourly summary would render as a warning. */
+export function formatPerfLine(perf: PerfCounters): string {
+  const sorted = [...perf.passMs].sort((a, b) => a - b);
+  const at = (q: number): number =>
+    sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!) : 0;
+  return `[hx] perf: passes=${perf.passes} passMs p50=${at(0.5)} p95=${at(0.95)} max=${Math.round(sorted[sorted.length - 1] ?? 0)} uploads=${perf.uploads} stateFlushes=${perf.flushes}`;
+}
+
 export async function startWatch(
   cfg: HxConfig,
   opts: WatchOptions,
@@ -2187,16 +2223,9 @@ export async function startWatch(
   let passBusy = false;
 
   // Perf self-observability: per-pass duration + activity counters, folded
-  // into ONE hourly info line. The token format is deliberately chosen to
-  // never match the UI log classifier's warn/up patterns (no "failed=", no
-  // "error", no "(+…B") — see classifyLogLine in ui/data.ts.
+  // into ONE hourly info line (formatPerfLine — classifier-safe by test).
   const PERF_LOG_MS = 60 * 60_000;
-  const perf = { passes: 0, passMs: [] as number[], uploads: 0, flushes: 0 };
-  const perfLine = (): string => {
-    const sorted = [...perf.passMs].sort((a, b) => a - b);
-    const at = (q: number): number => sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!) : 0;
-    return `[hx] perf: passes=${perf.passes} passMs p50=${at(0.5)} p95=${at(0.95)} max=${Math.round(sorted[sorted.length - 1] ?? 0)} uploads=${perf.uploads} stateFlushes=${perf.flushes}`;
-  };
+  const perf: PerfCounters = { passes: 0, passMs: [], uploads: 0, flushes: 0 };
 
   // User-driven pause (settings.json, written by the UI server or a future
   // CLI). Checked every tick so a pause/resume takes effect within one poll.
@@ -2316,7 +2345,7 @@ export async function startWatch(
   }, STATE_FLUSH_MS);
   const perfTimer = setInterval(() => {
     if (perf.passes === 0) return;
-    log(perfLine());
+    log(formatPerfLine(perf));
     perf.passes = 0;
     perf.passMs.length = 0;
     perf.uploads = 0;

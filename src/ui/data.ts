@@ -17,11 +17,18 @@ import { buildSyncDoctorReport, type SyncDoctorReport } from "../diagnostics.js"
 import { assertSecureFetchUrl } from "../net.js";
 import { readActivity, type ActivityEntry } from "../activity.js";
 import { readOrgNames } from "../org-names.js";
-import { discoverAll, readHead, type DiscoveredFile, type HeadMeta } from "../sources.js";
+import {
+  discoverClaudeFiles,
+  discoverCodexFiles,
+  readHead,
+  type DiscoveredFile,
+  type HeadMeta,
+} from "../sources.js";
 import {
   DEFAULT_CLAUDE_ROOT,
   DEFAULT_CODEX_ROOT,
   resolveDataRoots,
+  rootsSignature,
   samePhysicalDir,
   type DataRoot,
   type ResolvedRoots,
@@ -29,9 +36,90 @@ import {
 } from "../roots.js";
 import { readSettings } from "../settings.js";
 import { extractTitleFallback, readHeadLines } from "./preview.js";
-import { isDeletedSession, loadState, minOffset, resetStateCache, type FileState } from "../state.js";
+import {
+  isDeletedSession,
+  loadState,
+  minOffset,
+  resetStateCache,
+  type FileState,
+  type HxState,
+} from "../state.js";
 import { HX_VERSION } from "../version.js";
 import { computeSyncReport } from "../watch.js";
+
+// ── Discovery caches (LETAIR-144 WS5) ───────────────────────────────────────
+//
+// Every /api/snapshot used to re-walk the disk TWICE: a windowed discovery for
+// the folder/session views plus an UNWINDOWED full-disk sweep inside
+// computeSyncReport — on a 5 s poll, with overlapping polls compounding. The
+// walks are now cached (single-flight, short TTL, keyed by the roots
+// signature); every FOLD still runs fresh per request over the live
+// state.json, so offsets, percentages and ledger buckets keep today's
+// freshness. Sizes of actively-growing files are freshened from the daemon's
+// own `lastKnownSize` before any fold (see freshenSizes), so a cached size can
+// never flicker a growing file to done.
+const WINDOWED_TTL_MS = 4_000;
+const UNWINDOWED_TTL_MS = 60_000;
+
+interface DiscoveryCache {
+  atMs: number;
+  rootsSig: string;
+  claude: DiscoveredFile[];
+  codex: DiscoveredFile[];
+}
+let windowedCache: DiscoveryCache | null = null;
+let windowedInFlight: Promise<DiscoveryCache> | null = null;
+let unwindowedCache: DiscoveryCache | null = null;
+let unwindowedInFlight: Promise<DiscoveryCache> | null = null;
+
+/** Test seam — drop the discovery caches. */
+export function resetUiDiscoveryCaches(): void {
+  windowedCache = null;
+  windowedInFlight = null;
+  unwindowedCache = null;
+  unwindowedInFlight = null;
+}
+
+async function cachedDiscovery(
+  roots: ResolvedRoots,
+  unwindowed: boolean,
+): Promise<DiscoveryCache> {
+  const sig = rootsSignature(roots);
+  const cache = unwindowed ? unwindowedCache : windowedCache;
+  const ttl = unwindowed ? UNWINDOWED_TTL_MS : WINDOWED_TTL_MS;
+  if (cache && cache.rootsSig === sig && Date.now() - cache.atMs < ttl) return cache;
+  const inFlight = unwindowed ? unwindowedInFlight : windowedInFlight;
+  if (inFlight) return inFlight;
+  const load = (async (): Promise<DiscoveryCache> => {
+    try {
+      const opts = unwindowed ? { maxAgeMs: Infinity } : {};
+      const [claude, codex] = await Promise.all([
+        discoverClaudeFiles(roots.claude, opts),
+        discoverCodexFiles(roots.codex, opts),
+      ]);
+      const fresh: DiscoveryCache = { atMs: Date.now(), rootsSig: sig, claude, codex };
+      if (unwindowed) unwindowedCache = fresh;
+      else windowedCache = fresh;
+      return fresh;
+    } finally {
+      if (unwindowed) unwindowedInFlight = null;
+      else windowedInFlight = null;
+    }
+  })();
+  if (unwindowed) unwindowedInFlight = load;
+  else windowedInFlight = load;
+  return load;
+}
+
+/** A cached file list with sizes freshened from the daemon's live
+ *  `lastKnownSize` (maintained per tick for changed files). max() only — a
+ *  cached size is never lowered, so a growing file can't read as done. */
+function freshenSizes(files: DiscoveredFile[], state: HxState): DiscoveredFile[] {
+  return files.map((f) => {
+    const known = state.files[f.path]?.lastKnownSize;
+    return known !== undefined && known > f.size ? { ...f, size: known } : f;
+  });
+}
 
 export const FAMILY_LABELS: Record<string, string> = {
   "claude-cli": "Claude Code CLI",
@@ -337,9 +425,10 @@ async function uiEffectiveRoots(): Promise<{ roots: ResolvedRoots; from: "daemon
 
 async function collectFacts(): Promise<{ facts: FileFacts[]; roots: ResolvedRoots; rootsFrom: "daemon" | "local" }> {
   const { roots, from } = await uiEffectiveRoots();
-  const files = await discoverAll(roots);
-  const heads = await headsFor(files);
   const state = await loadState();
+  const cached = await cachedDiscovery(roots, false);
+  const files = freshenSizes([...cached.claude, ...cached.codex], state);
+  const heads = await headsFor(files);
   return {
     facts: files.map((file) => ({
       file,
@@ -395,10 +484,20 @@ export async function buildSnapshot(): Promise<UiSnapshot> {
   resetStateCache();
   const cfg = await readConfig();
   const { facts, roots, rootsFrom } = await collectFacts();
-  const report = await computeSyncReport(roots);
+  // The unwindowed sweep rides its own slower cache; every fold inside
+  // computeSyncReport still runs over THIS request's fresh state.json, with
+  // active-file sizes freshened so a cached size can't fake done.
+  const settings = await readSettings();
+  const state = await loadState();
+  const unwindowed = await cachedDiscovery(roots, true);
+  const report = await computeSyncReport(roots, {
+    claude: freshenSizes(unwindowed.claude, state),
+    codex: freshenSizes(unwindowed.codex, state),
+    settings,
+  });
   const doctor = buildSyncDoctorReport(report, cfg?.gatewayBaseUrl ?? "", Date.now(), roots);
   const dataRoots = buildDataRootVMs(roots, facts.map((f) => f.file));
-  const shellDetected = detectShellRoots(resolveDataRoots(await readSettings()), roots);
+  const shellDetected = detectShellRoots(resolveDataRoots(settings), roots);
 
   let daemon = { managerName: "none", loaded: false, pid: null as number | null };
   try {
@@ -493,11 +592,13 @@ export async function buildSessions(folderId: string): Promise<SessionVM[]> {
 
 /** Only paths the discovery scan yields may be previewed or sized. Scans with
  *  the daemon's effective roots (stamp-first) — the preview surface must match
- *  what the device actually mirrors, not this process's private env. */
+ *  what the device actually mirrors, not this process's private env. Reads
+ *  the same windowed cache the views render from, so the preview surface and
+ *  the visible list can never disagree. */
 export async function isDiscoveredPath(p: string): Promise<boolean> {
   const { roots } = await uiEffectiveRoots();
-  const files = await discoverAll(roots);
-  return files.some((f) => f.path === p);
+  const cached = await cachedDiscovery(roots, false);
+  return cached.claude.some((f) => f.path === p) || cached.codex.some((f) => f.path === p);
 }
 
 export type LogLevel = "info" | "up" | "warn";
