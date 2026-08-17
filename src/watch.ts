@@ -1659,9 +1659,13 @@ export function snapshotFrom(files: DiscoveredFile[], state: HxState): SyncSnaps
   return { total: files.length, done, totalBytes };
 }
 
-// Report progress at most every Nth file so a long first pass shows the bar
-// climbing without a callback per file. Start + end are always reported.
-const SYNC_PROGRESS_EVERY = 20;
+// Report progress at most once per second so a long first pass shows the bar
+// climbing without a snapshot per file. Start + end are always reported, and
+// reportSync throttles actual POSTs to ≥1.5 s apart regardless — a finer
+// cadence only burned CPU: the old every-20th-FILE gate recomputed the full
+// O(files) snapshot fold 500× per pass on a 10k tree (~64% of a core
+// measured in the e2e profile), then discarded almost all of them.
+const SYNC_PROGRESS_MIN_MS = 1_000;
 
 /** One-shot catch-up snapshot (no upload) — backs `hx status` and the daemon
  *  restart decision. Main lane only: the `--local` tee tracks its own catch-up
@@ -2072,7 +2076,6 @@ export async function tickOnce(
 
   let uploaded = 0;
   let failed = 0;
-  let completed = 0;
   // Distinct files that hit a gateway-shaped 5xx this pass — see the
   // serverUnavailable branch below: one file's unrecognized 5xx must not be
   // read as a wholesale outage. Shared across pooled workers; latching stops
@@ -2226,13 +2229,36 @@ export async function tickOnce(
       await recordFileFailure(f.path, FILE_RETRY_BASE_MS, scope);
     }
   };
+  // M1 in force for the caught-up multitude: a clean, fully-uploaded file's
+  // change detection lives with the catalog's tiered stats (its size/mtime
+  // here are tier-fresh by contract), so the pass pools only files with
+  // something to do — owed bytes, a shrink (heal), a moved mtime (touch
+  // bookkeeping), a hold/backoff, or the attribution-gate probe. Without
+  // this gate the pass re-statted every watched file every tick (10k
+  // stats/tick measured) — the exact per-tick sweep C1 removed, resurrected
+  // inside the pass. The legacy sweep (tuning.sweep="legacy") passes
+  // everything, preserving the base's stat-per-file behavior byte-for-byte.
+  const poolNowMs = Date.now();
+  const pooled = !catalog
+    ? files
+    : files.filter((f) => {
+        const fs = state.files[f.path];
+        if (!fs) return true;
+        if (fs.skipReason) return true;
+        if (fs.nextAttemptAtMs && fs.nextAttemptAtMs > poolNowMs) return true;
+        if (!settings.personalSync && fs.attributed === undefined) return true;
+        if (f.size !== minOffset(fs)) return true;
+        if (fs.lastMtimeMs !== f.mtimeMs) return true;
+        return false;
+      });
+  let lastProgressAtMs = Date.now();
   await runPool(
-    files,
+    pooled,
     fileConcurrency,
     async (f) => {
       await processParent(f);
-      completed += 1;
-      if (onProgress && completed % SYNC_PROGRESS_EVERY === 0) {
+      if (onProgress && Date.now() - lastProgressAtMs >= SYNC_PROGRESS_MIN_MS) {
+        lastProgressAtMs = Date.now();
         onProgress(snapshotFrom(files, state));
       }
     },

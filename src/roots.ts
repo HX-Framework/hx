@@ -84,15 +84,43 @@ function resolveFamily(
   return out;
 }
 
+// Sub-tick memo: the daemon resolves roots more than once per tick (tickOnce
+// and publishRoots each resolve, off separate settings reads), and every
+// resolution pays existsSync + realpathSync per candidate — measured at ~10%
+// of a core on WSL at tick cadence in the 10k-tree e2e. Roots were only ever
+// OBSERVED at tick boundaries, and the TTL sits under FAST_POLL_MS, so each
+// tick's FIRST resolution is always fresh — per-tick freshness is identical,
+// only within-tick duplicates collapse. A settings/env change alters the
+// input key and bypasses the TTL outright.
+const ROOTS_MEMO_TTL_MS = 1_200;
+let rootsMemo: { key: string; atMs: number; value: ResolvedRoots } | null = null;
+
+/** Test seam — drop the sub-tick memo so fs mutations are seen immediately. */
+export function clearRootsMemoForTests(): void {
+  rootsMemo = null;
+}
+
 /** Resolve the full watch-root set for THIS process (settings + own env). */
 export function resolveDataRoots(
   s: HxSettings,
   env: Record<string, string | undefined> = process.env,
 ): ResolvedRoots {
-  return {
+  const key = JSON.stringify([
+    s.dataDirs.claude,
+    s.dataDirs.codex,
+    env.CLAUDE_CONFIG_DIR ?? null,
+    env.CODEX_HOME ?? null,
+  ]);
+  const nowMs = Date.now();
+  if (rootsMemo && rootsMemo.key === key && nowMs - rootsMemo.atMs < ROOTS_MEMO_TTL_MS) {
+    return rootsMemo.value;
+  }
+  const value = {
     claude: resolveFamily(DEFAULT_CLAUDE_ROOT, s.dataDirs.claude, env.CLAUDE_CONFIG_DIR),
     codex: resolveFamily(DEFAULT_CODEX_ROOT, s.dataDirs.codex, env.CODEX_HOME),
   };
+  rootsMemo = { key, atMs: nowMs, value };
+  return value;
 }
 
 /** Same physical directory? Realpaths both sides when resolvable, so a
