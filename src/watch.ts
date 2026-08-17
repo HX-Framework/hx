@@ -64,6 +64,10 @@ import {
   clearDestinationUploadError,
   recordDestinationUploadError,
   clearGenericBackoffs,
+  armCoalescedPersistence,
+  disarmCoalescedPersistence,
+  flushStateIfDirty,
+  hasDirtyState,
 } from "./state.js";
 import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
@@ -2066,6 +2070,11 @@ export async function tickOnce(
     }
   }
 
+  // Flush point: end of every pass. Coalesced-mode bookkeeping (mtime
+  // touches, registry updates, backoff stamps, artifact hashes) becomes
+  // durable here; a no-op in flush-through mode (`hx tick`, `--once`, and
+  // every non-daemon caller — nothing ever marks dirty there).
+  await flushStateIfDirty(scope);
   const snapshot = snapshotFrom(files, state);
   onProgress?.(snapshot);
   return { uploaded, failed, snapshot };
@@ -2083,6 +2092,11 @@ export async function startWatch(
   log(`[hx] watching data roots: ${describeRoots(resolveDataRoots(await readSettings()))}`);
   log(`[hx] poll interval ${FAST_POLL_MS}ms; gateway ${cfg.gatewayBaseUrl}`);
   void trimActivity(); // cap the UI journal once per daemon lifetime
+
+  // Coalesced state persistence is a LONG-RUNNING-LOOP privilege: this loop
+  // owns flush points (end of pass, the timer below, flush-through commits).
+  // One-shot runs have none, so they keep flush-through mode untouched.
+  if (!opts.oneShot) armCoalescedPersistence(scopeOf(cfg));
 
   // A restart is a human signalling "conditions changed" — serving out stale
   // exponential penalties helps nobody. After the 2026-08-01 credential
@@ -2172,6 +2186,18 @@ export async function startWatch(
   // audit by its next interval.
   let passBusy = false;
 
+  // Perf self-observability: per-pass duration + activity counters, folded
+  // into ONE hourly info line. The token format is deliberately chosen to
+  // never match the UI log classifier's warn/up patterns (no "failed=", no
+  // "error", no "(+…B") — see classifyLogLine in ui/data.ts.
+  const PERF_LOG_MS = 60 * 60_000;
+  const perf = { passes: 0, passMs: [] as number[], uploads: 0, flushes: 0 };
+  const perfLine = (): string => {
+    const sorted = [...perf.passMs].sort((a, b) => a - b);
+    const at = (q: number): number => sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!) : 0;
+    return `[hx] perf: passes=${perf.passes} passMs p50=${at(0.5)} p95=${at(0.95)} max=${Math.round(sorted[sorted.length - 1] ?? 0)} uploads=${perf.uploads} stateFlushes=${perf.flushes}`;
+  };
+
   // User-driven pause (settings.json, written by the UI server or a future
   // CLI). Checked every tick so a pause/resume takes effect within one poll.
   // Heartbeats keep running while paused — the device reads "online, paused",
@@ -2185,6 +2211,7 @@ export async function startWatch(
     // passBusy false, start, and then overlap the pass we're about to run —
     // exactly the in-flight-chunk-reads-as-divergence race the flag prevents.
     passBusy = true;
+    const passStartMs = Date.now();
     try {
       const settings = await readSettings();
       // Stamping is observation, not an upload: it must track Watched
@@ -2206,6 +2233,7 @@ export async function startWatch(
         log(`[hx] sync resumed`);
       }
       const { uploaded, failed } = await tickOnce(cfg, opts, log, reportSync);
+      perf.uploads += uploaded;
       if (uploaded || failed) {
         if (uploaded) lastContactMs = Date.now();
         log(`[hx] tick uploaded=${uploaded} failed=${failed}`);
@@ -2224,6 +2252,8 @@ export async function startWatch(
     } catch (err) {
       log(`[hx] tick error: ${(err as Error).message}`);
     } finally {
+      perf.passes += 1;
+      perf.passMs.push(Date.now() - passStartMs);
       passBusy = false;
     }
   };
@@ -2274,12 +2304,35 @@ export async function startWatch(
     void syncTeamMirror(cfg, log);
   }, MIRROR_SYNC_MS);
   const auditTimer = setInterval(() => void audit(), VERIFY_INTERVAL_MS);
+  // Coalesced-persistence safety net: bounds how long dirty bookkeeping can
+  // sit unflushed between passes (M2's ≤5 s), and the only flush that covers
+  // a hard kill landing between pass-end flushes.
+  const STATE_FLUSH_MS = 5_000;
+  const scope = scopeOf(cfg);
+  const flushTimer = setInterval(() => {
+    if (!hasDirtyState(scope)) return;
+    perf.flushes += 1;
+    void flushStateIfDirty(scope);
+  }, STATE_FLUSH_MS);
+  const perfTimer = setInterval(() => {
+    if (perf.passes === 0) return;
+    log(perfLine());
+    perf.passes = 0;
+    perf.passMs.length = 0;
+    perf.uploads = 0;
+    perf.flushes = 0;
+  }, PERF_LOG_MS);
   return {
     stop: () => {
       clearInterval(timer);
       clearInterval(hbTimer);
       clearInterval(mirrorTimer);
       clearInterval(auditTimer);
+      clearInterval(flushTimer);
+      clearInterval(perfTimer);
+      // Best-effort parting flush, then back to flush-through mode.
+      void flushStateIfDirty(scope);
+      disarmCoalescedPersistence(scope);
     },
   };
 }
