@@ -136,8 +136,8 @@ export function dataDirsPatchError(v: unknown): string | null {
 
 export async function readSettings(path: string = SETTINGS_PATH): Promise<HxSettings> {
   try {
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixed
-    // path under ~/.let/hx (tests inject a tmp path), never request input.
+    // Fixed path under ~/.let/hx (tests inject a tmp path), never request input.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename
     const raw = await readFile(path, "utf-8");
     const parsed = JSON.parse(raw) as Record<string, unknown> & Partial<HxSettings>;
     // Unknown top-level keys ride through VERBATIM (`tuning`, and anything a
