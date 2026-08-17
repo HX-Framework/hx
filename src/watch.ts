@@ -157,6 +157,11 @@ const CHILD_CONCURRENCY_DEFAULT = 4;
 const MAX_GROWN_CHUNK = 32 * 1024 * 1024;
 // Process-global in-flight chunk-buffer budget, shared across tee lanes (M8).
 const uploadBytesSemaphore = new ByteSemaphore(64 * 1024 * 1024);
+// Backstop only: the drain loop's real bounds are the byte budget + the
+// roundProgress/remaining breaks (≈16 rounds × destinations at the default
+// chunk). A pathological store that trims every round to a byte could
+// otherwise spin; this cap turns that into "finish next pass".
+const DRAIN_ROUNDS_BACKSTOP = 1024;
 // How often the daemon announces liveness when idle. Uploads already refresh
 // lastSeenAt, so a beat only fires when nothing has contacted the gateway for
 // this long — keeping idle traffic to ~1 tiny request/minute. The gateway's
@@ -648,9 +653,12 @@ export async function ingestOne(
   // same byte range — the JSON.parse of every line must run once, not once
   // per destination. Keyed (stepOffset, want): same range ⇒ same trim ⇒ same
   // bytes, even if the file grew meanwhile (endOffset was fixed by the trim).
-  const sliceSummaries = new Map<string, { endOffset: number; text: string; summary: ReturnType<typeof summariseChunk> }>();
+  // SUMMARIES ONLY — caching the chunk text would retain up to the whole
+  // 64 MB drain budget as strings per file, outside the byte semaphore's
+  // accounting (× pool width in catch-up: several times the M8 RSS bound).
+  const sliceSummaries = new Map<string, { endOffset: number; summary: ReturnType<typeof summariseChunk> }>();
   try {
-  for (let round = 0; round < 1024; round++) {
+  for (let round = 0; round < DRAIN_ROUNDS_BACKSTOP; round++) {
     // Get signed staging URLs for EVERY store this repo fans out to. repoSlug lets
     // the gateway attribute + resolve the destination set; each is echoed back as
     // its own vaultOrgId so commit replays it into the same store. A gateway that
@@ -717,211 +725,218 @@ export async function ingestOne(
       let trimmed: Buffer;
       let endOffset: number;
       try {
-      const slice = await readSlice(file.path, stepOffset, want);
-      ({ trimmed, endOffset } = trimAtLastNewline(slice, stepOffset));
-      if (trimmed.length === 0) continue;
-      const cacheKey = `${stepOffset}:${want}`;
-      let parsed = sliceSummaries.get(cacheKey);
-      if (!parsed || parsed.endOffset !== endOffset) {
-        const freshText = trimmed.toString("utf8");
-        parsed = { endOffset, text: freshText, summary: summariseChunk(freshText) };
-        sliceSummaries.set(cacheKey, parsed);
-      }
-      let text = parsed.text;
-      let summary = parsed.summary;
-      // Title/meta derivation runs where `summary` is FINAL for this commit —
-      // the growth probe below can shrink the chunk, replacing text+summary,
-      // so the derivation lives in a helper called after the PUT settles.
-      const deriveTitleMeta = (): { title: string | undefined; titleSource: "user" | "ai" | "fallback" | undefined } => {
-        let title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
-        let titleSource: "user" | "ai" | "fallback" | undefined;
-        if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
-        else if (summary.title) titleSource = summary.titleSource ?? undefined;
-        else if (head.title) titleSource = "ai";
-        // No user/AI title anywhere — synthesize a readable label so the session
-        // shows something meaningful instead of a bare id downstream. Only on a
-        // from-zero upload: a later appended chunk must not overwrite it with a
-        // mid-conversation message. Stamped "fallback" so the provenance stays
-        // honest.
-        if (!title && stepOffset === 0) {
-          const derived = deriveFallbackTitle(summary.firstUserText, head.cwd, head.repoSlug);
-          if (derived) {
-            title = derived;
-            titleSource = "fallback";
-          }
+        const slice = await readSlice(file.path, stepOffset, want);
+        ({ trimmed, endOffset } = trimAtLastNewline(slice, stepOffset));
+        if (trimmed.length === 0) continue;
+        const cacheKey = `${stepOffset}:${want}`;
+        let parsed = sliceSummaries.get(cacheKey);
+        if (!parsed || parsed.endOffset !== endOffset) {
+          parsed = { endOffset, summary: summariseChunk(trimmed.toString("utf8")) };
+          sliceSummaries.set(cacheKey, parsed);
         }
-        return { title, titleSource };
-      };
-
-      try {
-        // Upload bytes directly to this destination's store, then compose.
-        // Growth probe (dark unless tuning.chunkGrowth): a failure at a GROWN
-        // size retries this same step in place at the base size — no throw,
-        // no destination-error latch, no file backoff, no [error] line. The
-        // learned cap persists (state.chunkCaps) so restarts never re-probe;
-        // only a failure at the base size takes the normal error path.
-        const baseChunk = Math.min(opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT, DEFAULT_CHUNK_LIMIT);
-        try {
-          await putChunk(step.uploadUrl, trimmed);
-        } catch (growErr) {
-          if (!(opts.chunkGrowth === true) || chunkSize <= baseChunk) throw growErr;
-          const dk = destKey(step.vaultOrgId);
-          const shrunkWant = Math.min(st.size - stepOffset, baseChunk);
-          const shrunkSlice = await readSlice(file.path, stepOffset, shrunkWant);
-          const shrunk = trimAtLastNewline(shrunkSlice, stepOffset);
-          if (shrunk.trimmed.length === 0) throw growErr;
-          await putChunk(step.uploadUrl, shrunk.trimmed);
-          trimmed = shrunk.trimmed;
-          endOffset = shrunk.endOffset;
-          text = trimmed.toString("utf8");
-          summary = summariseChunk(text);
-          sliceSummaries.set(`${stepOffset}:${shrunkWant}`, { endOffset, text, summary });
-          await setChunkCap(dk, baseChunk, scope);
-          grownChunk.set(`${scope}:${dk}`, baseChunk);
-          if (!chunkCapLogged.has(dk)) {
-            chunkCapLogged.add(dk);
-            log(`[hx] chunk size settled at ${Math.round(baseChunk / (1024 * 1024))} MB for ${dk}`);
-          }
-        }
-        const { title, titleSource } = deriveTitleMeta();
-        const commit = await commitChunk(uploadCfg, {
-          family: fState.family as never,
-          sessionId: fState.sessionId,
-          chunkId: step.chunkId,
-          // A from-zero upload REPLACES this store's canonical instead of appending:
-          // at offset 0 anything it still holds can't be content this device hasn't
-          // sent (stale/duplicated canonical, or a freshly-joined vault). Old
-          // gateways ignore the flag and append, same result for a new session.
-          replace: step.replace,
-          vaultOrgId: step.vaultOrgId,
-          meta: {
-            sourcePath: file.path,
-            title,
-            titleSource,
-            ccdSessionId: ccdMeta?.ccdSessionId ?? undefined,
-            // cwd doubles as attribution EVIDENCE the gateway now persists
-            // (org rules match on it); evidenceUpload:false withholds it for
-            // devices whose org considers local paths sensitive.
-            cwd: cfg.evidenceUpload === false ? undefined : head.cwd,
-            gitBranch: head.gitBranch,
-            repoSlug,
-            entrypoint: head.entrypoint,
-            originator: head.originator,
-            modelProvider: head.modelProvider,
-            lastUserText: summary.lastUserText,
-            lastAssistantText: summary.lastAssistantText,
-            eventCount: summary.eventCount,
-            userTextCount: summary.userTextCount,
-            assistantCount: summary.assistantCount,
-            lastActivityAt: summary.lastActivityAt,
-          },
-        });
-        // Per-commit divergence check (let.ai-hosted only — the audit + self-heal
-        // protocol live there): a size mismatch means the store lost the canonical
-        // mid-session; reset just this destination to zero so the next pass
-        // re-uploads it with replace. Chunks never split a line, so a healthy
-        // canonical matches endOffset byte-for-byte.
-        const diverged =
-          !route.fortress &&
-          SELF_HEAL.get(scope) === true &&
-          step.vaultOrgId === null &&
-          commit.totalBytes !== endOffset;
-        if (diverged && (fState.healPausedUntilMs ?? 0) > Date.now()) {
-          // Heal is paused (a prior streak ping-ponged) — accept our own offset
-          // so the file stops re-uploading; the periodic audit keeps reporting
-          // the divergence and healing resumes when the pause lapses.
-          await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
-        } else if (diverged) {
-          const streak = await recordHeal(file.path, scope);
-          log(
-            `  [heal] ${fState.sessionId.slice(0, 8)}… canonical ${commit.totalBytes}B ≠ uploaded ${endOffset}B — re-uploading from zero`,
-          );
-          if ((fState.healPausedUntilMs ?? 0) > Date.now()) {
-            log(
-              `  [heal] ${fState.sessionId.slice(0, 8)}… diverged ${streak}x in a row — pausing self-heal for this file`,
-            );
-          }
-          await setOffsetFor(file.path, step.vaultOrgId, 0, st.mtimeMs, scope);
-        } else {
-          await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
-          // Only a clean APPEND (stepOffset > 0) ends a heal streak. The
-          // from-zero re-upload a heal triggers is ALSO clean by construction
-          // (we resend the whole file, so totalBytes == endOffset) — clearing
-          // on it would reset the counter every heal and the ping-pong latch
-          // could never reach its threshold. A clean append means the store
-          // accepted our tail without diverging: genuinely healthy.
-          if (stepOffset > 0 && fState.healCount !== undefined) {
-            await clearHeal(file.path, scope);
-          }
-        }
-        // Sidecars (tasks/plan) are whole-file + hash-gated and route server-side
-        // to the session's store, so one sync off any destination's new tail is
-        // enough — capture the first.
-        if (artifactText === null) artifactText = text;
-        // A committed chunk ends this destination's failure run (no-op unless
-        // one is latched — see recordDestinationUploadError in the catch).
-        await clearDestinationUploadError(destKey(step.vaultOrgId), scope);
-        anyProgress = true;
-        roundProgress = true;
-        {
-          const dk = destKey(step.vaultOrgId);
-          sentByDest.set(dk, (sentByDest.get(dk) ?? 0) + trimmed.length);
-          // Growth ladder: a clean commit of a FULL-SIZE request (want ===
-          // chunkSize, i.e. not the file tail) doubles the next cloud-lane
-          // chunk, up to the max and any learned cap. The TRIMMED length is
-          // deliberately not compared — real jsonl trims a partial line off
-          // nearly every chunk, which must not stall the ladder. Dark unless
-          // tuning.chunkGrowth.
-          if (
-            opts.chunkGrowth === true &&
-            !route.fortress &&
-            step.vaultOrgId === null &&
-            want === chunkSize
-          ) {
-            const learned = await getChunkCap(dk, scope);
-            const next = Math.min(chunkSize * 2, MAX_GROWN_CHUNK, learned ?? Infinity);
-            if (next > (grownChunk.get(`${scope}:${dk}`) ?? DEFAULT_CHUNK_LIMIT)) {
-              grownChunk.set(`${scope}:${dk}`, next);
+        let summary = parsed.summary;
+        // Title/meta derivation runs where `summary` is FINAL for this commit —
+        // the growth probe below can shrink the chunk, replacing text+summary,
+        // so the derivation lives in a helper called after the PUT settles.
+        const deriveTitleMeta = (): { title: string | undefined; titleSource: "user" | "ai" | "fallback" | undefined } => {
+          let title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
+          let titleSource: "user" | "ai" | "fallback" | undefined;
+          if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
+          else if (summary.title) titleSource = summary.titleSource ?? undefined;
+          else if (head.title) titleSource = "ai";
+          // No user/AI title anywhere — synthesize a readable label so the session
+          // shows something meaningful instead of a bare id downstream. Only on a
+          // from-zero upload: a later appended chunk must not overwrite it with a
+          // mid-conversation message. Stamped "fallback" so the provenance stays
+          // honest.
+          if (!title && stepOffset === 0) {
+            const derived = deriveFallbackTitle(summary.firstUserText, head.cwd, head.repoSlug);
+            if (derived) {
+              title = derived;
+              titleSource = "fallback";
             }
           }
-        }
-        log(
-          `  ${path.relative(homedir(), file.path)} (+${trimmed.length}B → ${step.vaultOrgId ?? "let.ai"}, ${fState.family}, ${fState.sessionId.slice(0, 8)}…)`,
-        );
-        // Local journal for the UI's traffic chart — best-effort, never awaited
-        // into the upload path's error handling.
-        void appendActivity({
-          at: Date.now(),
-          sessionId: fState.sessionId,
-          family: fState.family,
-          bytes: trimmed.length,
-          dest: destKey(step.vaultOrgId),
-        });
-      } catch (err) {
-        // One destination's vault being unavailable must not stall the others — log
-        // and move on; its offset stays put so the next pass retries just it.
-        if (err instanceof HxHttpError && err.serverUnavailable) {
-          lastUnavailable = err;
-          unavailableDests.add(destKey(step.vaultOrgId));
+          return { title, titleSource };
+        };
+
+        try {
+          // Upload bytes directly to this destination's store, then compose.
+          // Growth probe (dark unless tuning.chunkGrowth): a failure at a GROWN
+          // size retries this same step in place at the LAST-GOOD rung (the
+          // previous ladder step — proven by its own clean commit) — no throw,
+          // no destination-error latch, no file backoff, no [error] line. A
+          // size-shaped rejection (4xx: 413/EntityTooLarge and kin) persists
+          // the rung as the destination's cap (state.chunkCaps — restarts never
+          // re-probe); a 5xx/network blip learns nothing durable — the ladder
+          // just steps back in memory and may regrow. Only a failure at the
+          // base size takes the normal error path.
+          const baseChunk = Math.min(opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT, DEFAULT_CHUNK_LIMIT);
+          try {
+            await putChunk(step.uploadUrl, trimmed);
+          } catch (growErr) {
+            if (!(opts.chunkGrowth === true) || chunkSize <= baseChunk) throw growErr;
+            const dk = destKey(step.vaultOrgId);
+            const lastGood = Math.max(baseChunk, Math.floor(chunkSize / 2));
+            const shrunkWant = Math.min(st.size - stepOffset, lastGood);
+            const shrunkSlice = await readSlice(file.path, stepOffset, shrunkWant);
+            const shrunk = trimAtLastNewline(shrunkSlice, stepOffset);
+            if (shrunk.trimmed.length === 0) throw growErr;
+            await putChunk(step.uploadUrl, shrunk.trimmed);
+            trimmed = shrunk.trimmed;
+            endOffset = shrunk.endOffset;
+            summary = summariseChunk(trimmed.toString("utf8"));
+            sliceSummaries.set(`${stepOffset}:${shrunkWant}`, { endOffset, summary });
+            grownChunk.set(`${scope}:${dk}`, lastGood);
+            const sizeShaped =
+              growErr instanceof HxHttpError && growErr.status >= 400 && growErr.status < 500;
+            if (sizeShaped) {
+              await setChunkCap(dk, lastGood, scope);
+              if (!chunkCapLogged.has(dk)) {
+                chunkCapLogged.add(dk);
+                log(`[hx] chunk size settled at ${Math.round(lastGood / (1024 * 1024))} MB for ${dk}`);
+              }
+            }
+          }
+          const { title, titleSource } = deriveTitleMeta();
+          const commit = await commitChunk(uploadCfg, {
+            family: fState.family as never,
+            sessionId: fState.sessionId,
+            chunkId: step.chunkId,
+            // A from-zero upload REPLACES this store's canonical instead of appending:
+            // at offset 0 anything it still holds can't be content this device hasn't
+            // sent (stale/duplicated canonical, or a freshly-joined vault). Old
+            // gateways ignore the flag and append, same result for a new session.
+            replace: step.replace,
+            vaultOrgId: step.vaultOrgId,
+            meta: {
+              sourcePath: file.path,
+              title,
+              titleSource,
+              ccdSessionId: ccdMeta?.ccdSessionId ?? undefined,
+              // cwd doubles as attribution EVIDENCE the gateway now persists
+              // (org rules match on it); evidenceUpload:false withholds it for
+              // devices whose org considers local paths sensitive.
+              cwd: cfg.evidenceUpload === false ? undefined : head.cwd,
+              gitBranch: head.gitBranch,
+              repoSlug,
+              entrypoint: head.entrypoint,
+              originator: head.originator,
+              modelProvider: head.modelProvider,
+              lastUserText: summary.lastUserText,
+              lastAssistantText: summary.lastAssistantText,
+              eventCount: summary.eventCount,
+              userTextCount: summary.userTextCount,
+              assistantCount: summary.assistantCount,
+              lastActivityAt: summary.lastActivityAt,
+            },
+          });
+          // Per-commit divergence check (let.ai-hosted only — the audit + self-heal
+          // protocol live there): a size mismatch means the store lost the canonical
+          // mid-session; reset just this destination to zero so the next pass
+          // re-uploads it with replace. Chunks never split a line, so a healthy
+          // canonical matches endOffset byte-for-byte.
+          const diverged =
+            !route.fortress &&
+            SELF_HEAL.get(scope) === true &&
+            step.vaultOrgId === null &&
+            commit.totalBytes !== endOffset;
+          if (diverged && (fState.healPausedUntilMs ?? 0) > Date.now()) {
+            // Heal is paused (a prior streak ping-ponged) — accept our own offset
+            // so the file stops re-uploading; the periodic audit keeps reporting
+            // the divergence and healing resumes when the pause lapses.
+            await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
+          } else if (diverged) {
+            const streak = await recordHeal(file.path, scope);
+            log(
+              `  [heal] ${fState.sessionId.slice(0, 8)}… canonical ${commit.totalBytes}B ≠ uploaded ${endOffset}B — re-uploading from zero`,
+            );
+            if ((fState.healPausedUntilMs ?? 0) > Date.now()) {
+              log(
+                `  [heal] ${fState.sessionId.slice(0, 8)}… diverged ${streak}x in a row — pausing self-heal for this file`,
+              );
+            }
+            await setOffsetFor(file.path, step.vaultOrgId, 0, st.mtimeMs, scope);
+          } else {
+            await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
+            // Only a clean APPEND (stepOffset > 0) ends a heal streak. The
+            // from-zero re-upload a heal triggers is ALSO clean by construction
+            // (we resend the whole file, so totalBytes == endOffset) — clearing
+            // on it would reset the counter every heal and the ping-pong latch
+            // could never reach its threshold. A clean append means the store
+            // accepted our tail without diverging: genuinely healthy.
+            if (stepOffset > 0 && fState.healCount !== undefined) {
+              await clearHeal(file.path, scope);
+            }
+          }
+          // Sidecars (tasks/plan) are whole-file + hash-gated and route server-side
+          // to the session's store, so one sync off any destination's new tail is
+          // enough — capture the first (decoded from the local buffer; chunk text
+          // is deliberately never cached).
+          if (artifactText === null) artifactText = trimmed.toString("utf8");
+          // A committed chunk ends this destination's failure run (no-op unless
+          // one is latched — see recordDestinationUploadError in the catch).
+          await clearDestinationUploadError(destKey(step.vaultOrgId), scope);
+          anyProgress = true;
+          roundProgress = true;
+          {
+            const dk = destKey(step.vaultOrgId);
+            sentByDest.set(dk, (sentByDest.get(dk) ?? 0) + trimmed.length);
+            // Growth ladder: a clean commit of a FULL-SIZE request (want ===
+            // chunkSize, i.e. not the file tail) doubles the next cloud-lane
+            // chunk, up to the max and any learned cap. The TRIMMED length is
+            // deliberately not compared — real jsonl trims a partial line off
+            // nearly every chunk, which must not stall the ladder. Dark unless
+            // tuning.chunkGrowth.
+            if (
+              opts.chunkGrowth === true &&
+              !route.fortress &&
+              step.vaultOrgId === null &&
+              want === chunkSize
+            ) {
+              const learned = await getChunkCap(dk, scope);
+              const next = Math.min(chunkSize * 2, MAX_GROWN_CHUNK, learned ?? Infinity);
+              if (next > (grownChunk.get(`${scope}:${dk}`) ?? DEFAULT_CHUNK_LIMIT)) {
+                grownChunk.set(`${scope}:${dk}`, next);
+              }
+            }
+          }
           log(
-            `  [hx] destination ${step.vaultOrgId ?? "let.ai"} unavailable (${err.status}); will retry`,
+            `  ${path.relative(homedir(), file.path)} (+${trimmed.length}B → ${step.vaultOrgId ?? "let.ai"}, ${fState.family}, ${fState.sessionId.slice(0, 8)}…)`,
           );
-          continue;
+          // Local journal for the UI's traffic chart — best-effort, never awaited
+          // into the upload path's error handling.
+          void appendActivity({
+            at: Date.now(),
+            sessionId: fState.sessionId,
+            family: fState.family,
+            bytes: trimmed.length,
+            dest: destKey(step.vaultOrgId),
+          });
+        } catch (err) {
+          // One destination's vault being unavailable must not stall the others — log
+          // and move on; its offset stays put so the next pass retries just it.
+          if (err instanceof HxHttpError && err.serverUnavailable) {
+            lastUnavailable = err;
+            unavailableDests.add(destKey(step.vaultOrgId));
+            log(
+              `  [hx] destination ${step.vaultOrgId ?? "let.ai"} unavailable (${err.status}); will retry`,
+            );
+            continue;
+          }
+          // A hard rejection (403/401/400) from a REACHABLE store. Latch it on
+          // the destination registry before the error propagates into the
+          // generic per-file backoff: without this, a store rejecting every
+          // write is indistinguishable from a slow backlog — the shape that hid
+          // a 12-hour credential outage behind a silent "0%".
+          if (err instanceof HxHttpError) {
+            await recordDestinationUploadError(
+              destKey(step.vaultOrgId),
+              uploadErrorCode(err),
+              scope,
+            ).catch(() => {});
+          }
+          throw err;
         }
-        // A hard rejection (403/401/400) from a REACHABLE store. Latch it on
-        // the destination registry before the error propagates into the
-        // generic per-file backoff: without this, a store rejecting every
-        // write is indistinguishable from a slow backlog — the shape that hid
-        // a 12-hour credential outage behind a silent "0%".
-        if (err instanceof HxHttpError) {
-          await recordDestinationUploadError(
-            destKey(step.vaultOrgId),
-            uploadErrorCode(err),
-            scope,
-          ).catch(() => {});
-        }
-        throw err;
-      }
       } finally {
         release();
       }
@@ -2171,12 +2186,15 @@ export async function tickOnce(
         // exponential backoff in run() still handles the outage itself.
         gatewayUnavailableFiles.add(f.path);
         if (gatewayUnavailableFiles.size >= 2) {
-          log(
-            `  [hx] gateway unavailable (${err.status}) on ${gatewayUnavailableFiles.size} files; pausing this pass`,
-          );
-          // Stop DEQUEUEING; already-launched workers settle (M4's ≤
-          // concurrency−1 bound) — the sequential loop's `break`, pooled.
-          stopPass = true;
+          // The check-log-latch runs with no await between, so exactly ONE
+          // worker crosses the threshold un-latched — the pause line prints
+          // once per pass, as the sequential loop's `break` did.
+          if (!stopPass) {
+            stopPass = true;
+            log(
+              `  [hx] gateway unavailable (${err.status}) on ${gatewayUnavailableFiles.size} files; pausing this pass`,
+            );
+          }
           return;
         }
         // Fixed bench, NOT recordFileFailure: the probe is not this file's
@@ -2575,10 +2593,26 @@ export async function startWatch(
   // a hard kill landing between pass-end flushes.
   const STATE_FLUSH_MS = 5_000;
   const scope = scopeOf(cfg);
+  let flushFailureLogged = false;
   const flushTimer = setInterval(() => {
     if (!hasDirtyState(scope)) return;
     perf.flushes += 1;
-    void flushStateIfDirty(scope);
+    // A rejected flush must never become an unhandled rejection (Bun exits
+    // the process on those). flushStateIfDirty re-marked the scope dirty, so
+    // this same timer retries; log the streak once, not every 5 s.
+    flushStateIfDirty(scope).then(
+      () => {
+        flushFailureLogged = false;
+      },
+      (err) => {
+        if (!flushFailureLogged) {
+          flushFailureLogged = true;
+          // Same shape as the existing failure lines (heartbeat error:, tick
+          // error:) — classifies warn in the UI, as a real failure should.
+          log(`[hx] state flush error: ${(err as Error).message} (will keep retrying)`);
+        }
+      },
+    );
   }, STATE_FLUSH_MS);
   const perfTimer = setInterval(() => {
     if (perf.passes === 0) return;
@@ -2596,8 +2630,9 @@ export async function startWatch(
       clearInterval(auditTimer);
       clearInterval(flushTimer);
       clearInterval(perfTimer);
-      // Best-effort parting flush, then back to flush-through mode.
-      void flushStateIfDirty(scope);
+      // Best-effort parting flush, then back to flush-through mode. Swallow —
+      // a rejection here would be unhandled, and stop() has no retry loop.
+      flushStateIfDirty(scope).catch(() => {});
       disarmCoalescedPersistence(scope);
     },
   };

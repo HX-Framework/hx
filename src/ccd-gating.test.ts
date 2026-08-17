@@ -137,3 +137,35 @@ describe("readCcdRecentsCached", () => {
     assert.equal(later, a, "unchanged fingerprint kept the cached records identity");
   });
 });
+
+describe("mirror rebuild inside the records TTL", () => {
+  it("a rebuild triggered by a session-file change sees the NEW mapping even when the records cache is TTL-fresh", async () => {
+    const { sessions } = setup("Alpha");
+    // Prime the records cache (the ingest path does this constantly).
+    const primed = await readCcdRecentsCached(1_000);
+    assert.equal(primed[0]!.cliSessionId, "cli-1");
+
+    // CCD rewrites the metadata 1s later — cliSessionId changes on disk.
+    writeFileSync(
+      join(sessions, "acct", "org", "local_aaa.json"),
+      JSON.stringify({
+        sessionId: "local_aaa",
+        cliSessionId: "cli-CHANGED",
+        title: "T",
+        titleSource: "user",
+        isArchived: false,
+        lastActivityAt: 2,
+      }),
+    );
+
+    // Mirror cycle 3s later — WITHIN the 10s records TTL of the prime. The
+    // session fingerprint moved, so the rebuild must NOT accept the stale
+    // TTL-cached records (it would otherwise cache the stale blob under the
+    // FRESH fingerprint — permanently wrong until the store changes again).
+    const blob = await buildGroupMirror(4_000);
+    assert.deepEqual(blob.groups[0]!.sessionIds, ["cli-CHANGED"], "fresh mapping despite TTL-fresh cache");
+
+    const again = await buildGroupMirror(6_000);
+    assert.deepEqual(again.groups[0]!.sessionIds, ["cli-CHANGED"], "and it stays correct");
+  });
+});

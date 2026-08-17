@@ -477,15 +477,25 @@ function persistOrMark(state: HxState, scope: StateScope): Promise<void> {
 
 /** Write the scope's state to disk now and clear its dirty flag. Used by the
  *  flush-through mutators (whose full-state write necessarily includes every
- *  pending coalesced mutation) and by the daemon's flush points. */
+ *  pending coalesced mutation) and by the daemon's flush points. A failed
+ *  write (after schedulePersist's one retry) RE-MARKS the scope dirty before
+ *  rethrowing, so the periodic flush keeps retrying instead of stranding the
+ *  in-memory mutations behind a cleared flag. */
 async function persistThrough(state: HxState, scope: StateScope): Promise<void> {
   dirtyScopes.delete(scope);
-  await schedulePersist(state, scope);
+  try {
+    await schedulePersist(state, scope);
+  } catch (err) {
+    dirtyScopes.add(scope);
+    throw err;
+  }
 }
 
 /** Flush a scope's coalesced mutations if any are pending. The daemon calls
  *  this at the end of every pass and on a short timer; a no-op everywhere
- *  else (nothing ever marks dirty outside coalesced mode). */
+ *  else (nothing ever marks dirty outside coalesced mode). Rejections carry
+ *  through to the caller (which logs) — the dirty flag was already re-marked,
+ *  so the next flush point retries. */
 export async function flushStateIfDirty(scope: StateScope = "main"): Promise<void> {
   if (!dirtyScopes.has(scope)) return;
   const state = await loadState(scope);
@@ -601,13 +611,16 @@ async function persist(state: HxState, scope: StateScope): Promise<void> {
 // commit-flushes from becoming N serialized full-file writes.
 const queuedWrite = new Map<StateScope, Promise<void>>();
 
-/** Chain writes per scope so we never have two writers racing on one file. */
+/** Chain writes per scope so we never have two writers racing on one file.
+ *  A failed write RETRIES ONCE immediately (the base contract — a transient
+ *  EBUSY/EPERM from an AV or indexer holding the file, classic on Windows,
+ *  must stay invisible); a double failure rejects to the awaiting caller. */
 function schedulePersist(state: HxState, scope: StateScope): Promise<void> {
   const queued = queuedWrite.get(scope);
   if (queued) return queued;
   const start = (): Promise<void> => {
     queuedWrite.delete(scope); // the write begins: later mutations must re-queue
-    return persist(state, scope);
+    return persist(state, scope).catch(() => persist(state, scope));
   };
   const chain = (writeChains.get(scope) ?? Promise.resolve()).then(start, start);
   writeChains.set(scope, chain);

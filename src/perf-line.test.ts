@@ -32,3 +32,22 @@ describe("formatPerfLine", () => {
     assert.match(line, /^\[hx\] perf: passes=3 passMs p50=\d+ p95=\d+ max=\d+ uploads=2 stateFlushes=1$/);
   });
 });
+
+describe("other new WS3/WS6 log lines", () => {
+  it("the chunk-cap settled line classifies as info", () => {
+    // Emitted once per destination when the growth probe learns a cap
+    // (watch.ts). Growth is cloud-lane-only, so dk is always "letai" today —
+    // but pin an org-id shape too in case that ever widens.
+    for (const dk of ["letai", "org-abc123"]) {
+      for (const mb of [4, 8, 16]) {
+        const line = `[hx] chunk size settled at ${mb} MB for ${dk}`;
+        assert.equal(classifyLogLine(line), "info", line);
+      }
+    }
+  });
+
+  it("the state-flush failure line classifies as warn (it IS a warning)", () => {
+    const line = `[hx] state flush error: EBUSY: resource busy (will keep retrying)`;
+    assert.equal(classifyLogLine(line), "warn", "a real failure renders warn, like its siblings");
+  });
+});

@@ -243,9 +243,11 @@ export async function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorB
   // so a freshly-stamped session still matches via the ccdSessionId fallback.
   const cliByCcd = new Map<string, string>();
   try {
-    // Cached (≤10 s stale, stat-fingerprint-gated) — the sessions store was
-    // historically re-read in full here every 20 s cycle.
-    for (const r of await readCcdRecentsCached(nowMs)) {
+    // Cached — but pinned to THIS rebuild's fresh fingerprint: passing sessFp
+    // forces a refresh when the TTL-cached records predate the change that
+    // triggered this rebuild (they'd otherwise be cached under the fresh
+    // fingerprint and never corrected).
+    for (const r of await readCcdRecentsCached(nowMs, sessFp || undefined)) {
       if (r.cliSessionId) cliByCcd.set(r.ccdSessionId, r.cliSessionId);
     }
   } catch {

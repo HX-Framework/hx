@@ -176,6 +176,31 @@ describe("coalesced mode", () => {
   });
 });
 
+describe("flush failure resilience", () => {
+  it("a failed flush re-marks the scope dirty and the next flush point retries", async () => {
+    freshDir();
+    await upsertFileState(entry("/a"));
+    armCoalescedPersistence("main");
+    await touchMtime("/a", 500);
+    assert.equal(hasDirtyState("main"), true);
+
+    // Point the state dir somewhere unwritable (a path under a plain FILE —
+    // mkdir recursive fails deterministically on every platform).
+    const blocker = join(dir, "blocker");
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(blocker, "not a dir");
+    setStateDirForTests(join(blocker, "sub"));
+    await assert.rejects(flushStateIfDirty("main"), "double-failed write rejects to the caller");
+    assert.equal(hasDirtyState("main"), true, "dirty flag re-marked — the timer will retry");
+
+    // Heal the path: the retry flushes everything that was pending.
+    setStateDirForTests(dir);
+    await flushStateIfDirty("main");
+    assert.equal(hasDirtyState("main"), false);
+    assert.equal(diskState().files["/a"]!.lastMtimeMs, 500, "pending mutation survived the outage");
+  });
+});
+
 describe("persist format", () => {
   it("writes compact JSON that round-trips unknown top-level keys", async () => {
     freshDir();

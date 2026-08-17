@@ -31,7 +31,7 @@ import {
 import { formatOutage, needsAttention, type SyncLedger } from "./ledger.js";
 import { collapseHome, isPaused, readSettings, writeSettings, type HxSettings } from "./settings.js";
 import { resolveDataRoots, type ResolvedRoots } from "./roots.js";
-import { loadState, resetStateCache } from "./state.js";
+import { flushStateIfDirty, loadState, resetStateCache } from "./state.js";
 import { daemonAction, disconnectDevice, retryBlocked } from "./maintenance.js";
 import { checkForUpdate } from "./update.js";
 import { watch as watchDir } from "node:fs";
@@ -411,7 +411,13 @@ async function cmdWatch(): Promise<void> {
       log("\n[hx] stopping…");
       main.stop();
       local?.stop();
-      process.exit(0);
+      // Give coalesced state its best-effort parting flush before exiting —
+      // this handler exits synchronously otherwise, so the flush the once-
+      // handler in state.ts started would never get its microtasks. Bounded:
+      // allSettled never rejects, and both scopes are usually clean.
+      void Promise.allSettled([flushStateIfDirty("main"), flushStateIfDirty("local")]).finally(
+        () => process.exit(0),
+      );
     });
   }
 }

@@ -167,17 +167,23 @@ describe("ingestOne drain", () => {
     assert.equal(did, true);
 
     // The 16 MB attempt failed invisibly (never recorded — the stub logs only
-    // successful PUTs); the retry and everything after ran at the 4 MB base.
+    // successful PUTs); the retry ran at LAST-GOOD (8 MB — proven by its own
+    // clean commit), which becomes the persisted cap. A 413 must not forfeit
+    // the proven rung down to base.
     assert.deepEqual(
       ledger.putBodies.slice(0, 2).map((b) => Math.round(b / MB)),
       [4, 8],
       "ladder up to the failure",
     );
     assert.ok(
-      ledger.putBodies.slice(2).every((b) => b <= 4 * MB),
-      "every body after the probe is base-size",
+      ledger.putBodies.slice(2).every((b) => b <= 8 * MB),
+      "every body after the probe is at most the last-good rung",
     );
-    assert.equal(await getChunkCap("letai"), 4 * MB, "learned cap persisted");
+    assert.ok(
+      ledger.putBodies.slice(2).some((b) => Math.round(b / MB) === 8),
+      "the retry itself ran at the last-good 8 MB",
+    );
+    assert.equal(await getChunkCap("letai"), 8 * MB, "learned cap persisted at last-good");
 
     const state = await loadState();
     assert.equal(state.files[f.path]!.offsets["letai"], f.size, "file fully delivered regardless");
@@ -185,8 +191,8 @@ describe("ingestOne drain", () => {
     assert.equal(state.destinations?.["letai"]?.consecutiveErrors, undefined, "no registry latch");
     assert.ok(!logs.some((l) => l.includes("[error]")), "no [error] line");
     assert.ok(
-      logs.some((l) => l.includes("chunk size settled at 4 MB")),
-      "one informational cap line",
+      logs.some((l) => l.includes("chunk size settled at 8 MB")),
+      "one informational cap line at the last-good rung",
     );
 
     // Restart-equivalent: a fresh drain honors the persisted cap, no re-probe.
@@ -210,9 +216,42 @@ describe("ingestOne drain", () => {
     const ledger2 = stubGateway({ putMaxBytes: 8 * MB });
     await ingestOne(cfg, f2, { chunkGrowth: true }, silentLog);
     assert.ok(
-      ledger2.putBodies.every((b) => b <= 4 * MB),
-      "persisted cap prevents any re-probe",
+      ledger2.putBodies.every((b) => b <= 8 * MB),
+      "persisted cap bounds every chunk — nothing above the learned rung, so no re-probe",
     );
+  });
+
+  it("a transient 5xx at a grown size steps the ladder back WITHOUT persisting a cap", async () => {
+    const f = await seedFile(28 * MB, 998);
+    // Fail exactly one PUT (the first 16 MB attempt) with a 500, then heal.
+    let failed = false;
+    const ledger = stubGateway();
+    const inner = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (!failed && u.startsWith("https://blob.test/staging")) {
+        const body = init?.body as Uint8Array;
+        if (body && body.byteLength > 8 * MB) {
+          failed = true;
+          return new Response("transient", { status: 500 });
+        }
+      }
+      return (inner as typeof fetch)(url as string, init);
+    }) as unknown as typeof fetch;
+
+    const logs: string[] = [];
+    const did = await ingestOne(cfg, f, { chunkGrowth: true }, (m) => logs.push(m));
+    assert.equal(did, true);
+    assert.equal(failed, true, "the injected 500 fired");
+    assert.equal(await getChunkCap("letai"), undefined, "no durable cap from a transient error");
+    assert.ok(!logs.some((l) => l.includes("settled")), "no cap line either");
+    assert.ok(
+      ledger.putBodies.some((b) => Math.round(b / MB) === 8),
+      "the in-place retry ran at the last-good rung",
+    );
+    const state = await loadState();
+    assert.equal(state.files[f.path]!.offsets["letai"], f.size, "delivered despite the blip");
+    assert.equal(state.files[f.path]!.consecutiveFailures, undefined, "no file backoff");
   });
 
   it("chunkLimitBytes stays an absolute override even under growth", async () => {

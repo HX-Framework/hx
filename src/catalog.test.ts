@@ -278,6 +278,82 @@ describe("catalog equivalence", () => {
     assert.ok(catalogSet(cat).has(`${p2}|60|${at(-2 * H)}`), "new root swept within one tick");
   });
 
+  it("a file created EMPTY is admitted once it grows — the excluded lane", async () => {
+    const roots = mkRoots();
+    mkFile("pa", "other.jsonl", 100, at(-1 * H)); // keeps the dir in-window
+    const p = mkFile("pa", "born-empty.jsonl", 0, at(0));
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    assert.ok(!cat.listFiles().some((f) => f.path === p), "size-0 not admitted (discovery parity)");
+
+    appendFileSync(p, "grown now!");
+    touch(p, at(1_000));
+    touch(join(base, "claude", "projects", "pa"), at(0)); // appends bump no dir mtime
+    await cat.sweep(roots, at(61_500)); // ≤ cold cadence later
+    assert.ok(
+      catalogSet(cat).has(`${p}|10|${at(1_000)}`),
+      "excluded lane re-admitted the grown file without any dir churn",
+    );
+    assert.deepEqual(catalogSet(cat), await groundTruth(roots));
+  });
+
+  it("truncate-to-zero then regrow re-admits within the cold cadence", async () => {
+    const roots = mkRoots();
+    const p = mkFile("pa", "trunc.jsonl", 100, at(0)); // hot
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    assert.ok(cat.listFiles().some((f) => f.path === p));
+
+    writeFileSync(p, ""); // truncated
+    touch(p, at(1_000));
+    touch(join(base, "claude", "projects", "pa"), at(0));
+    await cat.sweep(roots, at(1_500)); // hot stat sees size 0 → excluded lane
+    assert.ok(!cat.listFiles().some((f) => f.path === p), "empty file leaves the inventory");
+
+    writeFileSync(p, "back!");
+    touch(p, at(2_000));
+    touch(join(base, "claude", "projects", "pa"), at(0));
+    await cat.sweep(roots, at(63_000));
+    assert.ok(catalogSet(cat).has(`${p}|5|${at(2_000)}`), "regrowth re-admitted");
+  });
+
+  it("a genuinely aged-out file re-admits after a fresh append with the dir mtime unmoved", async () => {
+    const roots = mkRoots();
+    mkFile("pa", "fresh.jsonl", 50, at(-1 * H)); // keeps the dir recent
+    const p = mkFile("pa", "ancient.jsonl", 100, at(-31 * DAY), at(-1 * H));
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    assert.ok(!cat.listFiles().some((f) => f.path === p), "beyond-window file not admitted");
+
+    appendFileSync(p, "resumed");
+    touch(p, at(0)); // fresh append — but the dir mtime never moves
+    touch(join(base, "claude", "projects", "pa"), at(-1 * H));
+    await cat.sweep(roots, at(61_500));
+    assert.ok(
+      cat.listFiles().some((f) => f.path === p && f.size === 107),
+      "resume-append re-admitted via the excluded lane",
+    );
+    assert.deepEqual(catalogSet(cat), await groundTruth(roots));
+  });
+
+  it("codex deletions land within one tick (file and whole date dir)", async () => {
+    const roots = mkRoots();
+    const p1 = mkCodex("15", "rollout-2026-08-15T10-00-00-aaaa.jsonl", 50, at(-2 * H));
+    const p2 = mkCodex("16", "rollout-2026-08-16T10-00-00-bbbb.jsonl", 60, at(-2 * H));
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    assert.ok(cat.listFiles().some((f) => f.path === p1));
+
+    rmSync(p1);
+    await cat.sweep(roots, at(1_500));
+    assert.ok(!cat.listFiles().some((f) => f.path === p1), "deleted rollout gone next tick");
+
+    rmSync(join(base, "codex", "sessions", "2026", "08", "16"), { recursive: true });
+    await cat.sweep(roots, at(3_000));
+    assert.ok(!cat.listFiles().some((f) => f.path === p2), "wholesale date-dir removal gone next tick");
+    assert.deepEqual(catalogSet(cat), await groundTruth(roots));
+  });
+
   it("randomized op sequences settle to exact discovery equivalence", async () => {
     const roots = mkRoots();
     let seed = 0x5eed;
@@ -290,6 +366,7 @@ describe("catalog equivalence", () => {
     };
     const cat = new DiscoveryCatalog();
     const live: string[] = [];
+    const codexLive: string[] = [];
     let clock = 0;
     for (let i = 0; i < 60; i++) {
       const op = rnd();
@@ -310,8 +387,13 @@ describe("catalog equivalence", () => {
       } else if (op < 0.85) {
         const sid = `s${i}`;
         mkChild(proj, sid, `a${i}`, 30, at(clock - 10 * MIN));
+      } else if (op < 0.93 || codexLive.length === 0) {
+        codexLive.push(
+          mkCodex(String(10 + (i % 18)).padStart(2, "0"), `rollout-2026-08-${String(10 + (i % 18)).padStart(2, "0")}T00-00-00-${i}aaa.jsonl`, 40, at(-rnd() * 20 * DAY)),
+        );
       } else {
-        mkCodex(String(10 + (i % 18)).padStart(2, "0"), `rollout-2026-08-${String(10 + (i % 18)).padStart(2, "0")}T00-00-00-${i}aaa.jsonl`, 40, at(-rnd() * 20 * DAY));
+        const idx = Math.floor(rnd() * codexLive.length);
+        rmSync(codexLive.splice(idx, 1)[0]!, { force: true });
       }
       clock += 1_500;
       await cat.sweep(roots, at(clock));

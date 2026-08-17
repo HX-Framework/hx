@@ -169,13 +169,25 @@ const CCD_CACHE_TTL_MS = 10_000;
 let recordsCache: { atMs: number; fp: string; records: CcdSessionMeta[] } | null = null;
 let recordsInFlight: Promise<CcdSessionMeta[]> | null = null;
 
-/** All CCD records, ≤ TTL stale, re-read only when the store changed. */
-export async function readCcdRecentsCached(nowMs: number): Promise<CcdSessionMeta[]> {
-  if (recordsCache && nowMs - recordsCache.atMs < CCD_CACHE_TTL_MS) return recordsCache.records;
+/** All CCD records, ≤ TTL stale, re-read only when the store changed.
+ *
+ *  `expectedFp` (a fingerprint the CALLER just computed) bypasses the TTL
+ *  when it differs from the cached one: the mirror cycle fingerprints the
+ *  store itself, and without this a rebuild landing INSIDE the TTL of a
+ *  pre-change read would build from stale records yet be cached under the
+ *  fresh fingerprint — permanently stale until the store changes again. */
+export async function readCcdRecentsCached(
+  nowMs: number,
+  expectedFp?: string,
+): Promise<CcdSessionMeta[]> {
+  if (recordsCache && nowMs - recordsCache.atMs < CCD_CACHE_TTL_MS) {
+    if (expectedFp === undefined || recordsCache.fp === expectedFp) return recordsCache.records;
+    // TTL-fresh but fingerprint-stale — fall through to a forced refresh.
+  }
   if (recordsInFlight) return recordsInFlight;
   recordsInFlight = (async () => {
     try {
-      const fp = await ccdSessionsFingerprint();
+      const fp = expectedFp ?? (await ccdSessionsFingerprint());
       if (recordsCache && recordsCache.fp === fp) {
         recordsCache = { ...recordsCache, atMs: nowMs };
         return recordsCache.records;
