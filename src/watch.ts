@@ -32,6 +32,7 @@ import {
   type ResolvedRoots,
   claudeTasksDir,
   claudeTeamsDir,
+  invalidateRootsMemo,
   isUnderRoots,
   resolveDataRoots,
   rootsSignature,
@@ -2238,14 +2239,21 @@ export async function tickOnce(
   // stats/tick measured) — the exact per-tick sweep C1 removed, resurrected
   // inside the pass. The legacy sweep (tuning.sweep="legacy") passes
   // everything, preserving the base's stat-per-file behavior byte-for-byte.
-  const poolNowMs = Date.now();
   const pooled = !catalog
     ? files
     : files.filter((f) => {
         const fs = state.files[f.path];
         if (!fs) return true;
         if (fs.skipReason) return true;
-        if (fs.nextAttemptAtMs && fs.nextAttemptAtMs > poolNowMs) return true;
+        // PRESENCE of failure bookkeeping, not just an active window: an
+        // EXPIRED backoff on a caught-up file must still pool once so the
+        // post-ingest clearFileFailure fires — otherwise the stale streak
+        // survives and escalates the NEXT unrelated failure's backoff
+        // (active backoffs keep their per-tick stuck-log exactly as before).
+        if (fs.consecutiveFailures !== undefined || fs.nextAttemptAtMs !== undefined) return true;
+        // Legacy pre-cwd state entries get their one-time re-seed (the base
+        // paid it on its first pass) so folder/rule exclusions can match.
+        if (fs.cwd === undefined) return true;
         if (!settings.personalSync && fs.attributed === undefined) return true;
         if (f.size !== minOffset(fs)) return true;
         if (fs.lastMtimeMs !== f.mtimeMs) return true;
@@ -2537,6 +2545,11 @@ export async function startWatch(
     // passBusy false, start, and then overlap the pass we're about to run —
     // exactly the in-flight-chunk-reads-as-divergence race the flag prevents.
     passBusy = true;
+    // Every tick observes the filesystem's root set FRESH, by construction —
+    // an off-slot timer (mirror, audit) must not leave the sub-tick roots
+    // memo warm across a tick boundary and delay a root-set change past the
+    // one-poll visibility the base gave it.
+    invalidateRootsMemo();
     const passStartMs = Date.now();
     try {
       const settings = await readSettings();

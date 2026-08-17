@@ -85,18 +85,21 @@ function resolveFamily(
 }
 
 // Sub-tick memo: the daemon resolves roots more than once per tick (tickOnce
-// and publishRoots each resolve, off separate settings reads), and every
-// resolution pays existsSync + realpathSync per candidate — measured at ~10%
-// of a core on WSL at tick cadence in the 10k-tree e2e. Roots were only ever
-// OBSERVED at tick boundaries, and the TTL sits under FAST_POLL_MS, so each
-// tick's FIRST resolution is always fresh — per-tick freshness is identical,
-// only within-tick duplicates collapse. A settings/env change alters the
-// input key and bypasses the TTL outright.
+// and publishRoots each resolve, off separate settings reads; the mirror and
+// audit timers add off-slot calls), and every resolution pays existsSync +
+// realpathSync per candidate — measured at ~10% of a core on WSL at tick
+// cadence in the 10k-tree e2e. The TTL alone does NOT guarantee each tick a
+// fresh view (an off-slot timer can re-stamp the memo just before a tick
+// slot), so the daemon's run() calls invalidateRootsMemo() at the top of
+// every tick — the tick's first resolution is fresh BY CONSTRUCTION and
+// later same-tick calls collapse. A settings/env change alters the input
+// key and bypasses the memo outright either way.
 const ROOTS_MEMO_TTL_MS = 1_200;
 let rootsMemo: { key: string; atMs: number; value: ResolvedRoots } | null = null;
 
-/** Test seam — drop the sub-tick memo so fs mutations are seen immediately. */
-export function clearRootsMemoForTests(): void {
+/** Drop the memo so the next resolution re-observes the filesystem. The
+ *  daemon calls this at every tick boundary; tests use it around fs edits. */
+export function invalidateRootsMemo(): void {
   rootsMemo = null;
 }
 

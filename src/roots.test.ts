@@ -7,7 +7,7 @@ import { DEFAULT_SETTINGS, type HxSettings } from "./settings.js";
 import {
   DEFAULT_CLAUDE_ROOT,
   DEFAULT_CODEX_ROOT,
-  clearRootsMemoForTests,
+  invalidateRootsMemo,
   duplicateRootError,
   isUnderRoots,
   resolveDataRoots,
@@ -202,7 +202,7 @@ describe("rootsSignature", () => {
 
 describe("resolveDataRoots memo", () => {
   it("collapses same-key calls within the TTL; a settings change bypasses it", () => {
-    clearRootsMemoForTests();
+    invalidateRootsMemo();
     const base = tmp();
     const dir = join(base, "root-a");
     const s = settingsWith({ claude: [dir], codex: [] });
@@ -218,7 +218,7 @@ describe("resolveDataRoots memo", () => {
     const fresh = resolveDataRoots(s2, {});
     assert.equal(fresh.claude[1]?.exists, true);
     // And after the memo drops, the same key re-observes the filesystem.
-    clearRootsMemoForTests();
+    invalidateRootsMemo();
     assert.equal(resolveDataRoots(s, {}).claude[1]?.exists, true);
   });
 });
