@@ -263,7 +263,10 @@ describe("fold-freeze golden", () => {
       writeFileSync(EXPECTED_PATH, actual);
       return;
     }
-    const expected = readFileSync(EXPECTED_PATH, "utf8");
+    // Normalize CRLF: a Windows checkout with core.autocrlf rewrites the
+    // fixture's line endings on disk; the golden pins fold OUTPUT bytes, not
+    // the checkout's text-encoding policy.
+    const expected = readFileSync(EXPECTED_PATH, "utf8").replace(/\r\n/g, "\n");
     assert.equal(actual, expected);
   });
 });
