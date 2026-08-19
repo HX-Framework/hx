@@ -255,7 +255,12 @@ function computeAll(): unknown {
 
 const EXPECTED_PATH = join(import.meta.dir, "__fixtures__", "fold-goldens.expected.json");
 
-describe("fold-freeze golden", () => {
+// The harness feeds POSIX-literal fixture paths ("/home/u/…"), so on Windows
+// isUnderRoots joins roots with "\" and the same entries legitimately classify
+// differently (unwatched vs behind) — the platform's path semantics, not the
+// folds'. The golden pins fold identity against the base on ONE platform;
+// Windows path behavior has its own tests (same pattern as roots.test.ts).
+describe.skipIf(process.platform === "win32")("fold-freeze golden", () => {
   it("matches the output captured on the pristine base commit", () => {
     const actual = JSON.stringify(computeAll(), null, 2);
     if (process.env["GOLDEN_WRITE"] === "1") {
