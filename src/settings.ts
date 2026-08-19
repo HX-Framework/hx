@@ -54,6 +54,13 @@ export interface HxSettings {
   excludedFolders: ExcludedFolder[];
   excludeRules: string[];
   dataDirs: DataDirs;
+  /** Operational tuning knobs (LETAIR-144) — an OPAQUE round-trip object.
+   *  Subkeys are read by the consumers that own them (the watch loop / upload
+   *  scheduler), never normalized here: field-rebuilding this object is
+   *  exactly the historical bug that made settings.json unable to carry new
+   *  keys (every write erased unknowns). Ops-only surface: written by hand,
+   *  not exposed in the UI, absent by default. */
+  tuning?: Record<string, unknown>;
 }
 
 export const DEFAULT_SETTINGS: HxSettings = {
@@ -129,11 +136,24 @@ export function dataDirsPatchError(v: unknown): string | null {
 
 export async function readSettings(path: string = SETTINGS_PATH): Promise<HxSettings> {
   try {
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixed
-    // path under ~/.let/hx (tests inject a tmp path), never request input.
+    // Fixed path under ~/.let/hx (tests inject a tmp path), never request input.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename
     const raw = await readFile(path, "utf-8");
-    const parsed = JSON.parse(raw) as Partial<HxSettings>;
+    const parsed = JSON.parse(raw) as Record<string, unknown> & Partial<HxSettings>;
+    // Unknown top-level keys ride through VERBATIM (`tuning`, and anything a
+    // newer binary defines that this one doesn't know yet). The historical
+    // five-field rebuild silently erased them on the next write — which made
+    // settings.json unable to carry new keys across mixed-version fleets.
+    const {
+      pause: _pause,
+      personalSync: _personal,
+      excludedFolders: _folders,
+      excludeRules: _rules,
+      dataDirs: _dirs,
+      ...unknownRest
+    } = parsed;
     return {
+      ...unknownRest,
       pause:
         parsed.pause && typeof parsed.pause === "object"
           ? { untilMs: typeof parsed.pause.untilMs === "number" ? parsed.pause.untilMs : null }
@@ -158,6 +178,15 @@ export async function readSettings(path: string = SETTINGS_PATH): Promise<HxSett
       dataDirs: { claude: [], codex: [] },
     };
   }
+}
+
+/** Typed view of one tuning subkey — consumers own their keys' semantics;
+ *  anything absent or mistyped reads as undefined (never a throw, never a
+ *  normalization write-back). */
+export function tuningValue(s: HxSettings, key: string): unknown {
+  const t = s.tuning;
+  if (!t || typeof t !== "object" || Array.isArray(t)) return undefined;
+  return (t as Record<string, unknown>)[key];
 }
 
 // Writes are read-merge-write; two concurrent PATCHes (the UI's async add

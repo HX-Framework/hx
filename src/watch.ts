@@ -20,9 +20,11 @@ import {
   type DiscoveredChildFile,
   type DiscoveredFile,
   type DiscoveredWorkflowRun,
+  STAT_CONCURRENCY,
   discoverClaudeChildren,
   discoverClaudeFiles,
   discoverCodexFiles,
+  mapPool,
   readHead,
 } from "./sources.js";
 import {
@@ -30,6 +32,7 @@ import {
   type ResolvedRoots,
   claudeTasksDir,
   claudeTeamsDir,
+  invalidateRootsMemo,
   isUnderRoots,
   resolveDataRoots,
   rootsSignature,
@@ -61,17 +64,25 @@ import {
   stampEffectiveRoots,
   touchMtime,
   upsertFileState,
+  getChunkCap,
+  setChunkCap,
   clearDestinationUploadError,
   recordDestinationUploadError,
   clearGenericBackoffs,
+  armCoalescedPersistence,
+  disarmCoalescedPersistence,
+  flushStateIfDirty,
+  hasDirtyState,
 } from "./state.js";
+import { catalogFor } from "./catalog.js";
+import { ByteSemaphore, runPool } from "./upload-scheduler.js";
 import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
 import { buildLedger, type SyncLedger } from "./ledger.js";
 import { backfillDue, discoverBackfill, markBackfillRun } from "./backfill.js";
-import { collapseHome, isPaused, readSettings, shouldSkipFile, type HxSettings } from "./settings.js";
+import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
 import {
@@ -125,10 +136,37 @@ const FILE_RETRY_BASE_MS = 30_000;
 // genuine outage stops burning round trips. This is the "a few quick retries,
 // then back off" the skip path wants, using the existing exponential.
 const SESSION_SKIP_RETRY_BASE_MS = 20_000;
-// How many chunk rounds ONE file may drain within a single pass (x 4 MB chunk
-// limit = up to 64 MB per destination per pass). Enough that a big backlog
-// moves at line speed, capped so one huge file can't starve the rest.
-const DRAIN_ROUNDS_PER_PASS = 16;
+// How many bytes ONE file may drain per DESTINATION within a single pass —
+// numerically today's historical cap (16 rounds × 4 MB). A byte budget rather
+// than a round count so adaptive chunk growth changes the round COUNT, never
+// the pass pacing or the starvation guarantee; whatever is left continues
+// next pass. There is deliberately no global per-pass total: a 200-file
+// backlog still moves up to 200 × this per pass.
+const PASS_BYTE_BUDGET = 64 * 1024 * 1024;
+// Upload parallelism (LETAIR-144 WS3): files in flight concurrently, each
+// file's rounds strictly sequential (offset dependency) and its destinations
+// sequential within a round (partial-failure abort semantics preserved).
+// Overridable via settings `tuning.uploadConcurrency` / `tuning.childConcurrency`
+// (re-read per tick; 1 restores the historical strictly-sequential pass).
+const FILE_CONCURRENCY_DEFAULT = 4;
+const CHILD_CONCURRENCY_DEFAULT = 4;
+// Adaptive chunk growth (DARK by default — enable via tuning.chunkGrowth after
+// the live prod probe): cloud-lane (vaultOrgId === null, non-fortress) chunks
+// double per clean round from DEFAULT_CHUNK_LIMIT up to this, clamped by the
+// destination's learned cap (state.chunkCaps). Fortress-direct stays pinned at
+// DEFAULT_CHUNK_LIMIT. RSS note for the enable decision: the M8 semaphore
+// counts chunk BUFFERS, but the first committed chunk of a drain is also
+// decoded once to a string for the sidecar sync (artifactText) — at this cap
+// that's up to ~2× chunk size of additional transient RSS per draining file,
+// outside the 64 MB budget.
+const MAX_GROWN_CHUNK = 32 * 1024 * 1024;
+// Process-global in-flight chunk-buffer budget, shared across tee lanes (M8).
+const uploadBytesSemaphore = new ByteSemaphore(64 * 1024 * 1024);
+// Backstop only: the drain loop's real bounds are the byte budget + the
+// roundProgress/remaining breaks (≈16 rounds × destinations at the default
+// chunk). A pathological store that trims every round to a byte could
+// otherwise spin; this cap turns that into "finish next pass".
+const DRAIN_ROUNDS_BACKSTOP = 1024;
 // How often the daemon announces liveness when idle. Uploads already refresh
 // lastSeenAt, so a beat only fires when nothing has contacted the gateway for
 // this long — keeping idle traffic to ~1 tiny request/minute. The gateway's
@@ -244,10 +282,15 @@ function describeSkip(reason: FileSkipReason): string {
 export interface WatchOptions {
   /** Limit to a single file (debugging). */
   only?: string;
-  /** Maximum bytes per chunk. Splits a huge backlog into multiple commits. */
+  /** Maximum bytes per chunk. Splits a huge backlog into multiple commits.
+   *  An ABSOLUTE override: adaptive growth never exceeds it. */
   chunkLimitBytes?: number;
   /** Run once and exit (smoke test). */
   oneShot?: boolean;
+  /** Adaptive chunk growth (tuning.chunkGrowth) — dark by default; resolved
+   *  per tick in tickOnce and threaded here so ingestOne needs no settings
+   *  read of its own. */
+  chunkGrowth?: boolean;
 }
 
 const DEFAULT_CHUNK_LIMIT = 4 * 1024 * 1024;
@@ -256,6 +299,15 @@ const DEFAULT_CHUNK_LIMIT = 4 * 1024 * 1024;
 // The `--local` tee runs the same pipeline against the local dev gateway with
 // its own offsets, so the per-gateway latches below are also keyed by scope.
 const scopeOf = (cfg: HxConfig): StateScope => cfg.stateScope ?? "main";
+
+/** Integer tuning knob with a sane clamp (1..16); anything absent or
+ *  mistyped reads as the default — settings must never brick the daemon. */
+function tuningInt(settings: HxSettings, key: string, fallback: number): number {
+  const v = tuningValue(settings, key);
+  return typeof v === "number" && Number.isFinite(v) && v >= 1
+    ? Math.min(16, Math.floor(v))
+    : fallback;
+}
 
 // Per-repo route cache, keyed by config scope so the `--local` tee and the main
 // lane never share a Fortress token. Lives for the daemon's lifetime; resolveRoute
@@ -276,12 +328,29 @@ function routeCacheFor(scope: StateScope): Map<string, Route> {
   return cache;
 }
 
+// Single-flight per (scope, repo): under the upload pool, N workers hitting
+// the same cold repo must share ONE route-discovery fetch — identical result,
+// no stampede. resolveRoute never rejects (it falls back internally), so a
+// shared promise is safe to hand to every waiter.
+const routeInFlight = new Map<string, Promise<Route>>();
+function resolveRouteShared(
+  scope: StateScope,
+  params: Parameters<typeof resolveRoute>[0],
+): Promise<Route> {
+  const key = `${scope}:${params.repo}`;
+  const inflight = routeInFlight.get(key);
+  if (inflight) return inflight;
+  const p = resolveRoute(params).finally(() => routeInFlight.delete(key));
+  routeInFlight.set(key, p);
+  return p;
+}
+
 async function uploadConfigFor(
   cfg: HxConfig,
   repoSlug: string | null | undefined,
 ): Promise<{ cfg: HxConfig; fortress: boolean; attributedOrgIds?: string[] }> {
   if (!repoSlug || !cfg.accessToken) return { cfg, fortress: false };
-  const route = await resolveRoute({
+  const route = await resolveRouteShared(scopeOf(cfg), {
     repo: repoSlug,
     gatewayBaseUrl: cfg.gatewayBaseUrl,
     accessToken: cfg.accessToken,
@@ -466,7 +535,40 @@ export function uploadErrorCode(err: HxHttpError): string {
   return m ? `${err.status} ${m[1]}` : String(err.status);
 }
 
-async function ingestOne(
+// Adaptive-chunk growth ladder, in-memory per (scope, destination): the next
+// cloud-lane chunk size, doubled after each clean full-size commit up to
+// MAX_GROWN_CHUNK and the destination's learned cap. DARK unless
+// tuning.chunkGrowth is true; fortress-direct and vault destinations stay at
+// the base size unconditionally.
+const grownChunk = new Map<string, number>();
+const chunkCapLogged = new Set<string>();
+
+/** Test seam — forget the in-memory growth ladder and cap-log dedupe. */
+export function resetChunkGrowthForTests(): void {
+  grownChunk.clear();
+  chunkCapLogged.clear();
+}
+
+async function chunkSizeFor(
+  vaultOrgId: string | null,
+  fortress: boolean,
+  opts: WatchOptions,
+  scope: StateScope,
+): Promise<number> {
+  const base = opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT;
+  if (opts.chunkGrowth !== true || fortress || vaultOrgId !== null) return base;
+  const dk = destKey(vaultOrgId);
+  const learned = await getChunkCap(dk, scope);
+  const grown = grownChunk.get(`${scope}:${dk}`) ?? DEFAULT_CHUNK_LIMIT;
+  // An explicitly-passed chunkLimitBytes is an ABSOLUTE override — growth
+  // never exceeds it, even when it equals the default.
+  const hardCap = opts.chunkLimitBytes !== undefined ? opts.chunkLimitBytes : Infinity;
+  return Math.min(grown, learned ?? Infinity, MAX_GROWN_CHUNK, hardCap);
+}
+
+/** Exported for the drain tests (budget pacing, growth ladder, probe
+ *  cleanliness) — production callers stay inside this module. */
+export async function ingestOne(
   cfg: HxConfig,
   file: DiscoveredFile,
   opts: WatchOptions,
@@ -543,15 +645,25 @@ async function ingestOne(
   // Drain rounds: a backlogged file uploads chunk after chunk within ONE pass
   // (fresh signed URLs each round) instead of one chunk per 1.5 s poll — the
   // old pacing capped any session at ~2.7 MB/s regardless of bandwidth. The
-  // per-pass cap keeps one huge file from starving the rest of the backlog;
+  // per-(file, destination) BYTE budget keeps one huge file from starving the
+  // rest of the backlog (historically 16 rounds × 4 MB — the same 64 MB);
   // whatever is left continues next pass.
   //
   // Wrap the whole drain: any error that means THIS session's store is
   // unavailable (a direct-route store's 5xx/network failure, or the gateway's
   // vault_offline) is re-thrown as SessionUpstreamUnavailable so tickOnce skips
   // just this file and keeps the pass going. Everything else propagates as-is.
+  const sentByDest = new Map<string, number>();
+  // Parse dedupe (fixes C5): fan-out steps at the SAME offset re-read the
+  // same byte range — the JSON.parse of every line must run once, not once
+  // per destination. Keyed (stepOffset, want): same range ⇒ same trim ⇒ same
+  // bytes, even if the file grew meanwhile (endOffset was fixed by the trim).
+  // SUMMARIES ONLY — caching the chunk text would retain up to the whole
+  // 64 MB drain budget as strings per file, outside the byte semaphore's
+  // accounting (× pool width in catch-up: several times the M8 RSS bound).
+  const sliceSummaries = new Map<string, { endOffset: number; summary: ReturnType<typeof summariseChunk> }>();
   try {
-  for (let round = 0; round < DRAIN_ROUNDS_PER_PASS; round++) {
+  for (let round = 0; round < DRAIN_ROUNDS_BACKSTOP; round++) {
     // Get signed staging URLs for EVERY store this repo fans out to. repoSlug lets
     // the gateway attribute + resolve the destination set; each is echoed back as
     // its own vaultOrgId so commit replays it into the same store. A gateway that
@@ -594,7 +706,9 @@ async function ingestOne(
     }
 
     const steps = planFanout(append, fState).filter(
-      (step) => !unavailableDests.has(destKey(step.vaultOrgId)),
+      (step) =>
+        !unavailableDests.has(destKey(step.vaultOrgId)) &&
+        (sentByDest.get(destKey(step.vaultOrgId)) ?? 0) < PASS_BYTE_BUDGET,
     );
 
     let roundProgress = false;
@@ -603,160 +717,258 @@ async function ingestOne(
       // previously-offline vault back-fills from zero (replace) while the others
       // append, so one store's lag never blocks another.
       const stepOffset = offsetFor(fState, step.vaultOrgId);
-      const want = Math.min(st.size - stepOffset, opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT);
+      const chunkSize = await chunkSizeFor(step.vaultOrgId, route.fortress, opts, scope);
+      // Clamp to the remaining per-destination budget so a pass never sends
+      // MORE than the historical cap (16 rounds could never exceed 64 MB; an
+      // unclamped `sent < budget` admission could overshoot by one chunk).
+      const budgetLeft = PASS_BYTE_BUDGET - (sentByDest.get(destKey(step.vaultOrgId)) ?? 0);
+      const want = Math.min(st.size - stepOffset, chunkSize, budgetLeft);
       if (want <= 0) continue;
-      const slice = await readSlice(file.path, stepOffset, want);
-      const { trimmed, endOffset } = trimAtLastNewline(slice, stepOffset);
-      if (trimmed.length === 0) continue;
-      const text = trimmed.toString("utf8");
-      const summary = summariseChunk(text);
-      let title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
-      let titleSource: "user" | "ai" | "fallback" | undefined;
-      if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
-      else if (summary.title) titleSource = summary.titleSource ?? undefined;
-      else if (head.title) titleSource = "ai";
-      // No user/AI title anywhere — synthesize a readable label so the session
-      // shows something meaningful instead of a bare id downstream. Only on a
-      // from-zero upload: a later appended chunk must not overwrite it with a
-      // mid-conversation message. Stamped "fallback" so the provenance stays
-      // honest.
-      if (!title && stepOffset === 0) {
-        const derived = deriveFallbackTitle(summary.firstUserText, head.cwd, head.repoSlug);
-        if (derived) {
-          title = derived;
-          titleSource = "fallback";
-        }
-      }
-
+      // Chunk buffers ride the process-global byte budget (M8): admission caps
+      // concurrent RSS across pooled files and both tee lanes.
+      const release = await uploadBytesSemaphore.acquire(want);
+      let trimmed: Buffer;
+      let endOffset: number;
       try {
-        // Upload bytes directly to this destination's store, then compose.
-        await putChunk(step.uploadUrl, trimmed);
-        const commit = await commitChunk(uploadCfg, {
-          family: fState.family as never,
-          sessionId: fState.sessionId,
-          chunkId: step.chunkId,
-          // A from-zero upload REPLACES this store's canonical instead of appending:
-          // at offset 0 anything it still holds can't be content this device hasn't
-          // sent (stale/duplicated canonical, or a freshly-joined vault). Old
-          // gateways ignore the flag and append, same result for a new session.
-          replace: step.replace,
-          vaultOrgId: step.vaultOrgId,
-          meta: {
-            sourcePath: file.path,
-            title,
-            titleSource,
-            ccdSessionId: ccdMeta?.ccdSessionId ?? undefined,
-            // cwd doubles as attribution EVIDENCE the gateway now persists
-            // (org rules match on it); evidenceUpload:false withholds it for
-            // devices whose org considers local paths sensitive.
-            cwd: cfg.evidenceUpload === false ? undefined : head.cwd,
-            gitBranch: head.gitBranch,
-            repoSlug,
-            entrypoint: head.entrypoint,
-            originator: head.originator,
-            modelProvider: head.modelProvider,
-            lastUserText: summary.lastUserText,
-            lastAssistantText: summary.lastAssistantText,
-            eventCount: summary.eventCount,
-            userTextCount: summary.userTextCount,
-            assistantCount: summary.assistantCount,
-            lastActivityAt: summary.lastActivityAt,
-          },
-        });
-        // Per-commit divergence check (let.ai-hosted only — the audit + self-heal
-        // protocol live there): a size mismatch means the store lost the canonical
-        // mid-session; reset just this destination to zero so the next pass
-        // re-uploads it with replace. Chunks never split a line, so a healthy
-        // canonical matches endOffset byte-for-byte.
-        const diverged =
-          !route.fortress &&
-          SELF_HEAL.get(scope) === true &&
-          step.vaultOrgId === null &&
-          commit.totalBytes !== endOffset;
-        if (diverged && (fState.healPausedUntilMs ?? 0) > Date.now()) {
-          // Heal is paused (a prior streak ping-ponged) — accept our own offset
-          // so the file stops re-uploading; the periodic audit keeps reporting
-          // the divergence and healing resumes when the pause lapses.
-          await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
-        } else if (diverged) {
-          const streak = await recordHeal(file.path, scope);
-          log(
-            `  [heal] ${fState.sessionId.slice(0, 8)}… canonical ${commit.totalBytes}B ≠ uploaded ${endOffset}B — re-uploading from zero`,
-          );
-          if ((fState.healPausedUntilMs ?? 0) > Date.now()) {
+        const slice = await readSlice(file.path, stepOffset, want);
+        ({ trimmed, endOffset } = trimAtLastNewline(slice, stepOffset));
+        if (trimmed.length === 0) continue;
+        const cacheKey = `${stepOffset}:${want}`;
+        let parsed = sliceSummaries.get(cacheKey);
+        if (!parsed || parsed.endOffset !== endOffset) {
+          parsed = { endOffset, summary: summariseChunk(trimmed.toString("utf8")) };
+          sliceSummaries.set(cacheKey, parsed);
+        }
+        let summary = parsed.summary;
+        // Title/meta derivation runs where `summary` is FINAL for this commit —
+        // the growth probe below can shrink the chunk, replacing text+summary,
+        // so the derivation lives in a helper called after the PUT settles.
+        const deriveTitleMeta = (): { title: string | undefined; titleSource: "user" | "ai" | "fallback" | undefined } => {
+          let title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
+          let titleSource: "user" | "ai" | "fallback" | undefined;
+          if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
+          else if (summary.title) titleSource = summary.titleSource ?? undefined;
+          else if (head.title) titleSource = "ai";
+          // No user/AI title anywhere — synthesize a readable label so the session
+          // shows something meaningful instead of a bare id downstream. Only on a
+          // from-zero upload: a later appended chunk must not overwrite it with a
+          // mid-conversation message. Stamped "fallback" so the provenance stays
+          // honest.
+          if (!title && stepOffset === 0) {
+            const derived = deriveFallbackTitle(summary.firstUserText, head.cwd, head.repoSlug);
+            if (derived) {
+              title = derived;
+              titleSource = "fallback";
+            }
+          }
+          return { title, titleSource };
+        };
+
+        try {
+          // Upload bytes directly to this destination's store, then compose.
+          // Growth probe (dark unless tuning.chunkGrowth): a failure at a GROWN
+          // size retries this same step in place at the LAST-GOOD rung (the
+          // previous ladder step — proven by its own clean commit) — no throw,
+          // no destination-error latch, no file backoff, no [error] line. A
+          // size-shaped rejection (4xx: 413/EntityTooLarge and kin) persists
+          // the rung as the destination's cap (state.chunkCaps — restarts never
+          // re-probe); a 5xx/network blip learns nothing durable — the ladder
+          // just steps back in memory and may regrow. Only a failure at the
+          // base size takes the normal error path.
+          const baseChunk = Math.min(opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT, DEFAULT_CHUNK_LIMIT);
+          try {
+            await putChunk(step.uploadUrl, trimmed);
+          } catch (growErr) {
+            if (!(opts.chunkGrowth === true) || chunkSize <= baseChunk) throw growErr;
+            const dk = destKey(step.vaultOrgId);
+            const lastGood = Math.max(baseChunk, Math.floor(chunkSize / 2));
+            const shrunkWant = Math.min(st.size - stepOffset, lastGood);
+            const shrunkSlice = await readSlice(file.path, stepOffset, shrunkWant);
+            const shrunk = trimAtLastNewline(shrunkSlice, stepOffset);
+            if (shrunk.trimmed.length === 0) throw growErr;
+            await putChunk(step.uploadUrl, shrunk.trimmed);
+            trimmed = shrunk.trimmed;
+            endOffset = shrunk.endOffset;
+            summary = summariseChunk(trimmed.toString("utf8"));
+            sliceSummaries.set(`${stepOffset}:${shrunkWant}`, { endOffset, summary });
+            grownChunk.set(`${scope}:${dk}`, lastGood);
+            // Only a genuinely SIZE-shaped rejection earns a durable cap:
+            // 413, or a 4xx whose body names a size limit. A presign that
+            // expired while a 16-32 MB slice was being read (403
+            // SignatureDoesNotMatch) must NOT permanently under-cap the
+            // destination — it steps the in-memory ladder back like a 5xx
+            // and may regrow.
+            const sizeShaped =
+              growErr instanceof HxHttpError &&
+              (growErr.status === 413 ||
+                (growErr.status >= 400 &&
+                  growErr.status < 500 &&
+                  /EntityTooLarge|MaxMessageLength|PayloadTooLarge|RequestEntityTooLarge|TooBig/i.test(
+                    growErr.message,
+                  )));
+            if (sizeShaped) {
+              await setChunkCap(dk, lastGood, scope);
+              if (!chunkCapLogged.has(dk)) {
+                chunkCapLogged.add(dk);
+                log(`[hx] chunk size settled at ${Math.round(lastGood / (1024 * 1024))} MB for ${dk}`);
+              }
+            }
+          }
+          const { title, titleSource } = deriveTitleMeta();
+          const commit = await commitChunk(uploadCfg, {
+            family: fState.family as never,
+            sessionId: fState.sessionId,
+            chunkId: step.chunkId,
+            // A from-zero upload REPLACES this store's canonical instead of appending:
+            // at offset 0 anything it still holds can't be content this device hasn't
+            // sent (stale/duplicated canonical, or a freshly-joined vault). Old
+            // gateways ignore the flag and append, same result for a new session.
+            replace: step.replace,
+            vaultOrgId: step.vaultOrgId,
+            meta: {
+              sourcePath: file.path,
+              title,
+              titleSource,
+              ccdSessionId: ccdMeta?.ccdSessionId ?? undefined,
+              // cwd doubles as attribution EVIDENCE the gateway now persists
+              // (org rules match on it); evidenceUpload:false withholds it for
+              // devices whose org considers local paths sensitive.
+              cwd: cfg.evidenceUpload === false ? undefined : head.cwd,
+              gitBranch: head.gitBranch,
+              repoSlug,
+              entrypoint: head.entrypoint,
+              originator: head.originator,
+              modelProvider: head.modelProvider,
+              lastUserText: summary.lastUserText,
+              lastAssistantText: summary.lastAssistantText,
+              eventCount: summary.eventCount,
+              userTextCount: summary.userTextCount,
+              assistantCount: summary.assistantCount,
+              lastActivityAt: summary.lastActivityAt,
+            },
+          });
+          // Per-commit divergence check (let.ai-hosted only — the audit + self-heal
+          // protocol live there): a size mismatch means the store lost the canonical
+          // mid-session; reset just this destination to zero so the next pass
+          // re-uploads it with replace. Chunks never split a line, so a healthy
+          // canonical matches endOffset byte-for-byte.
+          const diverged =
+            !route.fortress &&
+            SELF_HEAL.get(scope) === true &&
+            step.vaultOrgId === null &&
+            commit.totalBytes !== endOffset;
+          if (diverged && (fState.healPausedUntilMs ?? 0) > Date.now()) {
+            // Heal is paused (a prior streak ping-ponged) — accept our own offset
+            // so the file stops re-uploading; the periodic audit keeps reporting
+            // the divergence and healing resumes when the pause lapses.
+            await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
+          } else if (diverged) {
+            const streak = await recordHeal(file.path, scope);
             log(
-              `  [heal] ${fState.sessionId.slice(0, 8)}… diverged ${streak}x in a row — pausing self-heal for this file`,
+              `  [heal] ${fState.sessionId.slice(0, 8)}… canonical ${commit.totalBytes}B ≠ uploaded ${endOffset}B — re-uploading from zero`,
             );
+            if ((fState.healPausedUntilMs ?? 0) > Date.now()) {
+              log(
+                `  [heal] ${fState.sessionId.slice(0, 8)}… diverged ${streak}x in a row — pausing self-heal for this file`,
+              );
+            }
+            await setOffsetFor(file.path, step.vaultOrgId, 0, st.mtimeMs, scope);
+          } else {
+            await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
+            // Only a clean APPEND (stepOffset > 0) ends a heal streak. The
+            // from-zero re-upload a heal triggers is ALSO clean by construction
+            // (we resend the whole file, so totalBytes == endOffset) — clearing
+            // on it would reset the counter every heal and the ping-pong latch
+            // could never reach its threshold. A clean append means the store
+            // accepted our tail without diverging: genuinely healthy.
+            if (stepOffset > 0 && fState.healCount !== undefined) {
+              await clearHeal(file.path, scope);
+            }
           }
-          await setOffsetFor(file.path, step.vaultOrgId, 0, st.mtimeMs, scope);
-        } else {
-          await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
-          // Only a clean APPEND (stepOffset > 0) ends a heal streak. The
-          // from-zero re-upload a heal triggers is ALSO clean by construction
-          // (we resend the whole file, so totalBytes == endOffset) — clearing
-          // on it would reset the counter every heal and the ping-pong latch
-          // could never reach its threshold. A clean append means the store
-          // accepted our tail without diverging: genuinely healthy.
-          if (stepOffset > 0 && fState.healCount !== undefined) {
-            await clearHeal(file.path, scope);
+          // Sidecars (tasks/plan) are whole-file + hash-gated and route server-side
+          // to the session's store, so one sync off any destination's new tail is
+          // enough — capture the first (decoded from the local buffer; chunk text
+          // is deliberately never cached).
+          if (artifactText === null) artifactText = trimmed.toString("utf8");
+          // A committed chunk ends this destination's failure run (no-op unless
+          // one is latched — see recordDestinationUploadError in the catch).
+          await clearDestinationUploadError(destKey(step.vaultOrgId), scope);
+          anyProgress = true;
+          roundProgress = true;
+          {
+            const dk = destKey(step.vaultOrgId);
+            sentByDest.set(dk, (sentByDest.get(dk) ?? 0) + trimmed.length);
+            // Growth ladder: a clean commit of a FULL-SIZE request (want ===
+            // chunkSize, i.e. not the file tail) doubles the next cloud-lane
+            // chunk, up to the max and any learned cap. The TRIMMED length is
+            // deliberately not compared — real jsonl trims a partial line off
+            // nearly every chunk, which must not stall the ladder. Dark unless
+            // tuning.chunkGrowth.
+            if (
+              opts.chunkGrowth === true &&
+              !route.fortress &&
+              step.vaultOrgId === null &&
+              want === chunkSize
+            ) {
+              const learned = await getChunkCap(dk, scope);
+              const next = Math.min(chunkSize * 2, MAX_GROWN_CHUNK, learned ?? Infinity);
+              if (next > (grownChunk.get(`${scope}:${dk}`) ?? DEFAULT_CHUNK_LIMIT)) {
+                grownChunk.set(`${scope}:${dk}`, next);
+              }
+            }
           }
-        }
-        // Sidecars (tasks/plan) are whole-file + hash-gated and route server-side
-        // to the session's store, so one sync off any destination's new tail is
-        // enough — capture the first.
-        if (artifactText === null) artifactText = text;
-        // A committed chunk ends this destination's failure run (no-op unless
-        // one is latched — see recordDestinationUploadError in the catch).
-        await clearDestinationUploadError(destKey(step.vaultOrgId), scope);
-        anyProgress = true;
-        roundProgress = true;
-        log(
-          `  ${path.relative(homedir(), file.path)} (+${trimmed.length}B → ${step.vaultOrgId ?? "let.ai"}, ${fState.family}, ${fState.sessionId.slice(0, 8)}…)`,
-        );
-        // Local journal for the UI's traffic chart — best-effort, never awaited
-        // into the upload path's error handling.
-        void appendActivity({
-          at: Date.now(),
-          sessionId: fState.sessionId,
-          family: fState.family,
-          bytes: trimmed.length,
-          dest: destKey(step.vaultOrgId),
-        });
-      } catch (err) {
-        // One destination's vault being unavailable must not stall the others — log
-        // and move on; its offset stays put so the next pass retries just it.
-        if (err instanceof HxHttpError && err.serverUnavailable) {
-          lastUnavailable = err;
-          unavailableDests.add(destKey(step.vaultOrgId));
           log(
-            `  [hx] destination ${step.vaultOrgId ?? "let.ai"} unavailable (${err.status}); will retry`,
+            `  ${path.relative(homedir(), file.path)} (+${trimmed.length}B → ${step.vaultOrgId ?? "let.ai"}, ${fState.family}, ${fState.sessionId.slice(0, 8)}…)`,
           );
-          continue;
+          // Local journal for the UI's traffic chart — best-effort, never awaited
+          // into the upload path's error handling.
+          void appendActivity({
+            at: Date.now(),
+            sessionId: fState.sessionId,
+            family: fState.family,
+            bytes: trimmed.length,
+            dest: destKey(step.vaultOrgId),
+          });
+        } catch (err) {
+          // One destination's vault being unavailable must not stall the others — log
+          // and move on; its offset stays put so the next pass retries just it.
+          if (err instanceof HxHttpError && err.serverUnavailable) {
+            lastUnavailable = err;
+            unavailableDests.add(destKey(step.vaultOrgId));
+            log(
+              `  [hx] destination ${step.vaultOrgId ?? "let.ai"} unavailable (${err.status}); will retry`,
+            );
+            continue;
+          }
+          // A hard rejection (403/401/400) from a REACHABLE store. Latch it on
+          // the destination registry before the error propagates into the
+          // generic per-file backoff: without this, a store rejecting every
+          // write is indistinguishable from a slow backlog — the shape that hid
+          // a 12-hour credential outage behind a silent "0%".
+          if (err instanceof HxHttpError) {
+            await recordDestinationUploadError(
+              destKey(step.vaultOrgId),
+              uploadErrorCode(err),
+              scope,
+            ).catch(() => {});
+          }
+          throw err;
         }
-        // A hard rejection (403/401/400) from a REACHABLE store. Latch it on
-        // the destination registry before the error propagates into the
-        // generic per-file backoff: without this, a store rejecting every
-        // write is indistinguishable from a slow backlog — the shape that hid
-        // a 12-hour credential outage behind a silent "0%".
-        if (err instanceof HxHttpError) {
-          await recordDestinationUploadError(
-            destKey(step.vaultOrgId),
-            uploadErrorCode(err),
-            scope,
-          ).catch(() => {});
-        }
-        throw err;
+      } finally {
+        release();
       }
     }
 
     if (!roundProgress) break;
-    // Caught up on every reachable destination? Then this pass is done. A
-    // diverged/healing destination (offset reset to 0) simply drains in the
-    // remaining rounds like any other backlog.
+    // Caught up on every reachable destination — or out of this pass's byte
+    // budget for all of them? Then this pass is done. A diverged/healing
+    // destination (offset reset to 0) simply drains in the remaining rounds
+    // like any other backlog; whatever the budget leaves continues next pass.
     const remaining = steps.some(
       (step) =>
         !unavailableDests.has(destKey(step.vaultOrgId)) &&
-        offsetFor(fState, step.vaultOrgId) < st.size,
+        offsetFor(fState, step.vaultOrgId) < st.size &&
+        (sentByDest.get(destKey(step.vaultOrgId)) ?? 0) < PASS_BYTE_BUDGET,
     );
     if (!remaining) break;
   }
@@ -1448,9 +1660,13 @@ export function snapshotFrom(files: DiscoveredFile[], state: HxState): SyncSnaps
   return { total: files.length, done, totalBytes };
 }
 
-// Report progress at most every Nth file so a long first pass shows the bar
-// climbing without a callback per file. Start + end are always reported.
-const SYNC_PROGRESS_EVERY = 20;
+// Report progress at most once per second so a long first pass shows the bar
+// climbing without a snapshot per file. Start + end are always reported, and
+// reportSync throttles actual POSTs to ≥1.5 s apart regardless — a finer
+// cadence only burned CPU: the old every-20th-FILE gate recomputed the full
+// O(files) snapshot fold 500× per pass on a 10k tree (~64% of a core
+// measured in the e2e profile), then discarded almost all of them.
+const SYNC_PROGRESS_MIN_MS = 1_000;
 
 /** One-shot catch-up snapshot (no upload) — backs `hx status` and the daemon
  *  restart decision. Main lane only: the `--local` tee tracks its own catch-up
@@ -1563,13 +1779,28 @@ export function collectSkipped(files: DiscoveredFile[], state: HxState): SyncSki
   return out;
 }
 
+/** Injectable inputs for {@link computeSyncReport} — the UI server passes its
+ *  cached UNWINDOWED discovery lists (and a settings snapshot) so its 5s poll
+ *  stops re-walking the whole disk; the CLI path passes nothing and stays
+ *  byte-identical (fresh unwindowed discovery + fresh settings). Injected
+ *  lists MUST be unwindowed-equivalent — the report's behind/incomplete math
+ *  is meaningless over a windowed subset. */
+export interface SyncReportInputs {
+  claude: DiscoveredFile[];
+  codex: DiscoveredFile[];
+  settings?: HxSettings;
+}
+
 /** Sync snapshot PLUS the sessions the snapshot can no longer see: entries
  *  whose source file vanished (or aged out of discovery) mid-upload — and the
  *  sessions currently skipped on a temporarily-unavailable store. Backs the
  *  honest `hx status` output — without these the bar reads 100% while the
  *  server holds partial transcripts or a store is down. */
-export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<SyncReport> {
-  const settings = await readSettings();
+export async function computeSyncReport(
+  rootsOverride?: ResolvedRoots,
+  injected?: SyncReportInputs,
+): Promise<SyncReport> {
+  const settings = injected?.settings ?? (await readSettings());
   const roots = rootsOverride ?? resolveDataRoots(settings);
   // UNWINDOWED — this is a REPORT, not the hot loop. The 30-day bound exists so
   // a 1.5s sweep stays cheap; describing the device is a once-per-invocation
@@ -1582,10 +1813,12 @@ export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<
   // neither gone nor unrecoverable; the backfill sweep will deliver it. Only
   // genuinely-vanished sources are incomplete, and that needs discovery to see
   // everything before it can tell the difference.
-  const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(roots.claude, { maxAgeMs: Infinity }),
-    discoverCodexFiles(roots.codex, { maxAgeMs: Infinity }),
-  ]);
+  const [claude, codex] = injected
+    ? [injected.claude, injected.codex]
+    : await Promise.all([
+        discoverClaudeFiles(roots.claude, { maxAgeMs: Infinity }),
+        discoverCodexFiles(roots.codex, { maxAgeMs: Infinity }),
+      ]);
   const all = [...claude, ...codex];
   const state = await loadState();
   const discovered = new Set(all.map((f) => f.path));
@@ -1755,14 +1988,27 @@ export async function tickOnce(
   // one poll interval, no restart.
   const settings = await readSettings();
   const roots = resolveDataRoots(settings);
-  const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(roots.claude),
-    discoverCodexFiles(roots.codex),
-  ]);
-  let files = [...claude, ...codex];
-  if (opts.only) files = files.filter((f) => f.path === opts.only);
-
   const scope = scopeOf(cfg);
+  // Tiered catalog by default; `tuning.sweep: "legacy"` (settings, re-read per
+  // tick so it reaches installed daemons) or HX_SWEEP=legacy (dev shells)
+  // restores the historical full-sweep-per-tick verbatim. A fresh catalog's
+  // first sweep IS a full discovery, so one-shot callers (`hx tick`,
+  // `watch --once`) see identical results either way.
+  const legacySweep =
+    tuningValue(settings, "sweep") === "legacy" || process.env["HX_SWEEP"] === "legacy";
+  const catalog = legacySweep ? null : catalogFor(scope);
+  let files: DiscoveredFile[];
+  if (catalog) {
+    await catalog.sweep(roots, Date.now());
+    files = catalog.listFiles();
+  } else {
+    const [claude, codex] = await Promise.all([
+      discoverClaudeFiles(roots.claude),
+      discoverCodexFiles(roots.codex),
+    ]);
+    files = [...claude, ...codex];
+  }
+  if (opts.only) files = files.filter((f) => f.path === opts.only);
   // Report before uploading anything so a freshly connected device shows its
   // full backlog ("0 / 1,203") immediately, not only after the first pass.
   const state = await loadState(scope);
@@ -1803,17 +2049,41 @@ export async function tickOnce(
       log(`[hx] backfill sweep skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  // Seed-then-elect (R5): every file with no state entry is seeded BEFORE
+  // election, so unseeded twins collapse to one winner before any pooled
+  // worker starts — two stateless copies of one session uploading in
+  // parallel would interleave replace/append writes into one canonical,
+  // permanently on vault/fortress lanes (no divergence heal there). This is
+  // the same lazy seeding ingestOne always did per file, done up front. An
+  // unreadable head is left for ingestOne's own error taxonomy — its twin,
+  // if readable, is seeded and wins the election regardless.
+  {
+    const unseeded = files.filter((f) => !state.files[f.path]);
+    if (unseeded.length > 0) {
+      await mapPool(unseeded, STAT_CONCURRENCY, async (f) => {
+        await ensureFileState(f, scope).catch(() => {});
+      });
+    }
+  }
   files = filterWatched(electUploaders(files, state, log), state, settings);
   onProgress?.(snapshotFrom(files, state));
+
+  // Adaptive chunk growth is resolved once per pass and threaded via opts —
+  // dark unless tuning.chunkGrowth is exactly true.
+  const effOpts: WatchOptions =
+    tuningValue(settings, "chunkGrowth") === true ? { ...opts, chunkGrowth: true } : opts;
+  const fileConcurrency = tuningInt(settings, "uploadConcurrency", FILE_CONCURRENCY_DEFAULT);
+  const childConcurrency = tuningInt(settings, "childConcurrency", CHILD_CONCURRENCY_DEFAULT);
 
   let uploaded = 0;
   let failed = 0;
   // Distinct files that hit a gateway-shaped 5xx this pass — see the
   // serverUnavailable branch below: one file's unrecognized 5xx must not be
-  // read as a wholesale outage.
+  // read as a wholesale outage. Shared across pooled workers; latching stops
+  // DEQUEUEING while in-flight workers settle (≤ concurrency−1 extra, M4).
   const gatewayUnavailableFiles = new Set<string>();
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i]!;
+  let stopPass = false;
+  const processParent = async (f: DiscoveredFile): Promise<void> => {
     // Per-file backoff: a file that keeps failing (bad request, offline vault)
     // sits out its window instead of burning a gateway round trip every poll.
     const pending = state.files[f.path];
@@ -1824,7 +2094,7 @@ export async function tickOnce(
         `waiting out a retry backoff for another ${mins} min (${pending.consecutiveFailures ?? 0} consecutive failures${pending.skipReason ? `, ${pending.skipReason}` : ""})`,
         log,
       );
-      continue;
+      return;
     }
     // A file seen for the first time has no state entry for filterWatched to
     // match — seed it now and re-check before any byte leaves the machine.
@@ -1839,7 +2109,7 @@ export async function tickOnce(
         seeded.attributed === undefined &&
         cfg.accessToken
       ) {
-        const r = await resolveRoute({
+        const r = await resolveRouteShared(scope, {
           repo: seeded.repoSlug,
           gatewayBaseUrl: cfg.gatewayBaseUrl,
           accessToken: cfg.accessToken,
@@ -1858,7 +2128,7 @@ export async function tickOnce(
           `excluded by settings — personalSync=${settings.personalSync}, repoSlug=${seeded.repoSlug ?? "null"}, attributed=${seeded.attributed}`,
           log,
         );
-        continue;
+        return;
       }
     }
     // Server-side permanent delete: terminal per-session stop — no request, no
@@ -1868,11 +2138,11 @@ export async function tickOnce(
       const entry = state.files[f.path];
       if (entry && isDeletedSession(state, entry.family, entry.sessionId)) {
         logStuck(f.path, "session was permanently deleted on the server — it will never upload again", log);
-        continue;
+        return;
       }
     }
     try {
-      const did = await ingestOne(cfg, f, opts, log);
+      const did = await ingestOne(cfg, f, effOpts, log);
       if (did) uploaded += 1;
       else if (pending && pending.lastKnownSize !== undefined && minOffset(pending) < f.size) {
         // Asked the gateway, got a plan, and it produced no committable bytes —
@@ -1909,7 +2179,7 @@ export async function tickOnce(
           err.blocker,
         );
         log(`  [hx] ${describeSkip(err.reason)}; retrying ${path.basename(f.path)} in ${Math.round(delay / 1000)}s`);
-        continue;
+        return;
       }
       if (err instanceof HxHttpError && err.sessionDeleted) {
         // Permanent server-side delete (410 tombstone): record the terminal
@@ -1923,7 +2193,7 @@ export async function tickOnce(
             `  [hx] ${entry.sessionId.slice(0, 8)}… permanently deleted on the server — uploads stopped (local file kept)`,
           );
         }
-        continue;
+        return;
       }
       if (err instanceof HxHttpError && err.serverUnavailable) {
         // A wholesale gateway outage and a per-session 5xx this client does not
@@ -1936,10 +2206,16 @@ export async function tickOnce(
         // exponential backoff in run() still handles the outage itself.
         gatewayUnavailableFiles.add(f.path);
         if (gatewayUnavailableFiles.size >= 2) {
-          log(
-            `  [hx] gateway unavailable (${err.status}) on ${gatewayUnavailableFiles.size} files; pausing this pass`,
-          );
-          break;
+          // The check-log-latch runs with no await between, so exactly ONE
+          // worker crosses the threshold un-latched — the pause line prints
+          // once per pass, as the sequential loop's `break` did.
+          if (!stopPass) {
+            stopPass = true;
+            log(
+              `  [hx] gateway unavailable (${err.status}) on ${gatewayUnavailableFiles.size} files; pausing this pass`,
+            );
+          }
+          return;
         }
         // Fixed bench, NOT recordFileFailure: the probe is not this file's
         // fault, so it must not accrue a compounding (and restart-surviving)
@@ -1947,16 +2223,55 @@ export async function tickOnce(
         // quietly replace the 5-min pass backoff with a 30-min bench.
         await benchFileProbe(f.path, FILE_RETRY_BASE_MS, scope);
         log(`  [hx] 5xx (${err.status}) on one file; probing another before pausing the pass`);
-        continue;
+        return;
       }
       // A genuine per-file fault (4xx, parse error, a doomed sidecar): back it
       // off so it doesn't burn a gateway round trip every poll.
       await recordFileFailure(f.path, FILE_RETRY_BASE_MS, scope);
     }
-    if (onProgress && (i + 1) % SYNC_PROGRESS_EVERY === 0) {
-      onProgress(snapshotFrom(files, state));
-    }
-  }
+  };
+  // M1 in force for the caught-up multitude: a clean, fully-uploaded file's
+  // change detection lives with the catalog's tiered stats (its size/mtime
+  // here are tier-fresh by contract), so the pass pools only files with
+  // something to do — owed bytes, a shrink (heal), a moved mtime (touch
+  // bookkeeping), a hold/backoff, or the attribution-gate probe. Without
+  // this gate the pass re-statted every watched file every tick (10k
+  // stats/tick measured) — the exact per-tick sweep C1 removed, resurrected
+  // inside the pass. The legacy sweep (tuning.sweep="legacy") passes
+  // everything, preserving the base's stat-per-file behavior byte-for-byte.
+  const pooled = !catalog
+    ? files
+    : files.filter((f) => {
+        const fs = state.files[f.path];
+        if (!fs) return true;
+        if (fs.skipReason) return true;
+        // PRESENCE of failure bookkeeping, not just an active window: an
+        // EXPIRED backoff on a caught-up file must still pool once so the
+        // post-ingest clearFileFailure fires — otherwise the stale streak
+        // survives and escalates the NEXT unrelated failure's backoff
+        // (active backoffs keep their per-tick stuck-log exactly as before).
+        if (fs.consecutiveFailures !== undefined || fs.nextAttemptAtMs !== undefined) return true;
+        // Legacy pre-cwd state entries get their one-time re-seed (the base
+        // paid it on its first pass) so folder/rule exclusions can match.
+        if (fs.cwd === undefined) return true;
+        if (!settings.personalSync && fs.attributed === undefined) return true;
+        if (f.size !== minOffset(fs)) return true;
+        if (fs.lastMtimeMs !== f.mtimeMs) return true;
+        return false;
+      });
+  let lastProgressAtMs = Date.now();
+  await runPool(
+    pooled,
+    fileConcurrency,
+    async (f) => {
+      await processParent(f);
+      if (onProgress && Date.now() - lastProgressAtMs >= SYNC_PROGRESS_MIN_MS) {
+        lastProgressAtMs = Date.now();
+        onProgress(snapshotFrom(files, state));
+      }
+    },
+    () => stopPass,
+  );
 
   // Child lanes + workflow sidecars (Claude only; Codex has no equivalent).
   // Runs after the parent pass so a brand-new session's parent commit lands
@@ -1966,7 +2281,9 @@ export async function tickOnce(
   if (!opts.only && Date.now() >= (childEndpointsMissingUntilMs.get(scope) ?? 0)) {
     const parentByArtifactSession = buildChildParentIndex(state);
     try {
-      const { children, runs } = await discoverClaudeChildren(roots.claude);
+      const { children, runs } = catalog
+        ? catalog.listChildren()
+        : await discoverClaudeChildren(roots.claude);
       const electedChildren = electChildUploaders(children, log);
       const lanePlan = planChildLaneResets(
         electedChildren,
@@ -1992,7 +2309,8 @@ export async function tickOnce(
         state.childUploaders = lanePlan.nextMap;
         await persistState(scope);
       }
-      for (const c of electedChildren) {
+      let stopChildren = false;
+      const processChild = async (c: DiscoveredChildFile): Promise<void> => {
         let pendingChild = state.files[c.path];
         if (pendingChild) {
           const reconciled = reconcileChildParent(
@@ -2004,13 +2322,13 @@ export async function tickOnce(
             await upsertFileState(reconciled, scope);
           }
         }
-        if (pendingChild?.nextAttemptAtMs && pendingChild.nextAttemptAtMs > Date.now()) continue;
+        if (pendingChild?.nextAttemptAtMs && pendingChild.nextAttemptAtMs > Date.now()) return;
         // A deleted parent blocks every child lane (the stop-flag matches the
         // bare sessionId, so a stale child family can't slip past it either).
         if (
           isDeletedSession(state, pendingChild?.family ?? "", pendingChild?.sessionId ?? c.parentSessionId)
         ) {
-          continue;
+          return;
         }
         try {
           const did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
@@ -2030,7 +2348,7 @@ export async function tickOnce(
             const family = pendingChild?.family ?? "claude-cli";
             await recordDeletedSession(family, pendingChild?.sessionId ?? c.parentSessionId, scope);
             await clearFileFailure(c.path, scope);
-            continue;
+            return;
           }
           if (err instanceof HxHttpError && err.vaultOffline) {
             // The child's session vault is offline (child lanes route through the
@@ -2043,16 +2361,24 @@ export async function tickOnce(
               err.vaultBlockReason ?? "vault_offline",
               err.blocker,
             );
-            continue;
+            return;
           }
           // A wholesale lane pause (404/401/403) or gateway-wide outage is not
           // this child's fault — don't give it a per-file backoff that would
-          // make it lag once the gateway recovers.
-          if (latchChildLanePause(err, scope, log)) break;
-          if (err instanceof HxHttpError && err.serverUnavailable) break;
+          // make it lag once the gateway recovers. Stop DEQUEUEING; in-flight
+          // children settle (M4's child half: ≤ concurrency−1 extra POSTs).
+          if (latchChildLanePause(err, scope, log)) {
+            stopChildren = true;
+            return;
+          }
+          if (err instanceof HxHttpError && err.serverUnavailable) {
+            stopChildren = true;
+            return;
+          }
           await recordFileFailure(c.path, FILE_RETRY_BASE_MS, scope);
         }
-      }
+      };
+      await runPool(electedChildren, childConcurrency, processChild, () => stopChildren);
       for (const r of runs) {
         try {
           await syncWorkflowRun(cfg, r, parentByArtifactSession, log);
@@ -2066,9 +2392,33 @@ export async function tickOnce(
     }
   }
 
+  // Flush point: end of every pass. Coalesced-mode bookkeeping (mtime
+  // touches, registry updates, backoff stamps, artifact hashes) becomes
+  // durable here; a no-op in flush-through mode (`hx tick`, `--once`, and
+  // every non-daemon caller — nothing ever marks dirty there).
+  await flushStateIfDirty(scope);
   const snapshot = snapshotFrom(files, state);
   onProgress?.(snapshot);
   return { uploaded, failed, snapshot };
+}
+
+/** Hourly perf-summary counters (see formatPerfLine / the perfTimer). */
+export interface PerfCounters {
+  passes: number;
+  passMs: number[];
+  uploads: number;
+  flushes: number;
+}
+
+/** The hourly `[hx] perf:` info line. Pure so the classifier golden can pin
+ *  it: the token format must never match the UI log classifier's warn/up
+ *  patterns (no "failed=", no "error", no "(+…B" — classifyLogLine in
+ *  ui/data.ts), or a healthy hourly summary would render as a warning. */
+export function formatPerfLine(perf: PerfCounters): string {
+  const sorted = [...perf.passMs].sort((a, b) => a - b);
+  const at = (q: number): number =>
+    sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!) : 0;
+  return `[hx] perf: passes=${perf.passes} passMs p50=${at(0.5)} p95=${at(0.95)} max=${Math.round(sorted[sorted.length - 1] ?? 0)} uploads=${perf.uploads} stateFlushes=${perf.flushes}`;
 }
 
 export async function startWatch(
@@ -2083,6 +2433,11 @@ export async function startWatch(
   log(`[hx] watching data roots: ${describeRoots(resolveDataRoots(await readSettings()))}`);
   log(`[hx] poll interval ${FAST_POLL_MS}ms; gateway ${cfg.gatewayBaseUrl}`);
   void trimActivity(); // cap the UI journal once per daemon lifetime
+
+  // Coalesced state persistence is a LONG-RUNNING-LOOP privilege: this loop
+  // owns flush points (end of pass, the timer below, flush-through commits).
+  // One-shot runs have none, so they keep flush-through mode untouched.
+  if (!opts.oneShot) armCoalescedPersistence(scopeOf(cfg));
 
   // A restart is a human signalling "conditions changed" — serving out stale
   // exponential penalties helps nobody. After the 2026-08-01 credential
@@ -2172,6 +2527,11 @@ export async function startWatch(
   // audit by its next interval.
   let passBusy = false;
 
+  // Perf self-observability: per-pass duration + activity counters, folded
+  // into ONE hourly info line (formatPerfLine — classifier-safe by test).
+  const PERF_LOG_MS = 60 * 60_000;
+  const perf: PerfCounters = { passes: 0, passMs: [], uploads: 0, flushes: 0 };
+
   // User-driven pause (settings.json, written by the UI server or a future
   // CLI). Checked every tick so a pause/resume takes effect within one poll.
   // Heartbeats keep running while paused — the device reads "online, paused",
@@ -2185,6 +2545,12 @@ export async function startWatch(
     // passBusy false, start, and then overlap the pass we're about to run —
     // exactly the in-flight-chunk-reads-as-divergence race the flag prevents.
     passBusy = true;
+    // Every tick observes the filesystem's root set FRESH, by construction —
+    // an off-slot timer (mirror, audit) must not leave the sub-tick roots
+    // memo warm across a tick boundary and delay a root-set change past the
+    // one-poll visibility the base gave it.
+    invalidateRootsMemo();
+    const passStartMs = Date.now();
     try {
       const settings = await readSettings();
       // Stamping is observation, not an upload: it must track Watched
@@ -2206,6 +2572,7 @@ export async function startWatch(
         log(`[hx] sync resumed`);
       }
       const { uploaded, failed } = await tickOnce(cfg, opts, log, reportSync);
+      perf.uploads += uploaded;
       if (uploaded || failed) {
         if (uploaded) lastContactMs = Date.now();
         log(`[hx] tick uploaded=${uploaded} failed=${failed}`);
@@ -2224,6 +2591,8 @@ export async function startWatch(
     } catch (err) {
       log(`[hx] tick error: ${(err as Error).message}`);
     } finally {
+      perf.passes += 1;
+      perf.passMs.push(Date.now() - passStartMs);
       passBusy = false;
     }
   };
@@ -2274,12 +2643,52 @@ export async function startWatch(
     void syncTeamMirror(cfg, log);
   }, MIRROR_SYNC_MS);
   const auditTimer = setInterval(() => void audit(), VERIFY_INTERVAL_MS);
+  // Coalesced-persistence safety net: bounds how long dirty bookkeeping can
+  // sit unflushed between passes (M2's ≤5 s), and the only flush that covers
+  // a hard kill landing between pass-end flushes.
+  const STATE_FLUSH_MS = 5_000;
+  const scope = scopeOf(cfg);
+  let flushFailureLogged = false;
+  const flushTimer = setInterval(() => {
+    if (!hasDirtyState(scope)) return;
+    perf.flushes += 1;
+    // A rejected flush must never become an unhandled rejection (Bun exits
+    // the process on those). flushStateIfDirty re-marked the scope dirty, so
+    // this same timer retries; log the streak once, not every 5 s.
+    flushStateIfDirty(scope).then(
+      () => {
+        flushFailureLogged = false;
+      },
+      (err) => {
+        if (!flushFailureLogged) {
+          flushFailureLogged = true;
+          // Same shape as the existing failure lines (heartbeat error:, tick
+          // error:) — classifies warn in the UI, as a real failure should.
+          log(`[hx] state flush error: ${(err as Error).message} (will keep retrying)`);
+        }
+      },
+    );
+  }, STATE_FLUSH_MS);
+  const perfTimer = setInterval(() => {
+    if (perf.passes === 0) return;
+    log(formatPerfLine(perf));
+    perf.passes = 0;
+    perf.passMs.length = 0;
+    perf.uploads = 0;
+    perf.flushes = 0;
+  }, PERF_LOG_MS);
   return {
     stop: () => {
       clearInterval(timer);
       clearInterval(hbTimer);
       clearInterval(mirrorTimer);
       clearInterval(auditTimer);
+      clearInterval(flushTimer);
+      clearInterval(perfTimer);
+      // Best-effort parting flush, then back to flush-through mode. Swallow —
+      // a rejection here would be unhandled, and stop() has no retry loop.
+      flushStateIfDirty(scope).catch(() => {});
+      disarmCoalescedPersistence(scope);
     },
   };
 }

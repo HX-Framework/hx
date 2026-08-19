@@ -1,0 +1,166 @@
+{
+  "watchedPaths": [
+    "/home/u/.claude/projects/pa/s1.jsonl",
+    "/home/u/.claude/projects/pa/s2.jsonl",
+    "/home/u/.claude/projects/pb/s3.jsonl",
+    "/home/u/.claude/projects/pb/s4-live.jsonl"
+  ],
+  "snapshot": {
+    "total": 4,
+    "done": 1,
+    "totalBytes": 89000
+  },
+  "skipped": [
+    {
+      "path": "/home/u/.claude/projects/pb/s3.jsonl",
+      "family": "claude-cli",
+      "sessionId": "s3",
+      "reason": "vault_offline",
+      "nextAttemptAtMs": 1755400600000,
+      "blocker": {
+        "reason": "vault_offline",
+        "destinations": [
+          {
+            "vaultOrgId": "orgV",
+            "reason": "vault_offline",
+            "orgName": "Vault Org",
+            "orgSlug": "vault-org",
+            "projectId": null,
+            "projectName": null,
+            "projectSlug": null,
+            "repoSlug": "acme/b",
+            "lastSeenAt": "2026-08-15T00:00:00.000Z"
+          }
+        ],
+        "firstSeenAtMs": 1755306400000,
+        "lastSeenAtMs": 1755396400000
+      }
+    }
+  ],
+  "behind": [
+    {
+      "path": "/home/u/.claude/projects/pg/s8.jsonl",
+      "sessionId": "s8",
+      "uploaded": 2000,
+      "lastKnownSize": 12000,
+      "sourceGone": true
+    }
+  ],
+  "unwatched": 1,
+  "ledger": {
+    "total": 4,
+    "totalBytes": 89000,
+    "oldestMs": 1755389200000,
+    "newestMs": 1755396400000,
+    "delivered": 1,
+    "live": 0,
+    "uploading": 1,
+    "waiting": 2,
+    "waitingUnprotected": 0,
+    "incomplete": 1,
+    "percent": 50,
+    "deliveredBytes": 10000,
+    "uploadingBytes": 1000,
+    "waitingBytes": 40000,
+    "notDelivered": [
+      {
+        "sessionId": "s2",
+        "family": "claude-cli",
+        "path": "/home/u/.claude/projects/pa/s2.jsonl",
+        "bucket": "waiting",
+        "sizeBytes": 50000,
+        "owedBytes": 20000,
+        "ageDays": 0,
+        "lastUploadAt": "2025-08-17T01:06:40.000Z",
+        "skipReason": null,
+        "consecutiveFailures": 0,
+        "nextAttemptAt": null,
+        "repoSlug": "acme/a",
+        "attributed": true,
+        "destinations": [
+          {
+            "key": "letai",
+            "label": "letai",
+            "offset": 50000,
+            "owed": 0,
+            "state": "reachable"
+          },
+          {
+            "key": "orgV",
+            "label": "Vault Org",
+            "offset": 30000,
+            "owed": 20000,
+            "state": "offline"
+          }
+        ]
+      },
+      {
+        "sessionId": "s3",
+        "family": "claude-cli",
+        "path": "/home/u/.claude/projects/pb/s3.jsonl",
+        "bucket": "waiting",
+        "sizeBytes": 20000,
+        "owedBytes": 20000,
+        "ageDays": 0,
+        "lastUploadAt": "2025-08-17T00:06:40.000Z",
+        "skipReason": "vault_offline",
+        "consecutiveFailures": 4,
+        "nextAttemptAt": "2025-08-17T03:16:40.000Z",
+        "repoSlug": "acme/b",
+        "attributed": true,
+        "destinations": [
+          {
+            "key": "letai",
+            "label": "letai",
+            "offset": 20000,
+            "owed": 0,
+            "state": "reachable"
+          },
+          {
+            "key": "orgV",
+            "label": "Vault Org",
+            "offset": 0,
+            "owed": 20000,
+            "state": "offline"
+          }
+        ]
+      },
+      {
+        "sessionId": "s4",
+        "family": "claude-cli",
+        "path": "/home/u/.claude/projects/pb/s4-live.jsonl",
+        "bucket": "uploading",
+        "sizeBytes": 9000,
+        "owedBytes": 1000,
+        "ageDays": 0,
+        "lastUploadAt": "2025-08-17T02:06:40.000Z",
+        "skipReason": null,
+        "consecutiveFailures": 0,
+        "nextAttemptAt": null,
+        "repoSlug": "acme/b",
+        "attributed": null,
+        "destinations": [
+          {
+            "key": "letai",
+            "label": "letai",
+            "offset": 8000,
+            "owed": 1000,
+            "state": "reachable"
+          }
+        ]
+      }
+    ],
+    "lagging": [
+      {
+        "key": "orgV",
+        "vaultOrgId": "orgV",
+        "label": "Vault Org",
+        "sessions": 2,
+        "bytes": 40000,
+        "lastSeenAt": "2026-08-15T00:00:00.000Z",
+        "offlineDays": 1
+      }
+    ],
+    "failing": []
+  }
+}

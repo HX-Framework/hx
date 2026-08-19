@@ -186,7 +186,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let alive = true;
     let debounce: ReturnType<typeof setTimeout> | null = null;
+    // Poll hygiene: a hidden tab renders nothing, so its timer ticks skip the
+    // fetch entirely (an immediate pull fires on return to visible); and a
+    // poll never starts while the previous request is still in flight, so a
+    // slow server sees one snapshot request at a time instead of a pile-up.
+    let inFlight = false;
     const pull = async () => {
+      if (inFlight || document.hidden) return;
+      inFlight = true;
       try {
         const s = await api.snapshot();
         if (!alive) return;
@@ -198,9 +205,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setError((e as Error).message);
         setAuthError(authErrorKind(e));
       } finally {
+        inFlight = false;
         if (alive) setLoading(false);
       }
     };
+    const onVisible = () => {
+      if (!document.hidden) void pull();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     refetchSnap.current = () => {
       if (debounce) return;
       debounce = setTimeout(() => {
@@ -236,6 +248,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       alive = false;
       clearInterval(t);
       if (debounce) clearTimeout(debounce);
+      document.removeEventListener("visibilitychange", onVisible);
       unsubscribe();
     };
   }, []);
@@ -269,19 +282,29 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!logsActive) return;
     let alive = true;
+    let inFlight = false;
     const pull = async () => {
+      if (inFlight || document.hidden) return;
+      inFlight = true;
       try {
         const r = await api.logs(500);
         if (alive) setLogs(r.lines);
       } catch {
         // snapshot polling surfaces connectivity problems; keep last lines
+      } finally {
+        inFlight = false;
       }
     };
+    const onVisible = () => {
+      if (!document.hidden) void pull();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     void pull();
     const t = setInterval(pull, LOGS_POLL_MS);
     return () => {
       alive = false;
       clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [logsActive]);
 

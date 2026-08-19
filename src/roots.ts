@@ -84,15 +84,46 @@ function resolveFamily(
   return out;
 }
 
+// Sub-tick memo: the daemon resolves roots more than once per tick (tickOnce
+// and publishRoots each resolve, off separate settings reads; the mirror and
+// audit timers add off-slot calls), and every resolution pays existsSync +
+// realpathSync per candidate — measured at ~10% of a core on WSL at tick
+// cadence in the 10k-tree e2e. The TTL alone does NOT guarantee each tick a
+// fresh view (an off-slot timer can re-stamp the memo just before a tick
+// slot), so the daemon's run() calls invalidateRootsMemo() at the top of
+// every tick — the tick's first resolution is fresh BY CONSTRUCTION and
+// later same-tick calls collapse. A settings/env change alters the input
+// key and bypasses the memo outright either way.
+const ROOTS_MEMO_TTL_MS = 1_200;
+let rootsMemo: { key: string; atMs: number; value: ResolvedRoots } | null = null;
+
+/** Drop the memo so the next resolution re-observes the filesystem. The
+ *  daemon calls this at every tick boundary; tests use it around fs edits. */
+export function invalidateRootsMemo(): void {
+  rootsMemo = null;
+}
+
 /** Resolve the full watch-root set for THIS process (settings + own env). */
 export function resolveDataRoots(
   s: HxSettings,
   env: Record<string, string | undefined> = process.env,
 ): ResolvedRoots {
-  return {
+  const key = JSON.stringify([
+    s.dataDirs.claude,
+    s.dataDirs.codex,
+    env.CLAUDE_CONFIG_DIR ?? null,
+    env.CODEX_HOME ?? null,
+  ]);
+  const nowMs = Date.now();
+  if (rootsMemo && rootsMemo.key === key && nowMs - rootsMemo.atMs < ROOTS_MEMO_TTL_MS) {
+    return rootsMemo.value;
+  }
+  const value = {
     claude: resolveFamily(DEFAULT_CLAUDE_ROOT, s.dataDirs.claude, env.CLAUDE_CONFIG_DIR),
     codex: resolveFamily(DEFAULT_CODEX_ROOT, s.dataDirs.codex, env.CODEX_HOME),
   };
+  rootsMemo = { key, atMs: nowMs, value };
+  return value;
 }
 
 /** Same physical directory? Realpaths both sides when resolvable, so a

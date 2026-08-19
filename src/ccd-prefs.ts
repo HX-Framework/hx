@@ -20,12 +20,20 @@
 // matching, so it is platform-independent once the path is right.
 
 import path from "node:path";
+import { readdir, stat } from "node:fs/promises";
 import { leveldbScanBuffers } from "./ccd-leveldb.js";
-import { ccdAppDir, readCcdRecents } from "./ccd.js";
+import { ccdAppDir, ccdSessionsFingerprint, readCcdRecentsCached } from "./ccd.js";
 import type { HxCcdGroupMirrorBlob, HxCcdGroup } from "./mirror-types.js";
 
 const CCD_ROOT = ccdAppDir();
-const LS_DIR = CCD_ROOT === null ? null : path.join(CCD_ROOT, "Local Storage", "leveldb");
+let LS_DIR = CCD_ROOT === null ? null : path.join(CCD_ROOT, "Local Storage", "leveldb");
+
+/** Test seam — point the Local Storage leveldb at a fixture dir (null
+ *  restores the platform default) and drop the mirror cache. */
+export function setCcdLeveldbDirForTests(dir: string | null): void {
+  LS_DIR = dir ?? (CCD_ROOT === null ? null : path.join(CCD_ROOT, "Local Storage", "leveldb"));
+  mirrorCache = null;
+}
 
 interface DframeState {
   groupByByMode?: { code?: string | null };
@@ -90,48 +98,79 @@ function scanBufferForDframe(buf: Buffer): DframeState | null {
   return null;
 }
 
-/**
- * Read CCD's grouping slice (`frame-store`, formerly `dframe-store`) — the slice
- * holding custom groups, assignments, order, and collapsed state. The value
- * lives in a recent .log (plaintext WAL) until leveldb compacts it into a
- * Snappy-compressed .ldb SSTable; the scanner transparently decompresses .ldb
- * blocks (see ccd-leveldb.ts). Newest file first; returns the first parseable
- * grouping `state`, or null.
- */
-async function readDframeStore(): Promise<DframeState | null> {
-  if (LS_DIR === null) return null;
-  for await (const buf of leveldbScanBuffers(LS_DIR)) {
-    const found = scanBufferForDframe(buf);
-    if (found) return found;
+/** Find `unreadIds` in one scannable buffer — CCD's blue-dot sessions, stored
+ *  under `epitaxy-unread-v1` (any wrapper key: the `"unreadIds":[…]` array is
+ *  the signature). Returns null to keep scanning older buffers (no match, or
+ *  a torn/unparseable match — same continue-scanning rule as before). */
+function scanBufferForUnread(buf: Buffer): string[] | null {
+  const m = buf.toString("utf8").match(/"unreadIds":\s*\[([^\]]{0,8000})\]/);
+  if (!m) return null;
+  try {
+    const arr = JSON.parse("[" + m[1] + "]") as unknown[];
+    if (Array.isArray(arr)) return arr.filter((x): x is string => typeof x === "string");
+  } catch {
+    /* torn match — keep scanning */
   }
   return null;
 }
 
 /**
- * Read CCD's `unreadIds` — sessions with new content since last viewed (CCD's
- * blue sidebar dot). Stored under `epitaxy-unread-v1` in a recent .log file.
- * Returns CCD session ids ("local_<uuid>").
+ * ONE pass over the leveldb for BOTH readers (grouping slice + unreadIds) —
+ * historically each reader iterated (and snappy-decompressed) every buffer
+ * independently, doubling the scan. Newest file first, first parseable hit
+ * wins per reader — identical results to the two independent scans, since
+ * both consumed the same newest-first order and took their first hit.
  */
-async function readUnreadIds(): Promise<string[]> {
-  if (LS_DIR === null) return [];
+async function scanLeveldbOnce(): Promise<{ dframe: DframeState | null; unreadIds: string[] }> {
+  if (LS_DIR === null) return { dframe: null, unreadIds: [] };
+  let dframe: DframeState | null = null;
+  let unread: string[] | null = null;
   for await (const buf of leveldbScanBuffers(LS_DIR)) {
-    // Works regardless of the wrapper key: any `"unreadIds":[…]` array.
-    const m = buf.toString("utf8").match(/"unreadIds":\s*\[([^\]]{0,8000})\]/);
-    if (m) {
-      try {
-        const arr = JSON.parse("[" + m[1] + "]") as unknown[];
-        if (Array.isArray(arr)) return arr.filter((x): x is string => typeof x === "string");
-      } catch {
-        /* keep scanning older buffers */
-      }
-    }
+    if (!dframe) dframe = scanBufferForDframe(buf);
+    if (!unread) unread = scanBufferForUnread(buf);
+    if (dframe && unread) break;
   }
-  return [];
+  return { dframe, unreadIds: unread ?? [] };
+}
+
+/** Cheap change fingerprint over the leveldb dir: (name, size, mtime) of every
+ *  .log/.ldb, sorted. Any Local Storage write lands in a .log (and compaction
+ *  rewrites the file set), so an unchanged fingerprint means an unchanged
+ *  store — the expensive decompress-and-scan can be skipped entirely. */
+async function leveldbFingerprint(): Promise<string | null> {
+  const dir = LS_DIR;
+  if (dir === null) return null;
+  let files: string[];
+  try {
+    files = await readdir(dir);
+  } catch {
+    return null;
+  }
+  const parts = await Promise.all(
+    files
+      .filter((f) => f.endsWith(".log") || f.endsWith(".ldb"))
+      .map(async (f) => {
+        try {
+          const st = await stat(path.join(dir, f));
+          return `${f}:${st.size}:${st.mtimeMs}`;
+        } catch {
+          return `${f}:gone`;
+        }
+      }),
+  );
+  return parts.sort().join("|");
 }
 
 function stripCodePrefix(s: string): string {
   return s.replace(/^code:/, "");
 }
+
+// Change gate: both sources fingerprinted by stats alone (a readdir + a stat
+// per file) before any byte is read or decompressed. Unchanged fingerprints
+// return the cached blob — the 20 s cadence then costs stats, not scans. The
+// caller's content-hash gate (syncGroupMirror) is unaffected: it already
+// excludes the volatile syncedAtMs, so a re-stamped cached blob never uploads.
+let mirrorCache: { ldbFp: string | null; sessFp: string; blob: HxCcdGroupMirrorBlob } | null = null;
 
 /**
  * Assemble the CCD sidebar mirror the gateway stores. Returns a disabled-empty
@@ -147,17 +186,31 @@ export async function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorB
     syncedAtMs: nowMs,
   };
 
+  let ldbFp: string | null = null;
+  let sessFp = "";
+  try {
+    [ldbFp, sessFp] = await Promise.all([leveldbFingerprint(), ccdSessionsFingerprint()]);
+    if (mirrorCache && mirrorCache.ldbFp === ldbFp && mirrorCache.sessFp === sessFp) {
+      return { ...mirrorCache.blob, syncedAtMs: nowMs };
+    }
+  } catch {
+    // Fingerprinting failed — fall through to the full read (never worse than
+    // the ungated behavior).
+  }
+
   let dframe: DframeState | null;
   let unreadIds: string[];
   try {
-    [dframe, unreadIds] = await Promise.all([readDframeStore(), readUnreadIds()]);
+    ({ dframe, unreadIds } = await scanLeveldbOnce());
   } catch {
     return empty;
   }
 
   const enabled = dframe?.groupByByMode?.code === "custom";
   if (!enabled || !Array.isArray(dframe?.customGroups) || dframe.customGroups.length === 0) {
-    return { ...empty, unreadIds: (unreadIds ?? []).map(stripCodePrefix) };
+    const blob = { ...empty, unreadIds: (unreadIds ?? []).map(stripCodePrefix) };
+    mirrorCache = { ldbFp, sessFp, blob };
+    return blob;
   }
 
   const collapsed = new Set(Array.isArray(dframe.collapsedGroups) ? dframe.collapsedGroups : []);
@@ -190,7 +243,11 @@ export async function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorB
   // so a freshly-stamped session still matches via the ccdSessionId fallback.
   const cliByCcd = new Map<string, string>();
   try {
-    for (const r of await readCcdRecents()) {
+    // Cached — but pinned to THIS rebuild's fresh fingerprint: passing sessFp
+    // forces a refresh when the TTL-cached records predate the change that
+    // triggered this rebuild (they'd otherwise be cached under the fresh
+    // fingerprint and never corrected).
+    for (const r of await readCcdRecentsCached(nowMs, sessFp || undefined)) {
       if (r.cliSessionId) cliByCcd.set(r.ccdSessionId, r.cliSessionId);
     }
   } catch {
@@ -209,11 +266,13 @@ export async function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorB
       sessionIds: (byGroup.get(g.id) ?? []).map(toCli),
     }));
 
-  return {
+  const blob: HxCcdGroupMirrorBlob = {
     groupingEnabled: true,
     groups,
     unreadIds: (unreadIds ?? []).map(stripCodePrefix).map(toCli),
     note: `CCD custom grouping: ${groups.length} groups`,
     syncedAtMs: nowMs,
   };
+  mirrorCache = { ldbFp, sessFp, blob };
+  return blob;
 }

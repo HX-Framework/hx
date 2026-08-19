@@ -275,7 +275,7 @@ export async function recordDestinationUploadError(
 ): Promise<void> {
   const state = await loadState(scope);
   applyDestinationUploadError(state, key, code, Date.now());
-  await schedulePersist(state, scope);
+  await persistOrMark(state, scope);
 }
 
 export async function clearDestinationUploadError(
@@ -283,7 +283,11 @@ export async function clearDestinationUploadError(
   scope: StateScope = "main",
 ): Promise<void> {
   const state = await loadState(scope);
-  if (applyDestinationUploadSuccess(state, key)) await schedulePersist(state, scope);
+  // Flush-through in both modes: this clear ends a destination failure run
+  // right after a successful commit — losing it to a hard kill would leave a
+  // phantom "failing" row in `hx status --detailed` until the NEXT commit to
+  // that destination. Transition-gated, so the extra write is rare.
+  if (applyDestinationUploadSuccess(state, key)) await persistThrough(state, scope);
 }
 
 /** One destination as the gateway just described it, narrowed to what we keep. */
@@ -347,7 +351,7 @@ export async function recordDestinations(
 ): Promise<void> {
   const state = await loadState(scope);
   if (applyDestinationReports(state, reports, Date.now())) {
-    await schedulePersist(state, scope);
+    await persistOrMark(state, scope);
   }
 }
 
@@ -378,6 +382,12 @@ export interface HxState {
    *  and falls back to its own resolution when the stamp is absent (daemon
    *  not yet upgraded / never ran). Additive; older binaries ignore it. */
   effectiveRoots?: EffectiveRootsStamp;
+  /** Learned per-destination chunk-size caps (bytes), keyed by {@link destKey}
+   *  — written by the adaptive-chunk probe when a destination's PUT path
+   *  rejects a grown size, so restarts never re-probe. Additive; older
+   *  binaries round-trip it untouched (loadState keeps unknown top-level
+   *  keys and persist rewrites the whole object). */
+  chunkCaps?: Record<string, number>;
   /** Last elected uploader path per child lane (`parent:agent:runId`). Child
    *  election is stateless (newest mtime wins); when a lane's winner FLIPS
    *  (a copied tree raced the live file), the new winner must re-upload from
@@ -398,14 +408,124 @@ const STATE_FILE: Record<StateScope, string> = {
 const inMemory = new Map<StateScope, HxState>();
 const writeChains = new Map<StateScope, Promise<void>>();
 
+// ── Coalesced persistence (daemon-only opt-in) ──────────────────────────────
+//
+// Default mode is FLUSH-THROUGH: every mutator awaits a full persist before
+// returning — exactly the historical behavior, and what every one-shot or
+// cross-process writer (`hx retry`, `hx backfill`, the UI server's actions,
+// `hx tick`, `watch --once`) must keep, since none of them has any later
+// flush point.
+//
+// The long-running watch loop arms COALESCED mode for its scope
+// (armCoalescedPersistence, from startWatch, never for one-shot runs). In that
+// mode, high-churn bookkeeping writes (mtime touches, destination registry,
+// backoff stamps, artifact hashes) only mark the scope dirty; the daemon
+// flushes at its own points (end of every pass + a periodic timer + after
+// every chunk commit via the flush-through mutators below). What a hard kill
+// can lose is therefore only records that re-derive on the next pass — never
+// a committed-byte offset and never a post-success status clear:
+// `setOffsetFor` and the three transition clears (`clearFileFailure`,
+// `clearDestinationUploadError`, `clearHeal`) stay flush-through in BOTH
+// modes, so offset durability and status-latch clearing keep today's
+// per-commit window on every platform, hard-kill Windows and containers
+// included.
+const coalescedScopes = new Set<StateScope>();
+const dirtyScopes = new Set<StateScope>();
+
+// Best-effort POSIX flush-on-signal (SIGTERM from systemd/launchd stop, SIGINT
+// from a foreground Ctrl-C). Never load-bearing — Windows and `docker stop`'s
+// SIGKILL get no signal at all, which is why offsets and the transition clears
+// are flush-through in the first place. After flushing, the signal is
+// RE-RAISED (the `once` handler is gone by then) so the process's observable
+// exit — default termination, or cmdWatch's own SIGINT handler — is exactly
+// what it is today; this handler only borrows the beat before it.
+let signalFlushInstalled = false;
+function installSignalFlush(): void {
+  if (signalFlushInstalled || process.platform === "win32") return;
+  signalFlushInstalled = true;
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    process.once(sig, () => {
+      void Promise.allSettled([...dirtyScopes].map((s) => flushStateIfDirty(s))).finally(() => {
+        process.kill(process.pid, sig);
+      });
+    });
+  }
+}
+
+/** Arm coalesced persistence for one scope — the long-running daemon loop
+ *  only. One-shot runs and every other process stay flush-through. */
+export function armCoalescedPersistence(scope: StateScope): void {
+  coalescedScopes.add(scope);
+  installSignalFlush();
+}
+
+/** Disarm (stop() / tests). Pending dirty state is NOT flushed here — callers
+ *  flush explicitly first; disarming only restores flush-through mode. */
+export function disarmCoalescedPersistence(scope: StateScope): void {
+  coalescedScopes.delete(scope);
+}
+
+/** Persist now (flush-through), or — in coalesced mode — mark the scope dirty
+ *  and return immediately. The daemon's flush points pick dirty scopes up. */
+function persistOrMark(state: HxState, scope: StateScope): Promise<void> {
+  if (coalescedScopes.has(scope)) {
+    dirtyScopes.add(scope);
+    return Promise.resolve();
+  }
+  return schedulePersist(state, scope);
+}
+
+/** Write the scope's state to disk now and clear its dirty flag. Used by the
+ *  flush-through mutators (whose full-state write necessarily includes every
+ *  pending coalesced mutation) and by the daemon's flush points. A failed
+ *  write (after schedulePersist's one retry) RE-MARKS the scope dirty before
+ *  rethrowing, so the periodic flush keeps retrying instead of stranding the
+ *  in-memory mutations behind a cleared flag. */
+async function persistThrough(state: HxState, scope: StateScope): Promise<void> {
+  dirtyScopes.delete(scope);
+  try {
+    await schedulePersist(state, scope);
+  } catch (err) {
+    dirtyScopes.add(scope);
+    throw err;
+  }
+}
+
+/** Flush a scope's coalesced mutations if any are pending. The daemon calls
+ *  this at the end of every pass and on a short timer; a no-op everywhere
+ *  else (nothing ever marks dirty outside coalesced mode). Rejections carry
+ *  through to the caller (which logs) — the dirty flag was already re-marked,
+ *  so the next flush point retries. */
+export async function flushStateIfDirty(scope: StateScope = "main"): Promise<void> {
+  if (!dirtyScopes.has(scope)) return;
+  const state = await loadState(scope);
+  await persistThrough(state, scope);
+}
+
+/** Test seam: whether a scope currently has unflushed coalesced mutations. */
+export function hasDirtyState(scope: StateScope = "main"): boolean {
+  return dirtyScopes.has(scope);
+}
+
 /** Forget a cached snapshot so a maintenance command can re-read state after
  *  stopping the daemon that owned the file. */
 export function resetStateCache(scope: StateScope = "main"): void {
   inMemory.delete(scope);
 }
 
+// Test seam: persistence tests point the module at a tmpdir (the same
+// injection style settings.ts/activity.ts use via path parameters — state's
+// mutators derive the path internally, so the override lives here instead).
+let stateDirOverride: string | null = null;
+
+/** Test seam — redirect state files to `dir` (null restores ~/.let/hx).
+ *  Callers reset the cache themselves; production code never calls this. */
+export function setStateDirForTests(dir: string | null): void {
+  stateDirOverride = dir;
+}
+
 function statePath(scope: StateScope): string {
-  return path.join(STATE_DIR, STATE_FILE[scope]);
+  return path.join(stateDirOverride ?? STATE_DIR, STATE_FILE[scope]);
 }
 
 export async function loadState(scope: StateScope = "main"): Promise<HxState> {
@@ -472,19 +592,39 @@ export function seedDestinationsFromBlockers(state: HxState): void {
 }
 
 async function persist(state: HxState, scope: StateScope): Promise<void> {
-  await mkdir(STATE_DIR, { recursive: true });
+  await mkdir(stateDirOverride ?? STATE_DIR, { recursive: true });
   const target = statePath(scope);
   const tmp = `${target}.tmp`;
-  await writeFile(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+  // Compact JSON: state.json is written often and parsed only by JSON.parse
+  // consumers (this module, the UI server, doctor) — pretty-printing doubled
+  // every write for nothing.
+  await writeFile(tmp, JSON.stringify(state), { mode: 0o600 });
   await rename(tmp, target);
 }
 
-/** Chain writes per scope so we never have two writers racing on one file. */
+// One write may be QUEUED (scheduled, not yet started) per scope. `persist`
+// serializes the live state object at write time, so every mutation applied
+// before the queued write starts is already included in it — additional
+// callers piggyback on that queued write instead of enqueueing another full
+// rewrite each. A mutation landing while a write is IN FLIGHT queues exactly
+// one follow-up. Under the upload pool this is what keeps N concurrent
+// commit-flushes from becoming N serialized full-file writes.
+const queuedWrite = new Map<StateScope, Promise<void>>();
+
+/** Chain writes per scope so we never have two writers racing on one file.
+ *  A failed write RETRIES ONCE immediately (the base contract — a transient
+ *  EBUSY/EPERM from an AV or indexer holding the file, classic on Windows,
+ *  must stay invisible); a double failure rejects to the awaiting caller. */
 function schedulePersist(state: HxState, scope: StateScope): Promise<void> {
-  const chain = (writeChains.get(scope) ?? Promise.resolve())
-    .then(() => persist(state, scope))
-    .catch(() => persist(state, scope));
+  const queued = queuedWrite.get(scope);
+  if (queued) return queued;
+  const start = (): Promise<void> => {
+    queuedWrite.delete(scope); // the write begins: later mutations must re-queue
+    return persist(state, scope).catch(() => persist(state, scope));
+  };
+  const chain = (writeChains.get(scope) ?? Promise.resolve()).then(start, start);
   writeChains.set(scope, chain);
+  queuedWrite.set(scope, chain);
   return chain;
 }
 
@@ -502,10 +642,14 @@ export async function upsertFileState(
 ): Promise<void> {
   const state = await loadState(scope);
   state.files[s.path] = s;
-  await schedulePersist(state, scope);
+  await persistOrMark(state, scope);
 }
 
-/** Persist the daemon's resolved watch roots (see HxState.effectiveRoots). */
+/** Persist the daemon's resolved watch roots (see HxState.effectiveRoots).
+ *  Flush-through deliberately: startWatch's publishRoots latch only advances
+ *  after the persist SUCCEEDS (its retry contract), so this write must fail
+ *  loudly rather than vanish into a dirty flag. Rare (signature changes +
+ *  a 10-min restamp), so the cost is nil. */
 export async function stampEffectiveRoots(
   roots: ResolvedRoots,
   scope: StateScope = "main",
@@ -516,7 +660,7 @@ export async function stampEffectiveRoots(
     codex: roots.codex,
     resolvedAtMs: Date.now(),
   };
-  await schedulePersist(state, scope);
+  await persistThrough(state, scope);
 }
 
 /** Persist the cached state after in-place mutations (childUploaders map,
@@ -524,7 +668,7 @@ export async function stampEffectiveRoots(
  *  other writer here — only the process that owns the lane calls this. */
 export async function persistState(scope: StateScope = "main"): Promise<void> {
   const state = await loadState(scope);
-  await schedulePersist(state, scope);
+  await persistOrMark(state, scope);
 }
 
 /** Record the bytes committed to ONE destination for a file. Other destinations'
@@ -542,7 +686,12 @@ export async function setOffsetFor(
   existing.offsets[destKey(vaultOrgId)] = offset;
   existing.lastMtimeMs = mtimeMs;
   existing.lastUploadAtMs = Date.now();
-  await schedulePersist(state, scope);
+  // Flush-through in BOTH modes: a committed-byte offset must be durable
+  // before the next fan-out step starts (today's guarantee). Vault-routed and
+  // fortress-direct canonicals have NO divergence heal, so a lost offset there
+  // means silently duplicated bytes after a hard kill — the one unrecoverable
+  // crash-loss class this file could create. Never coalesce this write.
+  await persistThrough(state, scope);
 }
 
 /**
@@ -562,7 +711,10 @@ export async function reconcileDestinations(
   const existing = state.files[filePath];
   if (!existing) return;
   const changed = reconcileDestinationOffsets(existing.offsets, activeKeys);
-  if (changed) await schedulePersist(state, scope);
+  // Coalesce-eligible: add-at-zero/prune edits re-derive from the next
+  // append-url's destination set; a lost key reads as offset 0, so no
+  // committed-byte durability rides on this write.
+  if (changed) await persistOrMark(state, scope);
 }
 
 /** Apply a gateway's current destination set to an offset map. Exported as a
@@ -601,7 +753,9 @@ export async function touchMtime(
   const existing = state.files[filePath];
   if (!existing) return;
   existing.lastMtimeMs = mtimeMs;
-  await schedulePersist(state, scope);
+  // The chattiest mutator (fires per active file per tick) — the reason
+  // coalesced mode exists. Loss on a hard kill costs one re-stat.
+  await persistOrMark(state, scope);
 }
 
 /** Per-file retry backoff cap — a broken file retries at most every 30 min. */
@@ -626,7 +780,7 @@ export async function benchFileProbe(
   const existing = state.files[filePath];
   if (!existing) return;
   existing.nextAttemptAtMs = Date.now() + delayMs;
-  await schedulePersist(state, scope);
+  await persistOrMark(state, scope);
 }
 
 /** Record a failed upload attempt for one file and schedule its next try with
@@ -663,7 +817,10 @@ export async function recordFileFailure(
   } else {
     delete existing.blocker;
   }
-  await schedulePersist(state, scope);
+  // Coalesce-eligible: a failure stamp lost to a hard kill re-latches on the
+  // very next failed attempt — and a daemon restart deliberately clears
+  // generic backoffs anyway.
+  await persistOrMark(state, scope);
   return delay;
 }
 
@@ -686,7 +843,7 @@ export async function recordHeal(
   if (n >= HEAL_MAX_CONSECUTIVE) {
     existing.healPausedUntilMs = Date.now() + HEAL_PAUSE_MS;
   }
-  await schedulePersist(state, scope);
+  await persistOrMark(state, scope);
   return n;
 }
 
@@ -702,7 +859,9 @@ export async function clearHeal(
   }
   delete existing.healCount;
   delete existing.healPausedUntilMs;
-  await schedulePersist(state, scope);
+  // Flush-through (transition-gated): a lost heal-streak clear would let a
+  // later genuine divergence trip the 6 h heal pause early.
+  await persistThrough(state, scope);
 }
 
 /** Clear a file's failure backoff (and any skip reason) after a clean pass. */
@@ -725,7 +884,11 @@ export async function clearFileFailure(
   delete existing.nextAttemptAtMs;
   delete existing.skipReason;
   delete existing.blocker;
-  await schedulePersist(state, scope);
+  // Flush-through (transition-gated): this clear runs right after a recovery
+  // upload; losing it to a hard kill would keep a phantom "waiting" row (the
+  // skipReason survives clearGenericBackoffs by design) for up to the 30-min
+  // backoff cap while the offsets already say the file is delivered.
+  await persistThrough(state, scope);
 }
 
 /** Clear only transient destination holds so the next daemon pass retries them
@@ -736,7 +899,7 @@ export async function clearBlockedFailures(
 ): Promise<{ files: number; sessions: number }> {
   const state = await loadState(scope);
   const cleared = clearBlockedFailuresFromState(state);
-  if (cleared.files > 0) await schedulePersist(state, scope);
+  if (cleared.files > 0) await persistOrMark(state, scope);
   return cleared;
 }
 
@@ -801,7 +964,7 @@ export async function clearAllFailures(
 ): Promise<{ files: number; sessions: number }> {
   const state = await loadState(scope);
   const cleared = clearAllFailuresFromState(state);
-  if (cleared.files > 0) await schedulePersist(state, scope);
+  if (cleared.files > 0) await persistOrMark(state, scope);
   return cleared;
 }
 
@@ -827,7 +990,7 @@ export function clearGenericBackoffsFromState(state: HxState): number {
 export async function clearGenericBackoffs(scope: StateScope = "main"): Promise<number> {
   const state = await loadState(scope);
   const files = clearGenericBackoffsFromState(state);
-  if (files > 0) await schedulePersist(state, scope);
+  if (files > 0) await persistOrMark(state, scope);
   return files;
 }
 
@@ -854,7 +1017,9 @@ export async function recordDeletedSession(
   for (const [k, at] of Object.entries(state.deletedSessions)) {
     if (at < cutoff) delete state.deletedSessions[k];
   }
-  await schedulePersist(state, scope);
+  // Coalesce-eligible: the server-side tombstone is authoritative — a record
+  // lost to a hard kill re-latches on the next 410.
+  await persistOrMark(state, scope);
 }
 
 /** True when the server permanently deleted this session (any family recorded —
@@ -873,6 +1038,28 @@ export function isDeletedSession(
   return false;
 }
 
+/** Learned chunk cap for one destination, if any (see HxState.chunkCaps). */
+export async function getChunkCap(
+  key: string,
+  scope: StateScope = "main",
+): Promise<number | undefined> {
+  const state = await loadState(scope);
+  return state.chunkCaps?.[key];
+}
+
+/** Persist a learned chunk cap. Coalesce-eligible: a cap lost to a hard kill
+ *  merely re-probes once, and the probe is side-effect-free by design. */
+export async function setChunkCap(
+  key: string,
+  capBytes: number,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  if (!state.chunkCaps) state.chunkCaps = {};
+  state.chunkCaps[key] = capBytes;
+  await persistOrMark(state, scope);
+}
+
 export async function getArtifactHash(
   key: string,
   scope: StateScope = "main",
@@ -889,5 +1076,5 @@ export async function setArtifactHash(
   const state = await loadState(scope);
   if (!state.artifacts) state.artifacts = {};
   state.artifacts[key] = hash;
-  await schedulePersist(state, scope);
+  await persistOrMark(state, scope);
 }

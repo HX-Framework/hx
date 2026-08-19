@@ -7,6 +7,7 @@ import { DEFAULT_SETTINGS, type HxSettings } from "./settings.js";
 import {
   DEFAULT_CLAUDE_ROOT,
   DEFAULT_CODEX_ROOT,
+  invalidateRootsMemo,
   duplicateRootError,
   isUnderRoots,
   resolveDataRoots,
@@ -196,5 +197,28 @@ describe("rootsSignature", () => {
     assert.equal(rootsSignature(a), rootsSignature(b));
     const withExtra = resolveDataRoots(settingsWith({ claude: ["/data/x"], codex: [] }), {});
     assert.notEqual(rootsSignature(a), rootsSignature(withExtra));
+  });
+});
+
+describe("resolveDataRoots memo", () => {
+  it("collapses same-key calls within the TTL; a settings change bypasses it", () => {
+    invalidateRootsMemo();
+    const base = tmp();
+    const dir = join(base, "root-a");
+    const s = settingsWith({ claude: [dir], codex: [] });
+    const first = resolveDataRoots(s, {});
+    assert.equal(first.claude[1]?.exists, false);
+    // Same key inside the TTL: the memoized value comes back — an fs change
+    // between two same-tick calls is deliberately NOT re-observed (roots were
+    // only ever read at tick boundaries; the TTL sits under the tick).
+    mkdirSync(dir);
+    assert.equal(resolveDataRoots(s, {}), first);
+    // A different input key (settings edit) resolves fresh immediately.
+    const s2 = settingsWith({ claude: [dir, join(base, "root-b")], codex: [] });
+    const fresh = resolveDataRoots(s2, {});
+    assert.equal(fresh.claude[1]?.exists, true);
+    // And after the memo drops, the same key re-observes the filesystem.
+    invalidateRootsMemo();
+    assert.equal(resolveDataRoots(s, {}).claude[1]?.exists, true);
   });
 });
