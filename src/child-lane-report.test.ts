@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeSyncReport } from "./watch.js";
+import { computeSyncReport, snapshotFrom } from "./watch.js";
 import { resetStateCache, setStateDirForTests, upsertFileState, type FileState } from "./state.js";
 
 let dir = "";
@@ -107,6 +107,8 @@ describe("childLanes accounting", () => {
 // The three rules below were each deletable with the entire suite still green.
 import { hasReleasableHolds, stuckLogKey } from "./watch.js";
 import { buildSyncDoctorReport } from "./diagnostics.js";
+import { buildLedger } from "./ledger.js";
+import type { HxState } from "./state.js";
 import type { SyncReport } from "./watch.js";
 
 const cleanReport = (): SyncReport => ({
@@ -182,5 +184,58 @@ describe("stuckLogKey", () => {
       stuckLogKey({ consecutiveFailures: 1, skipReason: "quarantine" }),
       stuckLogKey({ consecutiveFailures: 1, skipReason: "vault_offline" }),
     );
+  });
+});
+
+// The snapshot POSTed to the gateway is derived by snapshotFrom. It must agree
+// with the ledger `hx status` prints from the same state — a device telling the
+// server one number while showing the user another is the failure this whole
+// change set began from. Reverting snapshotFrom to minOffset left the entire
+// suite green, so nothing pinned it.
+describe("snapshotFrom agrees with the ledger about a phantom key", () => {
+  const withPhantom = (): HxState => ({
+    files: {
+      "/s.jsonl": {
+        path: "/s.jsonl",
+        family: "claude-cli",
+        sessionId: "s",
+        offsets: { letai: 1000, phantom: 0 },
+        lastMtimeMs: 0,
+        lastUploadAtMs: 0,
+      },
+    },
+    destinations: {
+      letai: {
+        vaultOrgId: null,
+        status: "ready",
+        orgName: null,
+        orgSlug: null,
+        lastSeenAt: null,
+        observedAtMs: 0,
+      },
+    },
+  });
+  const files = [{ path: "/s.jsonl", size: 1000, mtimeMs: 0 }] as never;
+
+  it("counts the session done — the phantom cannot pin it below", () => {
+    // minOffset would answer 0 here and report a delivered session as unsent
+    // for as long as the file exists.
+    assert.equal(snapshotFrom(files, withPhantom()).done, 1);
+  });
+
+  it("and the ledger calls the same session delivered", () => {
+    const l = buildLedger({
+      files: [{ path: "/s.jsonl", size: 1000, mtimeMs: 0 }],
+      state: withPhantom(),
+      incompleteSessions: 0,
+      nowMs: 30 * 24 * 60 * 60 * 1000,
+    });
+    assert.equal(l.delivered, 1);
+  });
+
+  it("still counts a session a REAL destination is short on as not done", () => {
+    const s = withPhantom();
+    s.files["/s.jsonl"]!.offsets = { letai: 400, phantom: 0 };
+    assert.equal(snapshotFrom(files, s).done, 0);
   });
 });

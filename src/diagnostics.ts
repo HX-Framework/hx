@@ -94,7 +94,22 @@ function originOf(gatewayBaseUrl: string): string | null {
 function settingsUrls(
   gatewayBaseUrl: string,
   destination: SyncBlockerDestination | null,
+  reason?: FileSkipReason,
 ): DoctorRemediation {
+  // A quarantine is not a Fortress being down. The gateway has declined to
+  // CHOOSE a destination — the uploader belongs to more than one self-hosted
+  // org and the session has no parent row to inherit routing from — so there is
+  // no Fortress to bring online and no repository to move. Sending someone to
+  // do either wastes their time on the one hold that resolves by itself.
+  if (reason === "quarantine") {
+    return {
+      fortressSettingsUrl: null,
+      repositorySettingsUrl: null,
+      guidance:
+        "The gateway has no routing decision for this session yet — it resolves once the session's parent upload lands, or once the uploader's org memberships are unambiguous. Nothing to change on this device.",
+      retryCommand: "hx retry --blocked",
+    };
+  }
   const origin = originOf(gatewayBaseUrl);
   const org = destination?.orgSlug;
   const project = destination?.projectSlug;
@@ -197,7 +212,7 @@ export function buildSyncDoctorReport(
     firstObservedAt: iso(group.firstObservedAtMs),
     lastObservedAt: iso(group.lastObservedAtMs),
     nextRetryAt: iso(group.nextRetryAtMs),
-    remediation: settingsUrls(gatewayBaseUrl, group.destination),
+    remediation: settingsUrls(gatewayBaseUrl, group.destination, group.reason),
   }));
   const gapSessions = new Set([...gone, ...aged]).size;
   return {
@@ -263,7 +278,16 @@ export function formatStatusBlocker(skipped: SyncSkippedEntry[], nowMs = Date.no
   const sessions = new Set(skipped.map((entry) => `${entry.family}:${entry.sessionId}`)).size;
   if (groups.length !== 1 || !groups[0]?.destination) {
     if (groups.length === 1) {
-      return `${sessions} session${sessions === 1 ? "" : "s"} — destination store unavailable`;
+      // Name the condition. "destination store unavailable" is wrong for a
+      // quarantine: nothing is unavailable, the routing decision is missing.
+      const only = groups[0]?.reason;
+      const why =
+        only === "quarantine"
+          ? "gateway has no routing decision yet"
+          : only === "vault_home_unreachable"
+            ? "home Fortress not connected"
+            : "destination store unavailable";
+      return `${sessions} session${sessions === 1 ? "" : "s"} — ${why}`;
     }
     return `${sessions} session${sessions === 1 ? "" : "s"} across ${groups.length} blocked destination${groups.length === 1 ? "" : "s"}`;
   }

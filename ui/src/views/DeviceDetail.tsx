@@ -189,10 +189,25 @@ export function DeviceDetail() {
                 <div><span className={`pill ${doctor.gaps.sessions > 0 ? "warn" : "ok"}`}>{doctor.gaps.sessions > 0 ? String(doctor.gaps.sessions) : "None"}</span></div>
                 <div className="m">—</div>
               </div>
+              {(doctor.childLanes?.held ?? 0) > 0 && (
+                // Overview clears "Caught up" for held child lanes and points
+                // the user HERE. Every other row on this panel is
+                // parent-session-only — blockers come from report.skipped,
+                // which is built from discovered files, and discovery never
+                // walks the subagents tree — so without this row the panel
+                // showed "1 of 1 sessions, 100%, Healthy" and no blockers, to
+                // someone sent to it to find out what was wrong.
+                <div className="row">
+                  <span className="dot warn"></span>
+                  <div className="who"><b>Agent lanes</b><div className="sub">{plural(doctor.childLanes?.held ?? 0, "lane")} held — these upload separately from their session and will not retry until released with <span className="mono">hx retry --blocked</span></div></div>
+                  <div><span className="pill warn">{doctor.childLanes?.held ?? 0}</span></div>
+                  <div className="m">—</div>
+                </div>
+              )}
               {doctor.blockers.map((b, i) => (
                 <div className="row" key={i}>
                   <span className="dot warn"></span>
-                  <div className="who"><b>{plural(b.sessions, "session")} held at {b.orgName ?? "an organization vault"}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — retrying with backoff" : b.reason === "vault_home_unreachable" ? "Home Fortress not connected — retrying with backoff" : "store unreachable — retrying with backoff"}</div></div>
+                  <div className="who"><b>{plural(b.sessions, "session")} held at {b.orgName ?? "an organization vault"}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — retrying with backoff" : b.reason === "vault_home_unreachable" ? "Home Fortress not connected — retrying with backoff" : b.reason === "quarantine" ? "Routing not decided yet — the gateway will place these once the parent upload lands" : "store unreachable — retrying with backoff"}</div></div>
                   <div><span className="pill warn">Held</span></div>
                   <div className="m">{b.nextRetryAtMs ? `next retry ${fmtClock(b.nextRetryAtMs)}` : "retrying"}</div>
                 </div>

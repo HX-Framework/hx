@@ -2620,7 +2620,8 @@ export async function startWatch(
   // A daemon that has been down for a while may be starting behind an already
   // oversized log; do not wait an hour to bound it.
   if (ownsDeviceLogs) {
-    for (const target of await rotateLogsIfLarge()) {
+    // Bare `await` here would abort daemon START-UP for an unreadable log.
+    for (const target of await rotateLogsIfLarge().catch(() => [] as string[])) {
       log(`[hx] rotated ${path.basename(target)} on start; previous generation kept at ${target}.1`);
     }
   }
@@ -2870,11 +2871,19 @@ export async function startWatch(
     // Same cadence as the perf line: an hourly check bounds a log that took
     // months to reach 242 MB, without a stat on every 1.5s pass.
     if (ownsDeviceLogs) {
-      void rotateLogsIfLarge().then((rotated) => {
-        for (const target of rotated) {
-          log(`[hx] rotated ${path.basename(target)}; previous generation kept at ${target}.1`);
-        }
-      });
+      // .catch is not decoration: this runs inside setInterval, and Bun exits
+      // the process on an unhandled rejection. A log we cannot rotate must
+      // never take the daemon down — which is also why the start-up call below
+      // is wrapped.
+      void rotateLogsIfLarge()
+        .then((rotated) => {
+          for (const target of rotated) {
+            log(`[hx] rotated ${path.basename(target)}; previous generation kept at ${target}.1`);
+          }
+        })
+        .catch(() => {
+          /* never fatal */
+        });
     }
     if (perf.passes === 0) return;
     log(formatPerfLine(perf));

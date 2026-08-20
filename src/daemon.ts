@@ -1130,40 +1130,60 @@ const ROTATE_LOCK_STALE_MS = 5 * 60_000;
  */
 async function rotateGuarded(maxBytes: number, targets: readonly string[]): Promise<string[]> {
   const lock = join(HX_DIR, "rotate.lock");
+  let held: ReturnType<typeof statSync> | undefined;
   try {
     await writeFile(lock, String(process.pid), { flag: "wx", mode: 0o600 });
   } catch {
-    // Held. Abandoned locks would otherwise disable rotation forever, so a
-    // stale one may be taken over; a live one means someone else is already
-    // doing this and there is nothing to add.
-    const held = statSync(lock, { throwIfNoEntry: false });
-    if (!held || Date.now() - held.mtimeMs < ROTATE_LOCK_STALE_MS) return [];
-    // Stale. Remove it and RE-RACE the O_EXCL create — a plain write here is
-    // not mutual exclusion: every process that saw the same stale lock would
-    // win it, and then both copy-truncate at once, which is the loss the lock
-    // exists to prevent. Measured that way: 3 of 25 trials lost history.
-    // Only one process can create the file, so only one proceeds.
+    // statSync must be INSIDE a try. `throwIfNoEntry: false` suppresses ENOENT
+    // and nothing else: EACCES on a directory whose ownership a sudo install
+    // changed, EIO/ESTALE on an NFS or FUSE mount, and EPERM on Windows for a
+    // lock another process is mid-delete all still throw. Uncaught, that
+    // rejection reached a `void ...then()` inside setInterval, and Bun exits
+    // the process on an unhandled rejection — an unreadable lock file would
+    // have killed the daemon on the hour, in a function whose contract is that
+    // a log it cannot rotate must never take the daemon down.
     try {
-      await unlink(lock);
-    } catch {
-      /* another taker already removed it; the create below still decides */
-    }
-    try {
-      await writeFile(lock, String(process.pid), { flag: "wx", mode: 0o600 });
+      held = statSync(lock, { throwIfNoEntry: false });
     } catch {
       return [];
     }
+    // Held. Abandoned locks would otherwise disable rotation forever, so a
+    // stale one may be taken over; a live one means someone else is already
+    // doing this and there is nothing to add.
+    if (!held || Date.now() - held.mtimeMs < ROTATE_LOCK_STALE_MS) return [];
+    // Stale — clear it and rotate NOTHING this round.
+    //
+    // Breaking the lock and immediately taking it is not expressible atomically
+    // with plain fs calls, and every attempt at it races. A plain write let
+    // every process that saw the same stale lock win (3 of 25 trials lost
+    // history). unlink-then-wx-create is no better: one process can complete
+    // both steps inside another's window, so the second deletes the first's
+    // FRESH lock and then wins its own create — measured at 2 of 40 trials with
+    // 8 processes, and on an 800 MB log that turned 800 MB of kept history into
+    // 580 MB.
+    //
+    // Removing it and returning has no race at all: unlink is idempotent, and
+    // nobody rotates in the round that breaks the lock, so the next round is an
+    // ordinary uncontested O_EXCL create that exactly one process wins. The
+    // cost is one skipped cycle — rotation runs hourly against a 32 MB cap, so
+    // a dead process delays rotation by an hour instead of disabling it forever.
+    try {
+      await unlink(lock);
+    } catch {
+      /* someone else cleared it first; either way it is gone */
+    }
+    return [];
   }
   try {
     return await rotateOnce(maxBytes, targets);
   } finally {
     try {
-      // Only release OUR lock. After a stale takeover the file may belong to
-      // another process by now, and unlinking it would hand a third process a
-      // free run alongside the owner.
+      // Only release OUR lock: another process may have cleared a lock it
+      // judged stale and be about to acquire, and unlinking that one would let
+      // two run together.
       if (readFileSync(lock, "utf8") === String(process.pid)) await unlink(lock);
     } catch {
-      /* already gone, or not ours to remove */
+      /* already gone, unreadable, or not ours to remove */
     }
   }
 }

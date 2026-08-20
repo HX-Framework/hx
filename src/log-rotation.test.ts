@@ -9,7 +9,7 @@
 // keeps working across a rotation, which is the whole safety argument.
 import { describe, it, afterEach } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, openSync, writeSync, closeSync, statSync, fstatSync, existsSync, utimesSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, openSync, writeSync, closeSync, statSync, fstatSync, existsSync, utimesSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rotateLogsIfLarge, seedBacklogLines, HX_DIR } from "./daemon.js";
@@ -179,18 +179,57 @@ describe("rotateLogsIfLarge cross-process lock", () => {
     }
   });
 
-  it("takes over a lock left behind by a dead process", async () => {
-    // Otherwise one killed daemon disables rotation permanently.
+  it("clears a lock left by a dead process WITHOUT rotating in the same round", async () => {
+    // Breaking a lock and taking it in one step cannot be done atomically with
+    // plain fs calls, and every attempt races: one process completes both steps
+    // inside another's window, so the second deletes the first's FRESH lock and
+    // wins its own create. Measured at 2 of 40 trials with 8 processes, and on
+    // an 800 MB log that turned 800 MB of kept history into 580 MB.
+    //
+    // Clearing and returning has no race: unlink is idempotent and nobody
+    // rotates in the round that breaks the lock.
     const p = make();
     writeFileSync(p, "z".repeat(4096));
     writeFileSync(lockPath(), "99999");
     const old = Date.now() / 1000 - 3600;
     utimesSync(lockPath(), old, old);
     try {
+      assert.deepEqual(await rotateLogsIfLarge(1024, [p]), []);
+      assert.equal(statSync(p).size, 4096, "the log must be untouched this round");
+      assert.equal(existsSync(lockPath()), false, "the stale lock must be gone");
+    } finally {
+      rmSync(lockPath(), { force: true });
+    }
+  });
+
+  it("rotates on the NEXT round, so a dead daemon delays rather than disables", async () => {
+    const p = make();
+    writeFileSync(p, "z".repeat(4096));
+    writeFileSync(lockPath(), "99999");
+    const old = Date.now() / 1000 - 3600;
+    utimesSync(lockPath(), old, old);
+    try {
+      await rotateLogsIfLarge(1024, [p]);
       assert.deepEqual(await rotateLogsIfLarge(1024, [p]), [p]);
       assert.equal(statSync(p).size, 0);
       assert.equal(readFileSync(`${p}.1`, "utf8").length, 4096);
     } finally {
+      rmSync(lockPath(), { force: true });
+    }
+  });
+
+  it("never rejects when the lock cannot even be stat-ed", async () => {
+    // throwIfNoEntry:false suppresses ENOENT only. EACCES/EIO/EPERM all throw,
+    // and this runs inside a setInterval where Bun exits on an unhandled
+    // rejection — an unreadable lock would have killed the daemon on the hour.
+    const p = make();
+    writeFileSync(p, "z".repeat(4096));
+    writeFileSync(lockPath(), "99999");
+    chmodSync(HX_DIR, 0o000);
+    try {
+      assert.deepEqual(await rotateLogsIfLarge(1024, [p]), []);
+    } finally {
+      chmodSync(HX_DIR, 0o755);
       rmSync(lockPath(), { force: true });
     }
   });
