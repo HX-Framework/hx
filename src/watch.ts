@@ -1985,13 +1985,20 @@ export async function computeSyncReport(
   for (const [p, fs] of Object.entries(state.files)) {
     if (isChildLane(p)) {
       childLanes.tracked += 1;
-      if (fs.skipReason) {
-        childLanes.held += 1;
-        childLanes.heldReasons[fs.skipReason] = (childLanes.heldReasons[fs.skipReason] ?? 0) + 1;
-      }
       const here = existsSync(p);
       if (here) childLanes.onDisk += 1;
       else childLanes.gone += 1;
+      // Only an ON-DISK lane can be held in any useful sense: releasing a hold
+      // on a pruned file changes nothing, and nothing ever removes entries from
+      // state.files, so counting those reported "81 HELD — release with hx
+      // retry --blocked" forever for lanes that no longer exist — and opened
+      // the retry gate, which stops the daemon and rewrites state to clear
+      // flags on files that are gone. Mirrors `owing` directly below, and
+      // collectSkipped's discovered-only rule for parents.
+      if (here && fs.skipReason) {
+        childLanes.held += 1;
+        childLanes.heldReasons[fs.skipReason] = (childLanes.heldReasons[fs.skipReason] ?? 0) + 1;
+      }
       // Only an on-disk lane can still be sent; a pruned one is as final as a
       // pruned session and must not read as backlog.
       if (here && fs.lastKnownSize !== undefined && minOffset(fs) < fs.lastKnownSize) {

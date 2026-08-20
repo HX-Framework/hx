@@ -198,6 +198,20 @@ describe("held child lanes are reported", () => {
     assert.match(text, /81 quarantine/);
   });
 
+  it("does not report a hold on a lane whose file is gone", () => {
+    // Nothing removes entries from state.files and clearGenericBackoffs
+    // preserves skipReason, so counting pruned lanes printed "81 HELD, release
+    // with hx retry --blocked" forever — and opened the retry gate, which stops
+    // the daemon and rewrites state to clear flags on files that do not exist.
+    const r = withHeldLanes();
+    r.childLanes = { ...r.childLanes, onDisk: 0, gone: 81, owing: 0, held: 0, heldReasons: {} };
+    const text = formatSyncDoctorText(
+      buildSyncDoctorReport(r, "https://let.ai/_api/hx-gateway", 0),
+    );
+    assert.doesNotMatch(text, /are HELD/);
+    assert.doesNotMatch(text, /hx retry --blocked/);
+  });
+
   it("says how to release them", () => {
     const text = formatSyncDoctorText(
       buildSyncDoctorReport(withHeldLanes(), "https://let.ai/_api/hx-gateway", 0),

@@ -363,9 +363,14 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
               // reader both that these bytes are counted and that they are not.
               ? "  <-- NOT KNOWN to this device; dead key, bytes already delivered"
               : "  <-- NOT KNOWN to this device; nothing will ever send here"
-            : dest.state === "offline"
-              ? "  (offline)"
-              : "";
+            : dest.state === "unregistered"
+              // Absent from the registry but demonstrably paid: these bytes ARE
+              // counted, and calling this a dead key would contradict the
+              // number printed beside it.
+              ? "  <-- not in this device's registry, but has accepted bytes; still owed"
+              : dest.state === "offline"
+                ? "  (offline)"
+                : "";
         lines.push(
           `      ${dest.label}: ${dest.offset.toLocaleString()} / ${d.sizeBytes.toLocaleString()} B${note}`,
         );

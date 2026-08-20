@@ -1125,7 +1125,12 @@ async function rotateOnce(maxBytes: number, targets: readonly string[]): Promise
       // could leave the kept generation empty or half-written: the exact loss
       // rotation exists to prevent. Rename is atomic, so `.1` is only ever a
       // complete copy, whoever wins.
-      const staging = `${target}.rotating`;
+      // Per-process staging name. A single shared `.rotating` path is the same
+      // inode in every process, so two rotations would stream into one file —
+      // one renames it into place while the other is still writing, and the
+      // kept generation is short. That is the very failure the rename was added
+      // to prevent, so the name has to be unique for the claim to hold.
+      const staging = `${target}.rotating.${process.pid}`;
       // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
       await copyFile(target, staging);
       // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
@@ -1137,6 +1142,13 @@ async function rotateOnce(maxBytes: number, targets: readonly string[]): Promise
       rotated.push(target);
     } catch {
       /* missing, unreadable, or a full disk — never fatal */
+      try {
+        // Do not leave a half-written staging file behind on failure.
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
+        await unlink(`${target}.rotating.${process.pid}`);
+      } catch {
+        /* nothing to clean up */
+      }
     }
   }
   return rotated;
@@ -1177,8 +1189,13 @@ export function seedBacklogLines(live: string, previous: string, linesBack: numb
   };
   const lines = split(live);
   if (lines.length < linesBack && previous.length > 0) {
-    // Bounded by linesBack, so the spread can never be a huge array.
-    lines.unshift(...split(previous).slice(-(linesBack - lines.length)));
+    // concat, NOT unshift(...spread). `linesBack` is user input — `hx logs
+    // --lines N` accepts any N — so the spread's argument count is unbounded,
+    // and a rotated 32 MB log is roughly a million lines. At 1,000,000 the
+    // spread throws RangeError: Maximum call stack size exceeded, turning a
+    // large --lines into a crash where the plain slice before this change
+    // simply returned everything.
+    return split(previous).slice(-(linesBack - lines.length)).concat(lines);
   }
   return lines.slice(-linesBack);
 }

@@ -704,3 +704,38 @@ describe("an unregistered destination that has accepted bytes", () => {
     assert.equal(l.stranded[0]!.key, "phantom");
   });
 });
+
+// A destination proves it exists ONCE, for every session. The same key billed
+// as owed on one file and listed as a dead key on another put both verdicts in
+// one report.
+describe("proof of a destination is per-destination, not per-file", () => {
+  const twoFiles = (aOffsets: Record<string, number>, bOffsets: Record<string, number>) => {
+    const state: HxState = { files: { a: entry("a", aOffsets), b: entry("b", bOffsets) } };
+    applyDestinationReports(state, [{ vaultOrgId: null, status: "ready" }], NOW - DAY);
+    return buildLedger({
+      files: [file("a", 1000), file("b", 1000)],
+      state,
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+  };
+
+  it("does not call a key dead on one session while owing it on another", () => {
+    const l = twoFiles({ letai: 1000, orgX: 500 }, { letai: 1000, orgX: 0 });
+    assert.equal(l.uploadingBytes, 500);
+    assert.deepEqual(l.stranded, []);
+  });
+
+  it("still writes off a key no session anywhere has ever written to", () => {
+    const l = twoFiles({ letai: 1000, orgX: 0 }, { letai: 1000, orgX: 0 });
+    assert.equal(l.stranded.length, 1);
+    assert.equal(l.stranded[0]!.key, "orgX");
+    assert.equal(l.percent, 100);
+  });
+
+  it("labels a paid-but-unregistered destination as owed, not as unknown", () => {
+    const l = twoFiles({ letai: 1000, orgX: 500 }, { letai: 1000, orgX: 0 });
+    const d = l.notDelivered.find((x) => x.sessionId === "a")!;
+    assert.equal(d.destinations.find((x) => x.key === "orgX")!.state, "unregistered");
+  });
+});

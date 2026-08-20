@@ -151,13 +151,18 @@ export interface DestinationStanding {
   label: string;
   offset: number;
   owed: number;
-  /** `unknown` is the one that matters: an offset key with NO registry entry.
-   *  The client has no evidence such a store exists, yet lagOf bills it as
-   *  reachable — so a destination that was advertised once and never seen
-   *  again pins a session in `uploading` forever, undrainable, with nothing
-   *  in the log. That is exactly how one device sat at "17 sessions · 135.5 MB"
-   *  unchanged for days. Naming it here is the whole point of this struct. */
-  state: "reachable" | "offline" | "unknown";
+  /** `unknown` is the one that matters: an offset key with no registry entry
+   *  that has NEVER accepted a byte. The client has no evidence such a store
+   *  exists, so a destination advertised once and never seen again would pin a
+   *  session in `uploading` forever, undrainable, with nothing in the log —
+   *  exactly how one device sat at "17 sessions · 135.5 MB" unchanged for days.
+   *
+   *  `unregistered` is its opposite and must never be confused with it: also
+   *  absent from the registry, but holding a non-zero offset, which is proof a
+   *  real store accepted those bytes and is owed the rest. It is billed as
+   *  backlog. Collapsing the two made the report call a live, still-owed
+   *  Fortress a dead key in the same breath as counting its debt. */
+  state: "reachable" | "offline" | "unknown" | "unregistered";
 }
 
 /** Why one on-disk session is not delivered — enough to act on without a
@@ -483,12 +488,19 @@ export function buildLedger(input: LedgerInput): SyncLedger {
         const record = state.destinations?.[key];
         const label =
           (record?.vaultOrgId && orgNames[record.vaultOrgId]) || record?.orgName || key;
+        const standing = destinationStanding(state, key);
         return {
           key,
           label,
           offset,
           owed: Math.max(0, file.size - offset),
-          state: destinationStanding(state, key),
+          // Same rule the ledger bills by, so the prose cannot contradict the
+          // arithmetic: absent-and-never-written is a phantom, absent-but-paid
+          // is a real store we have merely lost the name of.
+          state:
+            standing === "unknown" && !isPhantomKey(state, key, offset)
+              ? ("unregistered" as const)
+              : standing,
         };
       });
       if (standings.some((d) => d.owed > 0)) {
@@ -576,7 +588,19 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     // Longest outage first: the one most likely to need a decision leads.
     .sort((a, b) => (b.offlineDays ?? -1) - (a.offlineDays ?? -1) || b.sessions - a.sessions);
 
+  // Proof that a destination exists is per-DESTINATION, not per-file: if any
+  // file has ever committed a byte to a key, that store is real, and the other
+  // files sitting at 0 for it are simply unsent — not evidence of a phantom.
+  // Without this the same key could be billed as owed on one session and listed
+  // as a dead key on another, in one report.
+  const everWritten = new Set<string>();
+  for (const fs of Object.values(state.files)) {
+    for (const [key, offset] of Object.entries(fs.offsets ?? {})) {
+      if (offset > 0) everWritten.add(key);
+    }
+  }
   const stranded: StrandedDestination[] = [...strandedLag.entries()]
+    .filter(([key]) => !everWritten.has(key))
     .map(([key, v]) => {
       const record = state.destinations?.[key];
       const vaultOrgId = record?.vaultOrgId ?? (key === destKey(null) ? null : key);

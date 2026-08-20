@@ -140,3 +140,14 @@ describe("seedBacklogLines", () => {
     assert.deepEqual(seedBacklogLines("a\nb", "", 50), ["a", "b"]);
   });
 });
+
+// `hx logs --lines N` takes N straight from the user, and a rotated 32 MB log
+// is roughly a million lines. unshift(...spread) made that a crash.
+describe("seedBacklogLines at scale", () => {
+  it("survives a linesBack larger than the spread limit", () => {
+    const prev = Array.from({ length: 1_100_000 }, (_, i) => `line ${i}`).join("\n");
+    const out = seedBacklogLines("tail\n", prev, 1_000_000);
+    assert.equal(out.length, 1_000_000);
+    assert.equal(out[out.length - 1], "tail");
+  });
+});
