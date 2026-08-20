@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeSyncReport, formatWait, snapshotFrom } from "./watch.js";
+import { computeSyncReport, formatWait, isChildLane, snapshotFrom } from "./watch.js";
 import {
   loadState,
   pruneStrandedOffsets,
@@ -351,7 +351,10 @@ describe("pruneStrandedOffsets persists what it removes", () => {
 
 // Two guards that mutation testing showed nothing pinned, both load-bearing.
 describe("guards that were deletable with the suite green", () => {
-  it("survives a lane whose file cannot even be stat-ed", async () => {
+  // chmod 000 does not deny traversal on Windows, so the unreadable case cannot
+  // be staged there. The guard it covers is platform-independent; the SETUP is
+  // not. (Same pattern as the fold-freeze golden.)
+  it.skipIf(process.platform === "win32")("survives a lane whose file cannot even be stat-ed", async () => {
     // throwIfNoEntry:false suppresses ENOENT ONLY; the existsSync it replaced
     // returned false for EACCES/ELOOP/ENOTDIR/EIO alike. Unguarded in a bare
     // loop over state.files, one unreadable directory made `hx doctor sync`,
@@ -387,5 +390,35 @@ describe("guards that were deletable with the suite green", () => {
     resetStateCache();
     const after = await loadState();
     assert.equal(after.files["/departed.jsonl"]!.offsets["letai"], 0, "letai must survive");
+  });
+});
+
+// Windows stores discovery paths with backslashes, so a literal
+// includes("/subagents/") never matched there: every lane was misclassified as
+// a session transcript, childLanes read all zeros, and the lanes were counted
+// as tracked-but-undiscovered files — the exact false alarm this accounting
+// exists to stop. Present on the base branch too; the producer tests above only
+// surfaced it because they run on the Windows CI job.
+describe("isChildLane across platforms", () => {
+  const posix = "/home/u/.claude/projects/-p/sess/subagents/agent-a.jsonl";
+  const win = "C:\\Users\\u\\.claude\\projects\\-p\\sess\\subagents\\agent-a.jsonl";
+  const winFlow = "C:\\Users\\u\\.claude\\projects\\-p\\sess\\subagents\\workflows\\wf_1\\journal.jsonl";
+
+  it("recognises a POSIX lane", () => {
+    assert.equal(isChildLane(posix, "linux"), true);
+  });
+
+  it("recognises a WINDOWS lane, backslashes and all", () => {
+    assert.equal(isChildLane(win, "win32"), true);
+    assert.equal(isChildLane(winFlow, "win32"), true);
+  });
+
+  it("is case-insensitive on Windows, as the filesystem is", () => {
+    assert.equal(isChildLane(win.replace("subagents", "SubAgents"), "win32"), true);
+  });
+
+  it("does not mistake a session transcript for a lane", () => {
+    assert.equal(isChildLane("/home/u/.claude/projects/-p/sess.jsonl", "linux"), false);
+    assert.equal(isChildLane("C:\\Users\\u\\.claude\\projects\\-p\\sess.jsonl", "win32"), false);
   });
 });

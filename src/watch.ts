@@ -82,6 +82,7 @@ import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
 import { buildLedger, everWrittenKeys, reportableOffset, type SyncLedger } from "./ledger.js";
+import { pathKey } from "./pathnorm.js";
 import { rotateLogsIfLarge } from "./daemon.js";
 import { backfillDue, discoverBackfill, markBackfillRun } from "./backfill.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
@@ -1908,6 +1909,21 @@ export function hasReleasableHolds(report: SyncReport): boolean {
   return report.skipped.length > 0 || report.childLanes.held > 0;
 }
 
+/**
+ * Is this state entry a child agent lane rather than a session transcript?
+ *
+ * Through pathKey, not a raw `includes("/subagents/")`: on Windows discovery
+ * stores paths with backslashes, so the literal never matched and EVERY lane
+ * was misclassified as a session — childLanes read all zeros, and the lanes
+ * were counted instead as tracked-but-undiscovered files, which is precisely
+ * the false alarm this accounting was written to stop. Platform is injectable
+ * so win32 behaviour is testable from Linux CI (same shape as pathKey itself).
+ */
+export function isChildLane(p: string, platform: string = process.platform): boolean {
+  const key = pathKey(p, platform);
+  return key.includes("/subagents/") || key.includes("/workflows/");
+}
+
 export interface SyncReportInputs {
   claude: DiscoveredFile[];
   codex: DiscoveredFile[];
@@ -2005,8 +2021,7 @@ export async function computeSyncReport(
   // the whole map against session discovery reported 602 phantom "missing"
   // files on a completely healthy machine, which is exactly the kind of
   // false alarm that teaches people to ignore warnings.
-  const isChildLane = (p: string): boolean =>
-    p.includes("/subagents/") || p.includes("/workflows/");
+
   let fileGone = 0;
   let onDiskButUndiscovered = 0;
   const childLanes = {
