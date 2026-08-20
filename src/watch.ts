@@ -81,7 +81,7 @@ import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
-import { buildLedger, type SyncLedger } from "./ledger.js";
+import { buildLedger, reportableOffset, type SyncLedger } from "./ledger.js";
 import { rotateLogsIfLarge } from "./daemon.js";
 import { backfillDue, discoverBackfill, markBackfillRun } from "./backfill.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
@@ -1667,8 +1667,12 @@ export function snapshotFrom(files: DiscoveredFile[], state: HxState): SyncSnaps
   let totalBytes = 0;
   for (const f of files) {
     const fs = state.files[f.path];
-    // "Done" = the least-current destination has caught up to the file size.
-    const offset = fs ? minOffset(fs) : 0;
+    // "Done" = the least-current REAL destination has caught up to the file
+    // size. reportableOffset, not minOffset: a key with no registry entry can
+    // hold no bytes, and letting it pin the minimum reported a session as
+    // unsent forever — and would make this snapshot, which is POSTed to the
+    // gateway, contradict the ledger `hx status` prints from the same state.
+    const offset = fs ? reportableOffset(fs, state) : 0;
     // A persisted hold is unfinished even when legacy offsets happen to equal
     // the source size: a destination is still explicitly waiting for bytes.
     if (offset >= f.size && !fs?.skipReason) done += 1;

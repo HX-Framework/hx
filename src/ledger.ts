@@ -215,10 +215,6 @@ export interface LedgerInput {
  * outage is reported by the connection probe, and excusing the primary would
  * let the device claim 100% while nothing at all was being delivered.
  */
-export function isDestinationOffline(state: HxState, key: string): boolean {
-  return destinationStanding(state, key) === "offline";
-}
-
 /**
  * Three-way standing for one offset key.
  *
@@ -297,6 +293,31 @@ function lagOf(
     }
   }
   return { reachable, offline, unknown };
+}
+
+/**
+ * Least-advanced offset across destinations that actually EXIST.
+ *
+ * For REPORTING only — never for deciding what to upload. `minOffset` takes the
+ * minimum across every key including one with no registry entry, which is
+ * correct for the upload path (offering the whole file is what makes the
+ * gateway answer with its real destination set, and that answer is what prunes
+ * the dead key) and wrong for any view a human reads: an unknown key pins the
+ * minimum at 0 forever, so the session reports as unsent for as long as it
+ * exists.
+ *
+ * Without this the two numbers this client publishes would contradict each
+ * other — `hx status` calling a session delivered while the snapshot POSTed to
+ * the gateway still called it unsent. That gap, between a device's own view and
+ * the server's, is the bug this whole change set started from.
+ */
+export function reportableOffset(fs: FileState, state: HxState): number {
+  const vals = Object.entries(fs.offsets)
+    .filter(([key]) => destinationStanding(state, key) !== "unknown")
+    .map(([, offset]) => offset);
+  // No real destination on record: nothing has been delivered anywhere we know
+  // of, which is exactly what offset 0 says.
+  return vals.length === 0 ? 0 : Math.min(...vals);
 }
 
 /** Classify one discovered file. `incomplete` is decided elsewhere (the source

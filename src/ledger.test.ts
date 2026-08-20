@@ -1,6 +1,13 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
-import { buildLedger, classifyFile, isDestinationOffline, LIVE_WINDOW_MS, needsAttention } from "./ledger.js";
+import {
+  buildLedger,
+  classifyFile,
+  destinationStanding,
+  reportableOffset,
+  LIVE_WINDOW_MS,
+  needsAttention,
+} from "./ledger.js";
 import {
   applyDestinationReports,
   applyDestinationUploadError,
@@ -86,7 +93,7 @@ describe("ledger classification", () => {
   it("never excuses the primary bucket, even if reported held", () => {
     const state: HxState = { files: {} };
     applyDestinationReports(state, [{ vaultOrgId: null, status: "held" }], NOW);
-    assert.equal(isDestinationOffline(state, "letai"), false);
+    assert.equal(destinationStanding(state, "letai"), "reachable");
   });
 
   it("bills a never-seeded file to the primary as real backlog", () => {
@@ -231,7 +238,7 @@ describe("destination registry", () => {
     applyDestinationReports(state, [{ vaultOrgId: "orgA", status: "ready" }], NOW);
     assert.equal(state.destinations?.orgA?.status, "ready");
     assert.equal(state.destinations?.orgA?.heldSinceMs, undefined);
-    assert.equal(isDestinationOffline(state, "orgA"), false);
+    assert.equal(destinationStanding(state, "orgA"), "reachable");
   });
 
   it("remembers a name learned while held after the store recovers", () => {
@@ -504,6 +511,18 @@ describe("notDelivered diagnosis", () => {
     assert.equal(l.stranded[0]!.bytes, 1000);
   });
 
+  it("bills an unknown destination that is the ONLY key on the file", () => {
+    // reachable === 0 with no complete copy is reachable only when the offsets
+    // map holds no real destination at all — the branch a partially-delivered
+    // letai key never reaches. The session is genuinely nowhere, so it must
+    // read as backlog; the next append-url adds letai and drops the dead key.
+    const l = build({ orgX: 0 }, false);
+    assert.equal(l.uploading, 1);
+    assert.equal(l.uploadingBytes, 1000);
+    assert.equal(l.stranded.length, 0);
+    assert.equal(l.percent, 0);
+  });
+
   it("DOES bill an unknown destination when no reachable store has the bytes", () => {
     // The safety case: unknown is only inert because a store we can reach
     // already holds the whole session. Without that, the session is genuinely
@@ -550,5 +569,47 @@ describe("notDelivered diagnosis", () => {
       nowMs: NOW,
     });
     assert.equal(l.notDelivered[0]!.owedBytes, 5000);
+  });
+});
+
+// The two numbers this client publishes must agree. `hx status` reads the
+// ledger; the gateway reads the snapshot POSTed from snapshotFrom. Both derive
+// from the same state, so a destination that exists in neither must not be
+// allowed to pull one of them down.
+describe("reportableOffset", () => {
+  const fs = (offsets: Record<string, number>): FileState => ({
+    path: "/p",
+    family: "claude-cli",
+    sessionId: "s",
+    offsets,
+    lastMtimeMs: 0,
+    lastUploadAtMs: 0,
+  });
+  const registered = (): HxState => {
+    const state: HxState = { files: {} };
+    applyDestinationReports(
+      state,
+      [{ vaultOrgId: null, status: "ready" }, { vaultOrgId: "orgHeld", status: "held" }],
+      NOW,
+    );
+    return state;
+  };
+
+  it("ignores a key with no registry entry", () => {
+    // minOffset would answer 0 here and report a fully delivered session as
+    // unsent for as long as the file exists.
+    assert.equal(reportableOffset(fs({ letai: 1000, phantom: 0 }), registered()), 1000);
+  });
+
+  it("still counts a REGISTERED destination that is behind, however offline", () => {
+    assert.equal(reportableOffset(fs({ letai: 1000, orgHeld: 0 }), registered()), 0);
+  });
+
+  it("answers 0 when every key is unknown", () => {
+    assert.equal(reportableOffset(fs({ phantom: 400 }), registered()), 0);
+  });
+
+  it("answers 0 for a file with no offsets at all", () => {
+    assert.equal(reportableOffset(fs({}), registered()), 0);
   });
 });
