@@ -1081,6 +1081,12 @@ export const LOG_MAX_BYTES = 32 * 1024 * 1024;
  * rotated" and restarts from the top. The reader was built for a rotator that
  * was never written; this is it.
  *
+ * The copy-then-truncate window is inherent to copytruncate and accepted here:
+ * a line written between the two is copied to neither. At an hourly check on a
+ * log this size that is a sub-millisecond gap against months of history, and
+ * the alternative (holding a lock around the daemon's own stdout) would be a
+ * far worse trade.
+ *
  * Best-effort throughout: a log we cannot rotate must never take the daemon
  * down. Returns the paths actually rotated, for the caller to report.
  */

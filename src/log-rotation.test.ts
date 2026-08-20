@@ -9,7 +9,7 @@
 // keeps working across a rotation, which is the whole safety argument.
 import { describe, it, afterEach } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, openSync, writeSync, closeSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, openSync, writeSync, closeSync, statSync, fstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rotateLogsIfLarge } from "./daemon.js";
@@ -54,11 +54,18 @@ describe("rotateLogsIfLarge", () => {
     // stdout.log would stay empty forever.
     const p = make();
     const fd = openSync(p, "a");
-    writeSync(fd, "z".repeat(2048));
-    await rotateLogsIfLarge(1024, [p]);
-    writeSync(fd, "after\n");
-    closeSync(fd);
-    assert.equal(readFileSync(p, "utf8"), "after\n");
+    try {
+      writeSync(fd, "z".repeat(2048));
+      await rotateLogsIfLarge(1024, [p]);
+      writeSync(fd, "after\n");
+      // Asserted through the DESCRIPTOR rather than the path: the file it still
+      // points at being exactly 6 bytes is the proof. The write landed at
+      // offset 0 of the truncated file, not appended past the 2048 bytes that
+      // were there before, and not into some other inode left by a rename.
+      assert.equal(fstatSync(fd).size, "after\n".length);
+    } finally {
+      closeSync(fd);
+    }
   });
 
   it("keeps only one previous generation", async () => {
