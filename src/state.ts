@@ -773,6 +773,17 @@ export function pruneStrandedOffsetsFrom(
   onDisk: (filePath: string) => boolean,
 ): { keys: number; files: number } {
   if (state.destinations === undefined) return { keys: 0, files: 0 };
+  // Proof is per-DESTINATION. A key some OTHER file has committed bytes to is a
+  // real store, so this file's 0 means unsent, not dead — deleting it rewrote
+  // minOffset to "complete" and erased a genuine, unrecoverable gap (source
+  // file gone, that store never got a byte of it) from collectBehind and from
+  // `hx doctor sync`, permanently.
+  const everWritten = new Set<string>();
+  for (const fs of Object.values(state.files)) {
+    for (const [k, offset] of Object.entries(fs.offsets ?? {})) {
+      if (offset > 0) everWritten.add(k);
+    }
+  }
   let keys = 0;
   let files = 0;
   for (const [filePath, fs] of Object.entries(state.files)) {
@@ -781,9 +792,10 @@ export function pruneStrandedOffsetsFrom(
       ([k, offset]) =>
         k !== destKey(null) &&
         state.destinations?.[k] === undefined &&
-        // Never a key that has been written to. See above: this is the guard,
-        // not a refinement of it.
-        offset === 0,
+        // Never a key that has been written to — by THIS file or any other.
+        // See above: this is the guard, not a refinement of it.
+        offset === 0 &&
+        !everWritten.has(k),
     );
     if (dead.length === 0) continue;
     if (onDisk(filePath)) continue;

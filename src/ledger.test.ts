@@ -720,10 +720,22 @@ describe("proof of a destination is per-destination, not per-file", () => {
     });
   };
 
-  it("does not call a key dead on one session while owing it on another", () => {
+  it("bills the debt on EVERY session once the key is proven anywhere", () => {
+    // orgX took 500 bytes of `a`, so orgX is real. `b` sitting at 0 for it is
+    // therefore 1000 bytes unsent, not a dead key: 1500 owed in total. Asserting
+    // only `a`'s 500 here pinned the exact bug — `b`'s debt vanished from
+    // uploadingBytes, waitingBytes, notDelivered AND stranded at once.
     const l = twoFiles({ letai: 1000, orgX: 500 }, { letai: 1000, orgX: 0 });
-    assert.equal(l.uploadingBytes, 500);
+    assert.equal(l.uploadingBytes, 1500);
+    assert.equal(l.uploading, 2);
     assert.deepEqual(l.stranded, []);
+  });
+
+  it("accounts for every owed byte in some reported field", () => {
+    // The invariant the erasure broke: nothing may be silently dropped.
+    const l = twoFiles({ letai: 1000, orgX: 500 }, { letai: 1000, orgX: 0 });
+    const reported = l.uploadingBytes + l.waitingBytes + l.stranded.reduce((n, x) => n + x.bytes, 0);
+    assert.equal(reported, 1500);
   });
 
   it("still writes off a key no session anywhere has ever written to", () => {

@@ -236,6 +236,24 @@ describe("pruneStrandedOffsetsFrom", () => {
     assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgDelivered: 1000 });
   });
 
+  it("NEVER drops a key another file proves is real", () => {
+    // The cross-file case: /gone sits at 0 for orgX, but /here has committed
+    // 500 bytes to it, so orgX is a live store and /gone's 0 is a real gap.
+    // Deleting it rewrote minOffset to "complete" and erased that gap from
+    // collectBehind and `hx doctor sync` permanently — the source file is gone
+    // and orgX never received a byte of it.
+    const state: HxState = {
+      files: {
+        "/gone": { ...entry({ letai: 1000, orgX: 0 }), path: "/gone" },
+        "/here": { ...entry({ letai: 1000, orgX: 500 }), path: "/here" },
+      },
+      destinations: registry,
+    };
+    const r = pruneStrandedOffsetsFrom(state, (p) => p === "/here");
+    assert.deepEqual(r, { keys: 0, files: 0 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgX: 0 });
+  });
+
   it("does nothing at all when no registry has ever been recorded", () => {
     // "we have never seen a destination" must not read as "every destination
     // is dead" — that would wipe real offsets on an old state file.

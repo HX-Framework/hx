@@ -283,6 +283,7 @@ function lagOf(
   fs: FileState | undefined,
   size: number,
   state: HxState,
+  everWritten: ReadonlySet<string>,
 ): { reachable: number; offline: Map<string, number>; unknown: Map<string, number> } {
   const offline = new Map<string, number>();
   const unknown = new Map<string, number>();
@@ -295,7 +296,7 @@ function lagOf(
   for (const key of keys) {
     const pending = size - (offsets[key] ?? 0);
     if (pending <= 0) continue;
-    if (isPhantomKey(state, key, offsets[key] ?? 0)) {
+    if (isPhantomKey(state, key, offsets[key] ?? 0, everWritten)) {
       unknown.set(key, pending);
     } else if (isDestinationOfflineKey(state, key)) {
       offline.set(key, pending);
@@ -324,9 +325,14 @@ function lagOf(
  * the gateway still called it unsent. That gap, between a device's own view and
  * the server's, is the bug this whole change set started from.
  */
-export function reportableOffset(fs: FileState, state: HxState): number {
+export function reportableOffset(
+  fs: FileState,
+  state: HxState,
+  /** As for classifyFile: callers in a loop must hoist this. */
+  everWritten: ReadonlySet<string> = everWrittenKeys(state),
+): number {
   const vals = Object.entries(fs.offsets)
-    .filter(([key, offset]) => !isPhantomKey(state, key, offset))
+    .filter(([key, offset]) => !isPhantomKey(state, key, offset, everWritten))
     .map(([, offset]) => offset);
   // No real destination on record: nothing has been delivered anywhere we know
   // of, which is exactly what offset 0 says.
@@ -358,8 +364,34 @@ function isDestinationOfflineKey(state: HxState, key: string): boolean {
  * the two must agree or the ledger writes off exactly what the pruner
  * preserves as proof.
  */
-export function isPhantomKey(state: HxState, key: string, offset: number): boolean {
-  return offset === 0 && destinationStanding(state, key) === "unknown";
+export function isPhantomKey(
+  state: HxState,
+  key: string,
+  offset: number,
+  /** Keys some file has committed bytes to — see {@link everWrittenKeys}.
+   *  Computed ONCE per fold and threaded in: deriving it inside this per-file
+   *  test would make the ledger O(files²). */
+  everWritten: ReadonlySet<string>,
+): boolean {
+  if (offset > 0) return false;
+  // Proof is per-DESTINATION, not per-file. A store that took bytes from ANY
+  // session exists, so this file sitting at 0 for it means unsent, not dead.
+  // Applying the offset test per file wrote off 39 MB owed to a live Fortress
+  // across 39 sessions — absent from uploadingBytes, waitingBytes, stranded and
+  // notDelivered alike, with the bar reading 97%.
+  if (everWritten.has(key)) return false;
+  return destinationStanding(state, key) === "unknown";
+}
+
+/** Every destination key that some file has committed bytes to. */
+export function everWrittenKeys(state: HxState): Set<string> {
+  const out = new Set<string>();
+  for (const fs of Object.values(state.files)) {
+    for (const [key, offset] of Object.entries(fs.offsets ?? {})) {
+      if (offset > 0) out.add(key);
+    }
+  }
+  return out;
 }
 
 /** Classify one discovered file. `incomplete` is decided elsewhere (the source
@@ -368,6 +400,9 @@ export function classifyFile(
   file: LedgerFile,
   state: HxState,
   nowMs: number,
+  /** Optional only so direct callers (tests) stay ergonomic; buildLedger always
+   *  passes the set it computed once, because the default is O(files). */
+  everWritten: ReadonlySet<string> = everWrittenKeys(state),
 ): {
   state: Exclude<SessionState, "incomplete">;
   reachableBytes: number;
@@ -384,7 +419,7 @@ export function classifyFile(
   strandedUnknown: boolean;
 } {
   const fs = state.files[file.path];
-  const { reachable, offline, unknown } = lagOf(fs, file.size, state);
+  const { reachable, offline, unknown } = lagOf(fs, file.size, state, everWritten);
   const complete = hasReachableCompleteCopy(fs, file.size, state);
   const unprotected = offline.size > 0 && !complete;
   const strandedUnknown = unknown.size > 0 && complete;
@@ -454,6 +489,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
   let deliveredBytes = 0;
   let uploadingBytes = 0;
   let waitingBytes = 0;
+  const everWritten = everWrittenKeys(state);
   const lag = new Map<string, { sessions: number; bytes: number }>();
   const strandedLag = new Map<string, { sessions: number; bytes: number }>();
   const notDelivered: SessionDiagnosis[] = [];
@@ -465,7 +501,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     // range by — a session resumed today belongs at today's end of it.
     if (oldestMs === null || file.mtimeMs < oldestMs) oldestMs = file.mtimeMs;
     if (newestMs === null || file.mtimeMs > newestMs) newestMs = file.mtimeMs;
-    const c = classifyFile(file, state, nowMs);
+    const c = classifyFile(file, state, nowMs, everWritten);
     // Folded for EVERY bucket, delivered included: the whole point of the
     // stranded list is that these sessions are otherwise fully in the clear and
     // would appear nowhere at all.
@@ -498,7 +534,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
           // arithmetic: absent-and-never-written is a phantom, absent-but-paid
           // is a real store we have merely lost the name of.
           state:
-            standing === "unknown" && !isPhantomKey(state, key, offset)
+            standing === "unknown" && !isPhantomKey(state, key, offset, everWritten)
               ? ("unregistered" as const)
               : standing,
         };
@@ -588,19 +624,11 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     // Longest outage first: the one most likely to need a decision leads.
     .sort((a, b) => (b.offlineDays ?? -1) - (a.offlineDays ?? -1) || b.sessions - a.sessions);
 
-  // Proof that a destination exists is per-DESTINATION, not per-file: if any
-  // file has ever committed a byte to a key, that store is real, and the other
-  // files sitting at 0 for it are simply unsent — not evidence of a phantom.
-  // Without this the same key could be billed as owed on one session and listed
-  // as a dead key on another, in one report.
-  const everWritten = new Set<string>();
-  for (const fs of Object.values(state.files)) {
-    for (const [key, offset] of Object.entries(fs.offsets ?? {})) {
-      if (offset > 0) everWritten.add(key);
-    }
-  }
+  // No filter here: isPhantomKey already applies the per-destination proof
+  // rule, so a key that reached strandedLag is one nothing has ever written to.
+  // Filtering at this end instead was the bug — it hid the key from the report
+  // while lagOf had already dropped its debt from the arithmetic.
   const stranded: StrandedDestination[] = [...strandedLag.entries()]
-    .filter(([key]) => !everWritten.has(key))
     .map(([key, v]) => {
       const record = state.destinations?.[key];
       const vaultOrgId = record?.vaultOrgId ?? (key === destKey(null) ? null : key);
