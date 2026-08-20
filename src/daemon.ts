@@ -14,7 +14,7 @@
 
 import { homedir, platform, userInfo } from "node:os";
 import { join, dirname, win32 as winPath } from "node:path";
-import { writeFile, mkdir, unlink, readFile, open, stat, copyFile, truncate } from "node:fs/promises";
+import { writeFile, mkdir, unlink, readFile, open, stat, copyFile, truncate, rename } from "node:fs/promises";
 import { existsSync, readFileSync, createWriteStream, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { HX_DIR } from "./hx-home.js";
@@ -1118,10 +1118,20 @@ async function rotateOnce(maxBytes: number, targets: readonly string[]): Promise
       // never request input.
       const st = await stat(target);
       if (st.size <= maxBytes) continue;
-      // Copy BEFORE truncating: a crash between the two costs the previous
-      // generation, never the live one.
+      // Copy to a temp, then RENAME into place, then truncate. The in-process
+      // guard above cannot help across processes — a foreground `hx watch` runs
+      // the same command as the service, so nothing in `opts` distinguishes
+      // them — and copying straight onto `.1` opens it O_TRUNC, so an overlap
+      // could leave the kept generation empty or half-written: the exact loss
+      // rotation exists to prevent. Rename is atomic, so `.1` is only ever a
+      // complete copy, whoever wins.
+      const staging = `${target}.rotating`;
       // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
-      await copyFile(target, `${target}.1`);
+      await copyFile(target, staging);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
+      await rename(staging, `${target}.1`);
+      // Truncate last: a crash before here costs nothing, and one after leaves
+      // the live log short but the generation intact.
       // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
       await truncate(target, 0);
       rotated.push(target);
@@ -1146,6 +1156,33 @@ async function rotateOnce(maxBytes: number, targets: readonly string[]): Promise
  */
 const TAIL_POLL_MS = 250;
 
+/**
+ * The lines `hx logs -n N` should print before it starts following.
+ *
+ * Reaches back into the previous generation when the live file cannot fill the
+ * request. A rotation minutes ago would otherwise turn `hx logs -n 500` into
+ * "here are the 30 lines since we rotated", with no hint the rest exists — the
+ * daemon says it kept a generation, so the tool that reads logs has to be able
+ * to reach it. Only the LIVE file is followed afterwards; the rotated one is
+ * finished by definition.
+ *
+ * Pure, so the fallback is actually testable: tailLogs itself writes to stdout
+ * and then loops until SIGINT.
+ */
+export function seedBacklogLines(live: string, previous: string, linesBack: number): string[] {
+  const split = (text: string): string[] => {
+    const lines = text.split("\n");
+    if (lines[lines.length - 1] === "") lines.pop();
+    return lines;
+  };
+  const lines = split(live);
+  if (lines.length < linesBack && previous.length > 0) {
+    // Bounded by linesBack, so the spread can never be a huge array.
+    lines.unshift(...split(previous).slice(-(linesBack - lines.length)));
+  }
+  return lines.slice(-linesBack);
+}
+
 export async function tailLogs(linesBack = 50): Promise<void> {
   await mkdir(HX_DIR, { recursive: true });
   const files = [STDOUT_LOG, STDERR_LOG];
@@ -1160,24 +1197,9 @@ export async function tailLogs(linesBack = 50): Promise<void> {
   for (const p of files) {
     const buf = await readFile(p).catch(() => Buffer.alloc(0));
     offsets.set(p, buf.length);
-    const lines = buf.toString("utf8").split("\n");
-    if (lines[lines.length - 1] === "") lines.pop();
-    // Reach back into the previous generation when the live file cannot fill
-    // the request. A rotation minutes ago would otherwise turn `hx logs -n 500`
-    // into "here are the 30 lines since we rotated" with no hint that the rest
-    // exists — the daemon promises it kept a generation, so the tool that reads
-    // logs has to be able to reach it. Only the LIVE file is followed after
-    // this seed; the rotated one is finished by definition.
-    if (lines.length < linesBack) {
-      const prev = await readFile(`${p}.1`).catch(() => Buffer.alloc(0));
-      if (prev.length > 0) {
-        const prevLines = prev.toString("utf8").split("\n");
-        if (prevLines[prevLines.length - 1] === "") prevLines.pop();
-        // Bounded by linesBack, so the spread can never be a huge array.
-        lines.unshift(...prevLines.slice(-(linesBack - lines.length)));
-      }
-    }
-    const recent = lines.slice(-linesBack);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
+    const prev = await readFile(`${p}.1`, "utf8").catch(() => "");
+    const recent = seedBacklogLines(buf.toString("utf8"), prev, linesBack);
     if (recent.length > 0) process.stdout.write(`${recent.join("\n")}\n`);
   }
 

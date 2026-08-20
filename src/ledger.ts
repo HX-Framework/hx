@@ -290,15 +290,14 @@ function lagOf(
   for (const key of keys) {
     const pending = size - (offsets[key] ?? 0);
     if (pending <= 0) continue;
-    switch (destinationStanding(state, key)) {
-      case "offline":
-        offline.set(key, pending);
-        break;
-      case "unknown":
-        unknown.set(key, pending);
-        break;
-      default:
-        reachable += pending;
+    if (isPhantomKey(state, key, offsets[key] ?? 0)) {
+      unknown.set(key, pending);
+    } else if (isDestinationOfflineKey(state, key)) {
+      offline.set(key, pending);
+    } else {
+      // Reachable, or unknown-but-proven: a store that has taken bytes from
+      // this file is owed the rest of them whatever the registry currently says.
+      reachable += pending;
     }
   }
   return { reachable, offline, unknown };
@@ -322,7 +321,7 @@ function lagOf(
  */
 export function reportableOffset(fs: FileState, state: HxState): number {
   const vals = Object.entries(fs.offsets)
-    .filter(([key]) => destinationStanding(state, key) !== "unknown")
+    .filter(([key, offset]) => !isPhantomKey(state, key, offset))
     .map(([, offset]) => offset);
   // No real destination on record: nothing has been delivered anywhere we know
   // of, which is exactly what offset 0 says.
@@ -333,6 +332,29 @@ export function reportableOffset(fs: FileState, state: HxState): number {
  *  unknown key is NOT lumped in with offline ones. */
 function isDestinationOfflineKey(state: HxState, key: string): boolean {
   return destinationStanding(state, key) === "offline";
+}
+
+/**
+ * A key that names nothing this device knows AND has never accepted a byte.
+ *
+ * The registry alone cannot answer this. It is not reliably complete —
+ * seedDestinationsFromBlockers seeds HELD destinations only, so after an
+ * upgrade it can name one offline Fortress and nothing else, leaving every
+ * healthy store looking "unknown". The offset is the second witness, and the
+ * decisive one: setOffsetFor writes only after a successful commit, so any
+ * non-zero offset is proof a real store accepted those bytes and is genuinely
+ * owed the rest. A destination that was advertised once and never written to
+ * sits at exactly 0.
+ *
+ * Writing off an unknown key on the registry alone reported a session as
+ * delivered at 100% while a live Fortress was still owed half of it — and
+ * printed the shortfall under DEAD DESTINATION KEYS as "already delivered".
+ * This is the same test pruneStrandedOffsets applies before deleting anything;
+ * the two must agree or the ledger writes off exactly what the pruner
+ * preserves as proof.
+ */
+export function isPhantomKey(state: HxState, key: string, offset: number): boolean {
+  return offset === 0 && destinationStanding(state, key) === "unknown";
 }
 
 /** Classify one discovered file. `incomplete` is decided elsewhere (the source

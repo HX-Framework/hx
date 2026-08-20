@@ -605,8 +605,16 @@ describe("reportableOffset", () => {
     assert.equal(reportableOffset(fs({ letai: 1000, orgHeld: 0 }), registered()), 0);
   });
 
-  it("answers 0 when every key is unknown", () => {
-    assert.equal(reportableOffset(fs({ phantom: 400 }), registered()), 0);
+  it("answers 0 when every key is an unwritten phantom", () => {
+    assert.equal(reportableOffset(fs({ phantom: 0 }), registered()), 0);
+  });
+
+  it("COUNTS an unregistered key that has actually accepted bytes", () => {
+    // The registry is not reliably complete, so absence is not proof of death.
+    // A non-zero offset is proof of life: setOffsetFor writes only after a
+    // successful commit. Ignoring it reported a session as fully delivered
+    // while a live Fortress was still owed half of it.
+    assert.equal(reportableOffset(fs({ letai: 1000, orgReal: 400 }), registered()), 400);
   });
 
   it("answers 0 for a file with no offsets at all", () => {
@@ -658,5 +666,41 @@ describe("a complete copy at an unregistered destination", () => {
     assert.equal(l.delivered, 0);
     assert.equal(l.uploading, 1);
     assert.notEqual(l.percent, 100);
+  });
+});
+
+// The ledger and the pruner must apply ONE rule. pruneStrandedOffsets refuses
+// to delete a non-zero unknown offset because it is proof a real store accepted
+// bytes; if the ledger writes that same key off, it reports as delivered
+// exactly what the pruner is preserving as evidence of an outstanding debt.
+describe("an unregistered destination that has accepted bytes", () => {
+  const build = (offsets: Record<string, number>) => {
+    // The realistic post-upgrade registry: seeded from blockers, so it names
+    // one held org and nothing else. Every healthy store looks "unknown".
+    const state: HxState = { files: { a: entry("a", offsets) } };
+    applyDestinationReports(state, [{ vaultOrgId: "orgHeld", status: "held" }], NOW - DAY);
+    return buildLedger({
+      files: [file("a", 1000)],
+      state,
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+  };
+
+  it("is still owed its bytes, not written off as a dead key", () => {
+    const l = build({ letai: 1000, orgReal: 500 });
+    assert.equal(l.delivered, 0);
+    assert.equal(l.uploading, 1);
+    assert.equal(l.uploadingBytes, 500);
+    assert.equal(l.percent, 0);
+    assert.equal(l.stranded.length, 0);
+  });
+
+  it("while a never-written key on the same file IS written off", () => {
+    const l = build({ letai: 1000, phantom: 0 });
+    assert.equal(l.delivered, 1);
+    assert.equal(l.percent, 100);
+    assert.equal(l.stranded.length, 1);
+    assert.equal(l.stranded[0]!.key, "phantom");
   });
 });

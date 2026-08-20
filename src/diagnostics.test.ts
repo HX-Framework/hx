@@ -20,7 +20,7 @@ const blockedReport = (): SyncReport => ({
   unwatched: 0,
   excluded: [],
   undiscovered: { fileGone: 0, onDiskButUndiscovered: 0 },
-  childLanes: { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0 },
+  childLanes: { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0, held: 0, heldReasons: {} },
   ledger: noLedger(),
   skipped: ["s1", "s2"].map((sessionId, index) => ({
     path: `/private/${sessionId}.jsonl`,
@@ -98,7 +98,7 @@ describe("sync diagnostics", () => {
         unwatched: 0,
   excluded: [],
   undiscovered: { fileGone: 0, onDiskButUndiscovered: 0 },
-  childLanes: { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0 },
+  childLanes: { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0, held: 0, heldReasons: {} },
         ledger: noLedger(),
       },
       "https://beta.let.ai/_api/hx-gateway",
@@ -135,7 +135,7 @@ describe("dead destination keys in the detailed report", () => {
       unwatched: 0,
       excluded: [],
       undiscovered: { fileGone: 0, onDiskButUndiscovered: 0 },
-      childLanes: { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0 },
+      childLanes: { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0, held: 0, heldReasons: {} },
       skipped: [],
       ledger: buildLedger({
         files: [{ path: "/a.jsonl", size: 1000, mtimeMs: 0 }],
@@ -162,5 +162,46 @@ describe("dead destination keys in the detailed report", () => {
     assert.equal(r.ledger.delivered, 1);
     assert.equal(r.ledger.percent, 100);
     assert.equal(r.ledger.notDelivered.length, 0);
+  });
+});
+
+// A child lane's hold is stamped into state.json, but collectSkipped cannot see
+// it: discovery walks projects/<slug>/*.jsonl and never the <sessionId>/
+// subagents/ tree. A device whose every lane was quarantined therefore printed
+// a clean report while nothing uploaded — the failure this whole change set
+// exists to end.
+describe("held child lanes are reported", () => {
+  const withHeldLanes = (): SyncReport => ({
+    snapshot: { total: 1, done: 1, totalBytes: 10 },
+    behind: [],
+    unwatched: 0,
+    excluded: [],
+    undiscovered: { fileGone: 0, onDiskButUndiscovered: 0 },
+    childLanes: {
+      tracked: 81,
+      onDisk: 81,
+      gone: 0,
+      owing: 81,
+      owedBytes: 1024,
+      held: 81,
+      heldReasons: { quarantine: 81 },
+    },
+    skipped: [],
+    ledger: noLedger(),
+  });
+
+  it("names the count and the reason", () => {
+    const text = formatSyncDoctorText(
+      buildSyncDoctorReport(withHeldLanes(), "https://let.ai/_api/hx-gateway", 0),
+    );
+    assert.match(text, /81 of them are HELD/);
+    assert.match(text, /81 quarantine/);
+  });
+
+  it("says how to release them", () => {
+    const text = formatSyncDoctorText(
+      buildSyncDoctorReport(withHeldLanes(), "https://let.ai/_api/hx-gateway", 0),
+    );
+    assert.match(text, /hx retry --blocked/);
   });
 });

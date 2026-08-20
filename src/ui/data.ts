@@ -39,11 +39,11 @@ import { extractTitleFallback, readHeadLines } from "./preview.js";
 import {
   isDeletedSession,
   loadState,
-  minOffset,
   resetStateCache,
   type FileState,
   type HxState,
 } from "../state.js";
+import { reportableOffset } from "../ledger.js";
 import { HX_VERSION } from "../version.js";
 import { computeSyncReport } from "../watch.js";
 
@@ -570,7 +570,11 @@ export async function buildSessions(folderId: string): Promise<SessionVM[]> {
     const family = head.family === "unknown" ? (file.source === "claude" ? "claude-cli" : "codex-cli") : head.family;
     const cwd = collapseHome(head.cwd ?? path.dirname(file.path));
     if (folderIdFor(family, cwd) !== folderId) continue;
-    const uploaded = state ? minOffset(state) : 0;
+    // reportableOffset, not minOffset: this is a reporting surface, and the
+    // overview above it derives from report.snapshot which already ignores
+    // phantom keys. Left on minOffset, the same page showed "1 of 1 done" in
+    // the overview and a full file still pending in the session row beneath it.
+    const uploaded = state ? reportableOffset(state, fullState) : 0;
     const sessionId = head.sessionId ?? path.basename(file.path, ".jsonl");
     const deleted = isDeletedSession(fullState, state?.family ?? family, sessionId);
     out.push({

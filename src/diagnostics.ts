@@ -500,6 +500,17 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
     if (c.owing > 0) {
       lines.push("These upload on their own pass; a stall here is invisible in the session counts above.");
     }
+    if (c.held > 0) {
+      // The reason is stamped in state.json but collectSkipped cannot reach a
+      // child lane — discovery never walks the subagents tree — so without this
+      // a device with every lane on hold prints a clean report.
+      const why = Object.entries(c.heldReasons)
+        .sort((a, b) => b[1] - a[1])
+        .map(([reason, n]) => `${n} ${reason}`)
+        .join(", ");
+      lines.push(`  ${c.held} of them are HELD and will not retry until released: ${why}`);
+      lines.push("  Release with: hx retry --blocked");
+    }
   }
   if (report.undiscovered.fileGone > 0) {
     lines.push("");

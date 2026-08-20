@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, openSync, writeSync, closeSync, statSync, fstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rotateLogsIfLarge } from "./daemon.js";
+import { rotateLogsIfLarge, seedBacklogLines } from "./daemon.js";
 
 let dir = "";
 const make = (): string => {
@@ -107,13 +107,36 @@ describe("rotateLogsIfLarge under concurrent callers", () => {
 
 // `hx logs` must be able to reach what the rotator kept, or the daemon promises
 // a generation no command can retrieve.
-describe("tailLogs reaches the rotated generation", () => {
-  it("keeps the previous generation readable on disk under .1", async () => {
-    const p = make();
-    writeFileSync(p, Array.from({ length: 200 }, (_, i) => `line ${i}`).join("\n"));
-    await rotateLogsIfLarge(64, [p]);
-    const prev = readFileSync(`${p}.1`, "utf8").split("\n");
-    assert.equal(prev[0], "line 0");
-    assert.equal(prev[199], "line 199");
+describe("seedBacklogLines", () => {
+  const gen = (from: number, to: number): string =>
+    Array.from({ length: to - from }, (_, i) => `line ${from + i}`).join("\n");
+
+  it("reaches into the previous generation when the live log is short", () => {
+    // The case the rotation creates: 5 lines written since, 500 requested.
+    const out = seedBacklogLines(gen(200, 205), gen(0, 200), 50);
+    assert.equal(out.length, 50);
+    assert.equal(out[0], "line 155");
+    assert.equal(out[out.length - 1], "line 204");
+  });
+
+  it("does not touch the previous generation when the live log suffices", () => {
+    const out = seedBacklogLines(gen(0, 100), gen(900, 999), 10);
+    assert.deepEqual(out, Array.from({ length: 10 }, (_, i) => `line ${90 + i}`));
+  });
+
+  it("returns just the live lines when there is no previous generation", () => {
+    assert.deepEqual(seedBacklogLines("a\nb\n", "", 50), ["a", "b"]);
+  });
+
+  it("handles an empty live log right after a rotation", () => {
+    assert.deepEqual(seedBacklogLines("", "x\ny\n", 50), ["x", "y"]);
+  });
+
+  it("returns nothing when both are empty", () => {
+    assert.deepEqual(seedBacklogLines("", "", 50), []);
+  });
+
+  it("tolerates a log with no trailing newline", () => {
+    assert.deepEqual(seedBacklogLines("a\nb", "", 50), ["a", "b"]);
   });
 });

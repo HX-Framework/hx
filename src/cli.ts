@@ -907,7 +907,12 @@ async function cmdRetry(): Promise<void> {
   // "no blocked sessions" and never release the daemon's holds).
   const { roots: retryRoots } = await effectiveRootsForCli(await readSettings());
   const report = await computeSyncReport(retryRoots);
-  if (!all && report.skipped.length === 0) {
+  // Child lanes carry holds too, and collectSkipped cannot see them (discovery
+  // never walks the subagents tree), so gating on report.skipped alone made
+  // `hx retry --blocked` answer "nothing to retry" to a device whose every lane
+  // was held. clearBlockedFailuresFromState already walks all of state.files —
+  // only this early exit stood between the user and the release.
+  if (!all && report.skipped.length === 0 && report.childLanes.held === 0) {
     log("No blocked sessions to retry. (`hx retry --all` clears every backoff.)");
     return;
   }

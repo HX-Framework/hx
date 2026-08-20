@@ -217,12 +217,25 @@ function formatWait(ms: number): string {
   return `${Math.round(ms / 60_000)} min`;
 }
 
-function logStuck(path: string, reason: string, log: (m: string) => void): void {
+function logStuck(
+  path: string,
+  /** STABLE identity of the condition — never the countdown, the byte counts or
+   *  anything else that moves while the condition holds. Suppression compares
+   *  this, so a key that changes each tick suppresses nothing: with the wait
+   *  interpolated in, a file benched for 30s emitted a line on every 1.5s pass
+   *  (~57,600/day — precisely the number STUCK_LOG_INTERVAL_MS exists to
+   *  prevent) while appearing to be rate limited. A CHANGE of key is still
+   *  reported at once, which is the point: the transition is the interesting
+   *  part. */
+  key: string,
+  message: string,
+  log: (m: string) => void,
+): void {
   const prev = stuckLogged.get(path);
   const now = Date.now();
-  if (prev && prev.reason === reason && now - prev.atMs < STUCK_LOG_INTERVAL_MS) return;
-  stuckLogged.set(path, { reason, atMs: now });
-  log(`  [stuck] ${path}: ${reason}`);
+  if (prev && prev.reason === key && now - prev.atMs < STUCK_LOG_INTERVAL_MS) return;
+  stuckLogged.set(path, { reason: key, atMs: now });
+  log(`  [stuck] ${path}: ${message}`);
 }
 
 /**
@@ -1806,7 +1819,22 @@ export interface SyncReport {
    *  surface. Excluding them from the session checks (they are found by a
    *  different discovery) is correct; excluding them from the OUTPUT is how a
    *  whole category of stall would go unnoticed. Counted here instead. */
-  childLanes: { tracked: number; onDisk: number; gone: number; owing: number; owedBytes: number };
+  childLanes: {
+    tracked: number;
+    onDisk: number;
+    gone: number;
+    owing: number;
+    owedBytes: number;
+    /** Child lanes carrying a per-file HOLD (skipReason). Counted separately
+     *  because collectSkipped cannot see them: it reports only files present in
+     *  discovery, and discovery walks `projects/<slug>/*.jsonl` — never the
+     *  `<sessionId>/subagents/` tree. Without this a device whose every lane is
+     *  quarantined stamps the reason into state.json and still prints nothing,
+     *  which is the whole failure being fixed. */
+    held: number;
+    /** held, broken down by reason, so the report names the condition. */
+    heldReasons: Record<string, number>;
+  };
   /** DISTINCT partially-uploaded sessions sitting under NO current data root
    *  — a root was removed (or the daemon hasn't adopted one yet). They are
    *  not "behind" (nothing will ever pick them up under the current config),
@@ -1945,10 +1973,22 @@ export async function computeSyncReport(
     p.includes("/subagents/") || p.includes("/workflows/");
   let fileGone = 0;
   let onDiskButUndiscovered = 0;
-  const childLanes = { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0 };
+  const childLanes = {
+    tracked: 0,
+    onDisk: 0,
+    gone: 0,
+    owing: 0,
+    owedBytes: 0,
+    held: 0,
+    heldReasons: {} as Record<string, number>,
+  };
   for (const [p, fs] of Object.entries(state.files)) {
     if (isChildLane(p)) {
       childLanes.tracked += 1;
+      if (fs.skipReason) {
+        childLanes.held += 1;
+        childLanes.heldReasons[fs.skipReason] = (childLanes.heldReasons[fs.skipReason] ?? 0) + 1;
+      }
       const here = existsSync(p);
       if (here) childLanes.onDisk += 1;
       else childLanes.gone += 1;
@@ -2152,6 +2192,10 @@ export async function tickOnce(
       const why = pending.skipReason ? `, ${pending.skipReason}` : "";
       logStuck(
         f.path,
+        // Key on the CONDITION, not the countdown: bench-vs-backoff, the hold
+        // reason, and the failure streak. All three change only when something
+        // real changes, so a new line means new information.
+        `${failures === undefined ? "bench" : `backoff:${failures}`}:${pending.skipReason ?? "-"}`,
         // A bench and a backoff are different conditions and were printed
         // identically. benchFileProbe deliberately leaves consecutiveFailures
         // alone (the outage is not this file's fault), so the old line reported
@@ -2193,6 +2237,7 @@ export async function tickOnce(
         // good. Silent, this is indistinguishable from "still uploading".
         logStuck(
           f.path,
+          "excluded",
           `excluded by settings — personalSync=${settings.personalSync}, repoSlug=${seeded.repoSlug ?? "null"}, attributed=${seeded.attributed}`,
           log,
         );
@@ -2205,7 +2250,12 @@ export async function tickOnce(
     {
       const entry = state.files[f.path];
       if (entry && isDeletedSession(state, entry.family, entry.sessionId)) {
-        logStuck(f.path, "session was permanently deleted on the server — it will never upload again", log);
+        logStuck(
+          f.path,
+          "deleted",
+          "session was permanently deleted on the server — it will never upload again",
+          log,
+        );
         return;
       }
     }
@@ -2223,6 +2273,9 @@ export async function tickOnce(
           .join(", ");
         logStuck(
           f.path,
+          // Not the offsets: they move as other destinations advance, which
+          // would re-emit this line without the condition having changed.
+          "no-plan",
           `owes bytes but the gateway planned no upload for it — ${owed || "no destinations recorded"}. The destination may no longer exist.`,
           log,
         );
@@ -2506,11 +2559,12 @@ export async function startWatch(
   // stdout.log/stderr.log are DEVICE-global, but startWatch runs once per lane
   // (cli.ts starts main and the `--local` tee concurrently under Promise.all).
   // Two lanes racing here both pass the size check, then one truncates while
-  // the other is copying — and the "previous generation" is written as an empty
-  // or half-copied file. Same gate the roots stamper uses twelve lines up. A
-  // foreground `hx watch` is excluded for the same reason: on POSIX it writes
-  // to the terminal, so it has no business truncating the installed service's
-  // live log.
+  // the other is copying. Same gate the roots stamper uses twelve lines up.
+  //
+  // This does NOT distinguish a foreground `hx watch` from the installed
+  // service — they run the same command, so nothing in `opts` can. That case is
+  // handled where it actually can be: rotateLogsIfLarge stages the copy and
+  // renames it into place, so `.1` is a complete copy whichever process wins.
   const ownsDeviceLogs = !opts.oneShot && scopeOf(cfg) === "main";
   // A daemon that has been down for a while may be starting behind an already
   // oversized log; do not wait an hour to bound it.
