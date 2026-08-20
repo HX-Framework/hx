@@ -483,7 +483,15 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
     );
   }
   if (report.blockedSessions === 0) {
-    lines.push("Blocked: none");
+    // "none" is a claim about the whole device, and blockedSessions counts
+    // parent sessions only. Printing it four lines above "1 of them are HELD
+    // and will not retry until released" made one report disagree with itself.
+    const heldLanes = report.childLanes.held;
+    lines.push(
+      heldLanes > 0
+        ? `Blocked: none — but ${heldLanes} agent lane${heldLanes === 1 ? "" : "s"} held (see below)`
+        : "Blocked: none",
+    );
   } else {
     lines.push(`Blocked: ${report.blockedSessions} session${report.blockedSessions === 1 ? "" : "s"}`);
     report.blockers.forEach((blocker, index) => {

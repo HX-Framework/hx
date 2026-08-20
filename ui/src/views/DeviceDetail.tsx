@@ -45,7 +45,7 @@ export function DeviceDetail() {
   const doctor = snap?.doctor;
   const waiting = Math.max(0, (snap?.sync.total ?? 0) - (snap?.sync.done ?? 0));
   const q = probeLine(probe, probing);
-  const nextRetry = doctor?.blockers.map((b) => b.nextRetryAtMs ?? 0).filter((t) => t > 0).sort()[0];
+  const nextRetry = doctor?.blockers.map((b) => (b.nextRetryAt ? Date.parse(b.nextRetryAt) : 0)).filter((t) => t > 0).sort()[0];
 
   const copyDiagnostics = () => {
     if (!doctor) return;
@@ -207,9 +207,9 @@ export function DeviceDetail() {
               {doctor.blockers.map((b, i) => (
                 <div className="row" key={i}>
                   <span className="dot warn"></span>
-                  <div className="who"><b>{plural(b.sessions, "session")} held at {b.orgName ?? "an organization vault"}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — retrying with backoff" : b.reason === "vault_home_unreachable" ? "Home Fortress not connected — retrying with backoff" : b.reason === "quarantine" ? "Routing not decided yet — the gateway will place these once the parent upload lands" : "store unreachable — retrying with backoff"}</div></div>
+                  <div className="who"><b>{plural(b.sessionCount, "session")} held at {b.destination?.orgName ?? b.destination?.orgSlug ?? "an organization vault"}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — retrying with backoff" : b.reason === "vault_home_unreachable" ? "Home Fortress not connected — retrying with backoff" : b.reason === "quarantine" ? "Routing not decided yet — the gateway will place these once the parent upload lands" : "store unreachable — retrying with backoff"}</div></div>
                   <div><span className="pill warn">Held</span></div>
-                  <div className="m">{b.nextRetryAtMs ? `next retry ${fmtClock(b.nextRetryAtMs)}` : "retrying"}</div>
+                  <div className="m">{b.nextRetryAt ? `next retry ${fmtClock(Date.parse(b.nextRetryAt))}` : "retrying"}</div>
                 </div>
               ))}
             </div>

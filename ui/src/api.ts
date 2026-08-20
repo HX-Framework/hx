@@ -57,11 +57,22 @@ export interface RecentUpload {
   sizeBytes: number;
 }
 
+/** Mirrors DoctorBlocker as the server actually serves it. The previous shape
+ *  was invented rather than matched: it declared `sessions: number` where the
+ *  wire carries an ARRAY of sessions, so every blocker row rendered
+ *  "[object Object] sessions"; and `orgName`/`nextRetryAtMs` at the top level,
+ *  where the wire nests the first under `destination` and spells the second
+ *  `nextRetryAt` as an ISO string — so both were permanently undefined and
+ *  every row read "held at an organization vault", "retrying". */
 export interface DoctorBlockerInfo {
   reason: string;
-  sessions: number;
-  orgName?: string | null;
-  nextRetryAtMs?: number | null;
+  sessionCount: number;
+  destination?: {
+    orgName?: string | null;
+    orgSlug?: string | null;
+    vaultOrgId?: string | null;
+  } | null;
+  nextRetryAt?: string | null;
 }
 
 export interface DoctorInfo {

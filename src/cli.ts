@@ -638,6 +638,15 @@ async function cmdStatus(): Promise<void> {
     rows.push(["Connection", `down — ${probe.reason}`]);
     if (report && report.skipped.length > 0) {
       rows.push(["Blocked", formatStatusBlocker(report.skipped)]);
+    }
+    // Held lanes are local state and need no network, exactly like the row
+    // above — and a device that cannot reach the gateway is if anything MORE
+    // likely to be carrying them.
+    if (report && report.childLanes.held > 0) {
+      const n = report.childLanes.held;
+      rows.push(["Blocked lanes", `${n} agent lane${n === 1 ? "" : "s"} held`]);
+    }
+    if (report && (report.skipped.length > 0 || report.childLanes.held > 0)) {
       rows.push(["Details", "hx doctor sync"]);
     }
     printStatusTable(rows);
@@ -664,6 +673,18 @@ async function cmdStatus(): Promise<void> {
     rows.push(["Blocked", formatStatusBlocker(report.skipped)]);
     rows.push(["  Details", "hx status --detailed"]);
   }
+  // Held CHILD LANES, which report.skipped structurally cannot contain:
+  // collectSkipped reports only files present in discovery, and discovery never
+  // walks the subagents tree. Without this row `hx status` printed
+  // "Sync 100% — all sessions sent", exit 0, for the same device and instant
+  // where `hx doctor sync` printed "1 of them are HELD" and exited 1, and the
+  // UI showed "Caught up: No". The command people actually run was the one left
+  // behind.
+  if (report && report.childLanes.held > 0) {
+    const n = report.childLanes.held;
+    rows.push(["Blocked lanes", `${n} agent lane${n === 1 ? "" : "s"} held — hx retry --blocked`]);
+    if (report.skipped.length === 0) rows.push(["  Details", "hx status --detailed"]);
+  }
 
   // The health ledger. Every session sits in exactly one bucket and the
   // buckets sum to the total, so the headline percentage can be checked
@@ -683,7 +704,15 @@ async function cmdStatus(): Promise<void> {
     // count to imply a depth it may not have.
     const range = formatSessionRange(ledger.oldestMs, ledger.newestMs);
     if (range) rows.push(["Session range", range]);
-    rows.push(["Sync", syncVerdict(ledger)]);
+    // The verdict must not claim completion while a lane is held: the ledger
+    // counts SESSIONS, and a held lane belongs to a session that is otherwise
+    // fully delivered, so syncVerdict alone happily says "all sessions sent".
+    rows.push([
+      "Sync",
+      report && report.childLanes.held > 0
+        ? `${syncVerdict(ledger)} · ${report.childLanes.held} agent lane${report.childLanes.held === 1 ? "" : "s"} held`
+        : syncVerdict(ledger),
+    ]);
     rows.push(["  Delivered", `${sessions(ledger.delivered)} · ${formatSize(ledger.deliveredBytes)}`]);
     // Ordered by how much they matter, not by severity: the two healthy rows
     // sit together under the number, and anything wrong gets its own box.

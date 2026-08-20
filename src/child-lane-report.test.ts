@@ -7,8 +7,16 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeSyncReport, snapshotFrom } from "./watch.js";
-import { resetStateCache, setStateDirForTests, upsertFileState, type FileState } from "./state.js";
+import { computeSyncReport, formatWait, snapshotFrom } from "./watch.js";
+import {
+  loadState,
+  pruneStrandedOffsets,
+  recordDestinations,
+  resetStateCache,
+  setStateDirForTests,
+  upsertFileState,
+  type FileState,
+} from "./state.js";
 
 let dir = "";
 let projects = "";
@@ -106,9 +114,10 @@ describe("childLanes accounting", () => {
 
 // The three rules below were each deletable with the entire suite still green.
 import { hasReleasableHolds, stuckLogKey } from "./watch.js";
-import { buildSyncDoctorReport } from "./diagnostics.js";
+import { buildSyncDoctorReport, formatStatusBlocker } from "./diagnostics.js";
 import { buildLedger } from "./ledger.js";
 import type { HxState } from "./state.js";
+import type { SyncSkippedEntry } from "./watch.js";
 import type { SyncReport } from "./watch.js";
 
 const cleanReport = (): SyncReport => ({
@@ -237,5 +246,95 @@ describe("snapshotFrom agrees with the ledger about a phantom key", () => {
     const s = withPhantom();
     s.files["/s.jsonl"]!.offsets = { letai: 400, phantom: 0 };
     assert.equal(snapshotFrom(files, s).done, 0);
+  });
+});
+
+// User-facing text that mutation testing showed nothing pinned. Each of these
+// reverts to its pre-fix wording with the whole suite green.
+describe("the words a user actually reads", () => {
+  const quarantined = (): SyncSkippedEntry[] => [
+    { path: "/a.jsonl", family: "claude-cli", sessionId: "s", reason: "quarantine" },
+  ];
+
+  it("does not call a quarantine a store outage", () => {
+    // "destination store unavailable" is wrong: nothing is unavailable, the
+    // gateway has not made a routing decision.
+    const line = formatStatusBlocker(quarantined());
+    assert.doesNotMatch(line, /store unavailable/);
+    assert.match(line, /routing/i);
+  });
+
+  it("still calls a real store outage a store outage", () => {
+    const line = formatStatusBlocker([
+      { path: "/a.jsonl", family: "claude-cli", sessionId: "s", reason: "store_unreachable" },
+    ]);
+    assert.match(line, /store unavailable/);
+  });
+
+  it("does not tell a quarantined user to bring a Fortress online", () => {
+    // There is no Fortress to bring online and no repository to move.
+    const r = buildSyncDoctorReport(
+      { ...cleanReport(), skipped: quarantined() },
+      "https://let.ai/_api/hx-gateway",
+      0,
+    );
+    const guidance = r.blockers[0]!.remediation.guidance;
+    assert.doesNotMatch(guidance, /Fortress online/);
+    assert.doesNotMatch(guidance, /detach/);
+    assert.match(guidance, /routing decision/);
+  });
+
+  it("still tells an offline-vault user to bring the Fortress online", () => {
+    const r = buildSyncDoctorReport(
+      {
+        ...cleanReport(),
+        skipped: [{ path: "/a.jsonl", family: "claude-cli", sessionId: "s", reason: "vault_offline" }],
+      },
+      "https://let.ai/_api/hx-gateway",
+      0,
+    );
+    assert.match(r.blockers[0]!.remediation.guidance, /Fortress online/);
+  });
+
+  it("renders a sub-minute wait in seconds, not as '0 min'", () => {
+    // 749 of 760 stuck lines on the motivating device said "another 0 min",
+    // which reads as a stopped clock rather than a short one.
+    assert.match(formatWait(12_000), /^\d+s$/);
+    assert.doesNotMatch(formatWait(12_000), /min/);
+    assert.match(formatWait(5 * 60_000), /min/);
+  });
+});
+
+// The pure fold is well covered; the wrapper that loads state, applies it and
+// PERSISTS was not — and it is what startWatch calls on every daemon start.
+describe("pruneStrandedOffsets persists what it removes", () => {
+  const laneless = (path: string, offsets: Record<string, number>): FileState =>
+    ({
+      path,
+      family: "claude-desktop",
+      sessionId: path,
+      offsets,
+      lastMtimeMs: 0,
+      lastUploadAtMs: 0,
+    }) as FileState;
+
+  it("drops a phantom on a departed file and the change survives a reload", async () => {
+    // A registry must exist: "we have never recorded a destination" must not
+    // read as "every destination is dead", so the prune bails without one.
+    await recordDestinations([{ vaultOrgId: null, status: "ready" }]);
+    await upsertFileState(laneless("/gone.jsonl", { letai: 1000, phantom: 0 }));
+    const r = await pruneStrandedOffsets("main", () => false);
+    assert.deepEqual(r, { keys: 1, files: 1 });
+    // Reload from disk: an in-memory-only edit would be lost on the next start
+    // and the key would come back every time.
+    resetStateCache();
+    const reloaded = await loadState();
+    assert.deepEqual(reloaded.files["/gone.jsonl"]!.offsets, { letai: 1000 });
+  });
+
+  it("writes nothing when there is nothing to drop", async () => {
+    await recordDestinations([{ vaultOrgId: null, status: "ready" }]);
+    await upsertFileState(laneless("/here.jsonl", { letai: 1000 }));
+    assert.deepEqual(await pruneStrandedOffsets("main", () => true), { keys: 0, files: 0 });
   });
 });

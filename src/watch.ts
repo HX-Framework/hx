@@ -212,7 +212,7 @@ const stuckLogged = new Map<string, { reason: string; atMs: number }>();
 /** A wait a reader can act on. `Math.round(ms / 60_000)` rendered every delay
  *  under 30 seconds as "0 min" — which reads as a stopped clock rather than a
  *  short one. On one device 749 of 760 stuck lines said "another 0 min". */
-function formatWait(ms: number): string {
+export function formatWait(ms: number): string {
   if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
   return `${Math.round(ms / 60_000)} min`;
 }
@@ -2025,7 +2025,21 @@ export async function computeSyncReport(
       // and a child lane never carries lastKnownSize (only ensureFileState
       // writes that, and only the parent path calls it), so the on-disk size is
       // the sole way to know what a lane still owes.
-      const st = statSync(p, { throwIfNoEntry: false });
+      //
+      // The try is not optional. `throwIfNoEntry: false` suppresses ENOENT and
+      // nothing else, while the existsSync this replaced returned false for
+      // EACCES, ELOOP, ENOTDIR, ENAMETOOLONG and EIO alike. Unguarded in a bare
+      // loop over state.files it took down every caller that does not wrap
+      // computeSyncReport: `hx doctor sync` and `hx status --detailed` exited 1
+      // with no report, `hx retry` the same, and `hx status` silently dropped
+      // its Sessions/Sync rows through a .catch(() => null). Unreadable means
+      // "cannot be sent from here", which is what not-on-disk already means.
+      let st: ReturnType<typeof statSync>;
+      try {
+        st = statSync(p, { throwIfNoEntry: false });
+      } catch {
+        st = undefined;
+      }
       const here = st !== undefined;
       if (here) childLanes.onDisk += 1;
       else childLanes.gone += 1;
