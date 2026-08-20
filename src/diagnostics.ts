@@ -497,7 +497,14 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
     report.blockers.forEach((blocker, index) => {
       const d = blocker.destination;
       lines.push("");
-      lines.push(`Destination ${index + 1}: ${d?.orgName ?? d?.orgSlug ?? d?.vaultOrgId ?? "unknown store"}`);
+      lines.push(
+        blocker.reason === "quarantine"
+          // Not "unknown store": there is no store. A quarantine is the gateway
+          // declining to CHOOSE one, so naming a destination at all invites the
+          // reader to go and fix it.
+          ? `Hold ${index + 1}: no destination chosen yet`
+          : `Destination ${index + 1}: ${d?.orgName ?? d?.orgSlug ?? d?.vaultOrgId ?? "unknown store"}`,
+      );
       if (d?.projectName || d?.projectSlug) lines.push(`  Project: ${d.projectName ?? d.projectSlug}`);
       if (d?.repoSlug) lines.push(`  Repo: ${d.repoSlug}`);
       lines.push(`  Reason: ${blocker.reason}`);
@@ -513,7 +520,14 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
       }
     });
     lines.push("");
-    lines.push("After fixing the destination or repository attachment:");
+    // Only offer the destination/repository fix when one of the holds actually
+    // has a destination to fix. A quarantine has none, and printing this three
+    // lines under "Nothing to change on this device" contradicted it.
+    lines.push(
+      report.blockers.some((b) => b.reason !== "quarantine")
+        ? "After fixing the destination or repository attachment:"
+        : "Once routing resolves, or to retry immediately:",
+    );
     lines.push("  hx retry --blocked");
     lines.push("  hx status");
   }

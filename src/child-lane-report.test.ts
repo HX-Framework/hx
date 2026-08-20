@@ -4,7 +4,7 @@
 // lastKnownSize, left the whole suite green.
 import { describe, it, beforeEach, afterEach } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeSyncReport, formatWait, snapshotFrom } from "./watch.js";
@@ -23,6 +23,16 @@ let projects = "";
 
 const lanePath = (name: string): string =>
   join(projects, "-p", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "subagents", name);
+
+const laneStateFor = (p: string, offsets: Record<string, number>): FileState =>
+  ({
+    path: p,
+    family: "claude-desktop",
+    sessionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    offsets,
+    lastMtimeMs: 0,
+    lastUploadAtMs: 0,
+  }) as FileState;
 
 const laneState = (p: string, offsets: Record<string, number>, skipReason?: string): FileState =>
   ({
@@ -336,5 +346,46 @@ describe("pruneStrandedOffsets persists what it removes", () => {
     await recordDestinations([{ vaultOrgId: null, status: "ready" }]);
     await upsertFileState(laneless("/here.jsonl", { letai: 1000 }));
     assert.deepEqual(await pruneStrandedOffsets("main", () => true), { keys: 0, files: 0 });
+  });
+});
+
+// Two guards that mutation testing showed nothing pinned, both load-bearing.
+describe("guards that were deletable with the suite green", () => {
+  it("survives a lane whose file cannot even be stat-ed", async () => {
+    // throwIfNoEntry:false suppresses ENOENT ONLY; the existsSync it replaced
+    // returned false for EACCES/ELOOP/ENOTDIR/EIO alike. Unguarded in a bare
+    // loop over state.files, one unreadable directory made `hx doctor sync`,
+    // `hx status --detailed` and `hx retry` exit 1 with no report, and silently
+    // blanked `hx status`'s Sessions and Sync rows. This exact shape has been
+    // shipped twice, so it gets a test.
+    const locked = join(projects, "-p", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "subagents", "locked");
+    mkdirSync(locked, { recursive: true });
+    const p = join(locked, "agent-x.jsonl");
+    writeFileSync(p, "y".repeat(100));
+    await upsertFileState(laneStateFor(p, { letai: 0 }));
+    chmodSync(locked, 0o000);
+    try {
+      const c = await report();
+      // Unreadable means "cannot be sent from here", which is what gone means.
+      assert.equal(c.tracked, 1);
+      assert.equal(c.gone, 1);
+      assert.equal(c.owing, 0);
+    } finally {
+      chmodSync(locked, 0o755);
+    }
+  });
+
+  it("never prunes the primary key, whatever the registry names", async () => {
+    // Not redundant with the everWritten guard. A registry built by
+    // seedDestinationsFromBlockers names HELD destinations only, so it can omit
+    // letai entirely — and a departed file at {letai: 0, orgB: 500} would then
+    // lose letai, minOffset would jump 0 -> 500, and a real unrecoverable gap
+    // would vanish from collectBehind and `hx doctor sync` permanently.
+    await recordDestinations([{ vaultOrgId: "orgHeld", status: "held" }]);
+    await upsertFileState(laneStateFor("/departed.jsonl", { letai: 0, orgB: 500 }));
+    await pruneStrandedOffsets("main", () => false);
+    resetStateCache();
+    const after = await loadState();
+    assert.equal(after.files["/departed.jsonl"]!.offsets["letai"], 0, "letai must survive");
   });
 });

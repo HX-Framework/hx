@@ -176,9 +176,14 @@ export function DeviceDetail() {
           ) : (
             <div className="rowlist">
               <div className="row">
-                <span className={`dot${doctor.sync.percent < 100 ? " warn" : ""}`}></span>
+                <span className={`dot${doctor.sync.percent < 100 || !doctor.ok ? " warn" : ""}`}></span>
                 <div className="who"><b>Sync</b><div className="sub">{doctor.sync.done} of {doctor.sync.total} sessions · {fmtBytes(doctor.sync.totalBytes)} — {doctor.sync.percent}%</div></div>
-                <div><span className={`pill ${doctor.sync.percent === 100 ? "ok" : "warn"}`}>{doctor.sync.percent === 100 ? "Healthy" : "Catching up"}</span></div>
+                {/* Keyed on the VERDICT, not on one of its inputs. With held
+                    lanes as the only fault, percent is 100 while ok is false —
+                    so this row answered "Healthy" directly above the warn-pilled
+                    "Agent lanes — 1 lane held" row, on the very panel Overview
+                    sends the user to when it says "Caught up: No". */}
+                <div><span className={`pill ${doctor.sync.percent === 100 && doctor.ok ? "ok" : "warn"}`}>{doctor.sync.percent === 100 && doctor.ok ? "Healthy" : "Catching up"}</span></div>
                 <div className="m">generated just now</div>
               </div>
               <div className="row">
@@ -207,7 +212,7 @@ export function DeviceDetail() {
               {doctor.blockers.map((b, i) => (
                 <div className="row" key={i}>
                   <span className="dot warn"></span>
-                  <div className="who"><b>{plural(b.sessionCount, "session")} held at {b.destination?.orgName ?? b.destination?.orgSlug ?? "an organization vault"}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — retrying with backoff" : b.reason === "vault_home_unreachable" ? "Home Fortress not connected — retrying with backoff" : b.reason === "quarantine" ? "Routing not decided yet — the gateway will place these once the parent upload lands" : "store unreachable — retrying with backoff"}</div></div>
+                  <div className="who"><b>{plural(b.sessionCount, "session")} {b.reason === "quarantine" ? "awaiting a routing decision" : `held at ${b.destination?.orgName ?? b.destination?.orgSlug ?? "an organization vault"}`}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — retrying with backoff" : b.reason === "vault_home_unreachable" ? "Home Fortress not connected — retrying with backoff" : b.reason === "quarantine" ? "Routing not decided yet — the gateway will place these once the parent upload lands" : "store unreachable — retrying with backoff"}</div></div>
                   <div><span className="pill warn">Held</span></div>
                   <div className="m">{b.nextRetryAt ? `next retry ${fmtClock(Date.parse(b.nextRetryAt))}` : "retrying"}</div>
                 </div>
@@ -216,7 +221,15 @@ export function DeviceDetail() {
           )}
           {doctor && doctor.blockers.length > 0 && (
             <>
-              <div className="why-note" style={{ marginTop: 12 }}><b>Fix:</b> bring the Session Vault back online, or ask an admin to move the repository to a live destination. Nothing is lost — held sessions send automatically on reconnect.</div>
+              {/* A quarantine has no destination to bring online and no
+                  repository to move — the gateway has simply not chosen where
+                  these go yet. Offering the Fortress fix there sends the reader
+                  after something that does not exist. */}
+              {doctor.blockers.some((b) => b.reason !== "quarantine") ? (
+                <div className="why-note" style={{ marginTop: 12 }}><b>Fix:</b> bring the Session Vault back online, or ask an admin to move the repository to a live destination. Nothing is lost — held sessions send automatically on reconnect.</div>
+              ) : (
+                <div className="why-note" style={{ marginTop: 12 }}><b>Nothing to fix here:</b> the gateway has not chosen a destination for these sessions yet. It resolves once the parent upload lands, or once the uploader’s org memberships are unambiguous. Nothing is lost.</div>
+              )}
               <div className="why-act">
                 <button className="btn ghost sm" id="retryBtn" onClick={doRetry}>Retry blocked now</button>
                 <button className="btn ghost sm" onClick={() => goto("folders")}>Open Folders &amp; Destinations</button>

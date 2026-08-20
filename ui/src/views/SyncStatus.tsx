@@ -125,7 +125,7 @@ export function SyncStatus() {
             {doctor.blockers.map((b, i) => (
               <div className="row" key={i}>
                 <span className="dot warn"></span>
-                <div className="who"><b>{b.destination?.orgName ?? b.destination?.orgSlug ?? "Organization vault"}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — sessions held safely until it reconnects" : b.reason === "vault_home_unreachable" ? "Home Fortress not connected — sessions held safely until it comes online" : b.reason === "quarantine" ? "Routing not decided yet — the gateway will place these once the parent upload lands" : "store unreachable — retrying with backoff"}</div></div>
+                <div className="who"><b>{b.reason === "quarantine" ? "Routing undecided" : (b.destination?.orgName ?? b.destination?.orgSlug ?? "Organization vault")}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — sessions held safely until it reconnects" : b.reason === "vault_home_unreachable" ? "Home Fortress not connected — sessions held safely until it comes online" : b.reason === "quarantine" ? "Routing not decided yet — the gateway will place these once the parent upload lands" : "store unreachable — retrying with backoff"}</div></div>
                 <div><span className="pill warn">Held</span></div>
                 <div className="m">{plural(b.sessionCount, "session")}</div>
               </div>
