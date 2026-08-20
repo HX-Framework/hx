@@ -878,7 +878,8 @@ describe("accounting invariants", () => {
   }
 
   it("detail matches the headline when nothing is offline", () => {
-    for (const offsets of [{ phantom: 0 }, { letai: 400, phantom: 0 }, {}]) {
+    const noOffline: Record<string, number>[] = [{ phantom: 0 }, { letai: 400, phantom: 0 }, {}];
+    for (const offsets of noOffline) {
       const l = ledgerFor(offsets);
       const perSession = l.notDelivered.reduce((n, d) => n + d.owedBytes, 0);
       assert.equal(perSession, l.uploadingBytes);
