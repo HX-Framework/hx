@@ -735,13 +735,26 @@ export async function reconcileDestinations(
  * device carried 43 of them for an org that advertised itself once and was
  * never seen again; every one of those sessions read as owing its whole size.
  *
- * BOTH conditions are required, and the pairing is the whole safety argument.
- * Absence from the registry alone is NOT evidence of a dead destination — a
- * newly attached vault legitimately sits at offset 0 before any pass records
- * it — but that file is on disk and still uploading, so requiring absence from
- * disk leaves every live case untouched. A state with no registry at all is
- * skipped outright: "we have never recorded a destination" would otherwise
- * read as "every destination is dead".
+ * THREE conditions are required, and the third is the one that matters most.
+ *
+ * A non-zero offset is PROOF the destination existed: setOffsetFor records
+ * bytes only after a successful commit, so a key at 400 means a store really
+ * accepted 400 bytes. A genuine phantom — advertised once, never written to —
+ * sits at exactly 0. Pruning only zero-offset keys is therefore the difference
+ * between dropping a name nothing ever used and erasing the durable record of
+ * a delivery.
+ *
+ * That distinction is load-bearing because the registry is NOT reliably
+ * complete. seedDestinationsFromBlockers runs inside loadState and seeds HELD
+ * destinations only, so a first run after upgrade can hold a registry naming
+ * one offline Fortress and nothing else. Every healthy destination then looks
+ * "unknown". Without the offset check, a session fully delivered to a real
+ * Fortress and since pruned from disk would have its proof of delivery deleted
+ * and reappear as a fabricated gap in `hx doctor sync`.
+ *
+ * Absence from disk is required too: a newly attached vault also sits at 0, but
+ * that file is on disk and still uploading, and append-url's reconcile is the
+ * right repair for it. A state with no registry at all is skipped outright.
  */
 export async function pruneStrandedOffsets(
   scope: StateScope = "main",
@@ -764,12 +777,17 @@ export function pruneStrandedOffsetsFrom(
   let files = 0;
   for (const [filePath, fs] of Object.entries(state.files)) {
     const offsets = fs.offsets ?? {};
-    const dead = Object.keys(offsets).filter(
-      (k) => k !== destKey(null) && state.destinations?.[k] === undefined,
+    const dead = Object.entries(offsets).filter(
+      ([k, offset]) =>
+        k !== destKey(null) &&
+        state.destinations?.[k] === undefined &&
+        // Never a key that has been written to. See above: this is the guard,
+        // not a refinement of it.
+        offset === 0,
     );
     if (dead.length === 0) continue;
     if (onDisk(filePath)) continue;
-    for (const k of dead) delete offsets[k];
+    for (const [k] of dead) delete offsets[k];
     keys += dead.length;
     files += 1;
   }

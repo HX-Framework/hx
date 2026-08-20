@@ -83,3 +83,37 @@ describe("rotateLogsIfLarge", () => {
     assert.ok(p);
   });
 });
+
+// stdout.log/stderr.log are DEVICE-global while callers are per-lane: cli.ts
+// starts the main and `--local` watchers concurrently in ONE process. Two
+// overlapping rotations both pass the size check, then one truncates while the
+// other is still copying — and the "previous generation" it promised ends up
+// empty. Callers are gated too; this pins the function's own safety.
+describe("rotateLogsIfLarge under concurrent callers", () => {
+  it("coalesces overlapping calls instead of destroying the copy", async () => {
+    const p = make();
+    writeFileSync(p, "q".repeat(4096));
+    const [a, b] = await Promise.all([
+      rotateLogsIfLarge(1024, [p]),
+      rotateLogsIfLarge(1024, [p]),
+    ]);
+    // Whatever the interleaving, the kept generation must be the real history.
+    assert.equal(readFileSync(`${p}.1`, "utf8").length, 4096);
+    assert.equal(statSync(p).size, 0);
+    // Exactly one rotation happened; the other observed the same result.
+    assert.deepEqual(a, b);
+  });
+});
+
+// `hx logs` must be able to reach what the rotator kept, or the daemon promises
+// a generation no command can retrieve.
+describe("tailLogs reaches the rotated generation", () => {
+  it("keeps the previous generation readable on disk under .1", async () => {
+    const p = make();
+    writeFileSync(p, Array.from({ length: 200 }, (_, i) => `line ${i}`).join("\n"));
+    await rotateLogsIfLarge(64, [p]);
+    const prev = readFileSync(`${p}.1`, "utf8").split("\n");
+    assert.equal(prev[0], "line 0");
+    assert.equal(prev[199], "line 199");
+  });
+});

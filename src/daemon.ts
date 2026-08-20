@@ -1090,10 +1090,26 @@ export const LOG_MAX_BYTES = 32 * 1024 * 1024;
  * Best-effort throughout: a log we cannot rotate must never take the daemon
  * down. Returns the paths actually rotated, for the caller to report.
  */
+let rotationInFlight: Promise<string[]> | null = null;
+
 export async function rotateLogsIfLarge(
   maxBytes: number = LOG_MAX_BYTES,
   targets: readonly string[] = [STDOUT_LOG, STDERR_LOG],
 ): Promise<string[]> {
+  // These paths are DEVICE-global while callers are per-lane and in the same
+  // process (cli.ts runs the main and `--local` watchers concurrently). Two
+  // overlapping calls both pass the size check, then one truncates while the
+  // other is still copying — and the "previous generation" ends up empty or
+  // half-written, destroying the history this exists to preserve. Callers are
+  // gated too; this makes the function safe on its own terms.
+  if (rotationInFlight) return rotationInFlight;
+  rotationInFlight = rotateOnce(maxBytes, targets).finally(() => {
+    rotationInFlight = null;
+  });
+  return rotationInFlight;
+}
+
+async function rotateOnce(maxBytes: number, targets: readonly string[]): Promise<string[]> {
   const rotated: string[] = [];
   for (const target of targets) {
     try {
@@ -1146,6 +1162,21 @@ export async function tailLogs(linesBack = 50): Promise<void> {
     offsets.set(p, buf.length);
     const lines = buf.toString("utf8").split("\n");
     if (lines[lines.length - 1] === "") lines.pop();
+    // Reach back into the previous generation when the live file cannot fill
+    // the request. A rotation minutes ago would otherwise turn `hx logs -n 500`
+    // into "here are the 30 lines since we rotated" with no hint that the rest
+    // exists — the daemon promises it kept a generation, so the tool that reads
+    // logs has to be able to reach it. Only the LIVE file is followed after
+    // this seed; the rotated one is finished by definition.
+    if (lines.length < linesBack) {
+      const prev = await readFile(`${p}.1`).catch(() => Buffer.alloc(0));
+      if (prev.length > 0) {
+        const prevLines = prev.toString("utf8").split("\n");
+        if (prevLines[prevLines.length - 1] === "") prevLines.pop();
+        // Bounded by linesBack, so the spread can never be a huge array.
+        lines.unshift(...prevLines.slice(-(linesBack - lines.length)));
+      }
+    }
     const recent = lines.slice(-linesBack);
     if (recent.length > 0) process.stdout.write(`${recent.join("\n")}\n`);
   }

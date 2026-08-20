@@ -182,6 +182,10 @@ export interface SessionDiagnosis {
   repoSlug: string | null;
   attributed: boolean | null;
   destinations: DestinationStanding[];
+  /** This session's unknown-key debt is already moot — a reachable store holds
+   *  the whole transcript. The bytes are NOT counted, so any prose about them
+   *  must not claim otherwise. */
+  strandedUnknown: boolean;
 }
 
 /** A discovered file, narrowed to what classification needs. */
@@ -256,9 +260,14 @@ function hasReachableCompleteCopy(
   state: HxState,
 ): boolean {
   for (const [key, offset] of Object.entries(fs?.offsets ?? {})) {
-    // Only a destination we know AND can reach is proof of safety. An unknown
-    // key is not evidence of a stored copy — it is evidence of nothing.
-    if (destinationStanding(state, key) !== "reachable") continue;
+    // Offline only. An UNKNOWN key is deliberately still counted here: an
+    // offset at or past `size` means setOffsetFor recorded a successful commit
+    // of every byte, and a store that accepted the whole transcript held it
+    // whether or not the registry still names the org. Excluding those raised a
+    // false "only copy is on this device, Claude Code deletes it at 30 days"
+    // alarm — and dropped the percentage to 0 — for sessions that were fully
+    // delivered. A never-written phantom sits at 0 and cannot reach this test.
+    if (isDestinationOfflineKey(state, key)) continue;
     if (offset >= size) return true;
   }
   return false;
@@ -318,6 +327,12 @@ export function reportableOffset(fs: FileState, state: HxState): number {
   // No real destination on record: nothing has been delivered anywhere we know
   // of, which is exactly what offset 0 says.
   return vals.length === 0 ? 0 : Math.min(...vals);
+}
+
+/** Offline in the registry sense — see hasReachableCompleteCopy for why an
+ *  unknown key is NOT lumped in with offline ones. */
+function isDestinationOfflineKey(state: HxState, key: string): boolean {
+  return destinationStanding(state, key) === "offline";
 }
 
 /** Classify one discovered file. `incomplete` is decided elsewhere (the source
@@ -470,6 +485,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
           repoSlug: fs?.repoSlug ?? null,
           attributed: fs?.attributed ?? null,
           destinations: standings,
+          strandedUnknown: c.strandedUnknown,
         });
       }
     }

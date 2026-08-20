@@ -288,6 +288,44 @@ export function classifyUpstreamError(
   return null;
 }
 
+/**
+ * What a failed CHILD-LANE upload means.
+ *
+ * Pure, and exported, so the order of these checks is directly testable. A 409
+ * quarantine that reaches the generic backoff instead of a hold is invisible in
+ * production — `recordFileFailure` without a skipReason means `collectSkipped`
+ * cannot see it, `hx status` says nothing, `hx retry --blocked` cannot release
+ * it, and `clearGenericBackoffs` wipes the streak on every restart. One device
+ * paid 798,704 silent retries for exactly that ordering, on child lanes, which
+ * are the ONLY population a quarantine can affect: a lane is quarantined
+ * precisely when its parent row is missing.
+ *
+ * `latchChildLanePause` is deliberately NOT folded in — it mutates lane state.
+ * The caller consults it between "hold" and "stop", exactly where it sat.
+ */
+export type ChildFailureAction =
+  | { kind: "session-deleted" }
+  | { kind: "hold"; reason: FileSkipReason; blocker?: SyncBlockerDetails }
+  | { kind: "stop" }
+  | { kind: "backoff" };
+
+export function classifyChildFailure(err: unknown): ChildFailureAction {
+  if (err instanceof HxHttpError) {
+    if (err.sessionDeleted) return { kind: "session-deleted" };
+    // Child lanes route through the cloud gateway, never fortress-direct.
+    if (err.vaultOffline) {
+      return {
+        kind: "hold",
+        reason: err.vaultBlockReason ?? "vault_offline",
+        blocker: err.blocker,
+      };
+    }
+    if (err.routingQuarantined) return { kind: "hold", reason: "quarantine" };
+    if (err.serverUnavailable) return { kind: "stop" };
+  }
+  return { kind: "backoff" };
+}
+
 /** Human-readable form of a skip reason for the daemon log. */
 function describeSkip(reason: FileSkipReason): string {
   if (reason === "vault_offline") return "session vault temporarily unavailable";
@@ -2372,7 +2410,8 @@ export async function tickOnce(
         } catch (err) {
           failed += 1;
           log(`  [error] ${c.path}: ${(err as Error).message}`);
-          if (err instanceof HxHttpError && err.sessionDeleted) {
+          const action = classifyChildFailure(err);
+          if (action.kind === "session-deleted") {
             // Parent session permanently deleted server-side — terminal for
             // every lane; record the session stop-flag and stop retrying.
             const family = pendingChild?.family ?? "claude-cli";
@@ -2380,16 +2419,17 @@ export async function tickOnce(
             await clearFileFailure(c.path, scope);
             return;
           }
-          if (err instanceof HxHttpError && err.vaultOffline) {
-            // The child's session vault is offline (child lanes route through the
-            // cloud gateway, never fortress-direct) — skip just this child with
-            // the same short-retries-then-backoff pacing as its parent.
+          if (action.kind === "hold") {
+            // An offline vault, or a routing decision the gateway has not made.
+            // Either way it is not this file's fault: skip just this child with
+            // the same short-retries-then-backoff pacing as its parent, and
+            // stamp the reason so it is visible and releasable.
             await recordFileFailure(
               c.path,
               SESSION_SKIP_RETRY_BASE_MS,
               scope,
-              err.vaultBlockReason ?? "vault_offline",
-              err.blocker,
+              action.reason,
+              action.blocker,
             );
             return;
           }
@@ -2401,7 +2441,7 @@ export async function tickOnce(
             stopChildren = true;
             return;
           }
-          if (err instanceof HxHttpError && err.serverUnavailable) {
+          if (action.kind === "stop") {
             stopChildren = true;
             return;
           }
@@ -2463,10 +2503,21 @@ export async function startWatch(
   log(`[hx] watching data roots: ${describeRoots(resolveDataRoots(await readSettings()))}`);
   log(`[hx] poll interval ${FAST_POLL_MS}ms; gateway ${cfg.gatewayBaseUrl}`);
   void trimActivity(); // cap the UI journal once per daemon lifetime
+  // stdout.log/stderr.log are DEVICE-global, but startWatch runs once per lane
+  // (cli.ts starts main and the `--local` tee concurrently under Promise.all).
+  // Two lanes racing here both pass the size check, then one truncates while
+  // the other is copying — and the "previous generation" is written as an empty
+  // or half-copied file. Same gate the roots stamper uses twelve lines up. A
+  // foreground `hx watch` is excluded for the same reason: on POSIX it writes
+  // to the terminal, so it has no business truncating the installed service's
+  // live log.
+  const ownsDeviceLogs = !opts.oneShot && scopeOf(cfg) === "main";
   // A daemon that has been down for a while may be starting behind an already
   // oversized log; do not wait an hour to bound it.
-  for (const target of await rotateLogsIfLarge()) {
-    log(`[hx] rotated ${path.basename(target)} on start (kept one previous generation)`);
+  if (ownsDeviceLogs) {
+    for (const target of await rotateLogsIfLarge()) {
+      log(`[hx] rotated ${path.basename(target)} on start; previous generation kept at ${target}.1`);
+    }
   }
 
   // Coalesced state persistence is a LONG-RUNNING-LOOP privilege: this loop
@@ -2713,9 +2764,13 @@ export async function startWatch(
   const perfTimer = setInterval(() => {
     // Same cadence as the perf line: an hourly check bounds a log that took
     // months to reach 242 MB, without a stat on every 1.5s pass.
-    void rotateLogsIfLarge().then((rotated) => {
-      for (const target of rotated) log(`[hx] rotated ${path.basename(target)} (kept one previous generation)`);
-    });
+    if (ownsDeviceLogs) {
+      void rotateLogsIfLarge().then((rotated) => {
+        for (const target of rotated) {
+          log(`[hx] rotated ${path.basename(target)}; previous generation kept at ${target}.1`);
+        }
+      });
+    }
     if (perf.passes === 0) return;
     log(formatPerfLine(perf));
     perf.passes = 0;

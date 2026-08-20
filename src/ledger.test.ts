@@ -613,3 +613,50 @@ describe("reportableOffset", () => {
     assert.equal(reportableOffset(fs({}), registered()), 0);
   });
 });
+
+// A destination the registry no longer names can still HOLD the transcript:
+// an offset at or past the file size is a recorded successful commit. Treating
+// those as "no copy anywhere" raised the data-loss alarm — "the only whole
+// transcript is the local file, Claude Code deletes it at 30 days" — and drove
+// the percentage to 0, for sessions that were fully delivered.
+describe("a complete copy at an unregistered destination", () => {
+  const build = (offsets: Record<string, number>) => {
+    const state: HxState = { files: { a: entry("a", offsets) } };
+    applyDestinationReports(
+      state,
+      [{ vaultOrgId: null, status: "ready" }, { vaultOrgId: "orgOffline", status: "held" }],
+      NOW - DAY,
+    );
+    return buildLedger({
+      files: [file("a", 1000)],
+      state,
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+  };
+
+  it("does not raise the at-risk alarm when an unregistered store holds it all", () => {
+    const l = build({ orgFortress: 1000, orgOffline: 500 });
+    assert.equal(l.waiting, 1);
+    assert.equal(l.waitingUnprotected, 0);
+    assert.equal(l.percent, 100);
+  });
+
+  it("still raises it when nothing anywhere holds the whole transcript", () => {
+    // Same bucket, opposite stakes: only an offline store is owed, and no store
+    // has ever taken the whole file, so the local jsonl really is the sole copy.
+    const l = build({ orgOffline: 500 });
+    assert.equal(l.waiting, 1);
+    assert.equal(l.waitingUnprotected, 1);
+  });
+
+  it("counts a session partly written to an unregistered store as backlog", () => {
+    // 900 of 1000 committed somewhere unregistered is not a complete copy, so
+    // the session must not read as delivered — the next append-url replaces the
+    // dead key with a real destination and sends the file.
+    const l = build({ orgFortress: 900, orgOffline: 500 });
+    assert.equal(l.delivered, 0);
+    assert.equal(l.uploading, 1);
+    assert.notEqual(l.percent, 100);
+  });
+});

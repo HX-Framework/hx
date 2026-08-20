@@ -92,7 +92,8 @@
             "owed": 20000,
             "state": "offline"
           }
-        ]
+        ],
+        "strandedUnknown": false
       },
       {
         "sessionId": "s3",
@@ -123,7 +124,8 @@
             "owed": 20000,
             "state": "offline"
           }
-        ]
+        ],
+        "strandedUnknown": false
       },
       {
         "sessionId": "s4",
@@ -147,7 +149,8 @@
             "owed": 1000,
             "state": "reachable"
           }
-        ]
+        ],
+        "strandedUnknown": false
       }
     ],
     "stranded": [],

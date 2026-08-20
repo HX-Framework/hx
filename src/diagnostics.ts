@@ -358,7 +358,11 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
         // bytes to a store it has no record of, so nothing will ever drain it.
         const note =
           dest.state === "unknown"
-            ? "  <-- NOT KNOWN to this device; nothing will ever send here"
+            ? d.strandedUnknown
+              // Already safe elsewhere: say so, or the same report tells the
+              // reader both that these bytes are counted and that they are not.
+              ? "  <-- NOT KNOWN to this device; dead key, bytes already delivered"
+              : "  <-- NOT KNOWN to this device; nothing will ever send here"
             : dest.state === "offline"
               ? "  (offline)"
               : "";
@@ -369,7 +373,15 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
     }
     const rest = ledger.notDelivered.length - MAX_LISTED_SESSIONS;
     if (rest > 0) lines.push(`  …and ${rest} more (see --json)`);
-    if (ledger.notDelivered.some((d) => d.destinations.some((x) => x.state === "unknown" && x.owed > 0))) {
+    // Only for sessions whose unknown debt is ACTUALLY counted. A `waiting` or
+    // `live` session can carry a dead key while a reachable store already holds
+    // every byte; claiming those are counted contradicts the DEAD DESTINATION
+    // KEYS section printed directly below.
+    if (
+      ledger.notDelivered.some(
+        (d) => !d.strandedUnknown && d.destinations.some((x) => x.state === "unknown" && x.owed > 0),
+      )
+    ) {
       lines.push("");
       lines.push("  A destination marked NOT KNOWN was advertised to this device once and");
       lines.push("  never registered. These bytes ARE still counted, because no store this");

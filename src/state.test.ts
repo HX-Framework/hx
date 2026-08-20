@@ -196,6 +196,46 @@ describe("pruneStrandedOffsetsFrom", () => {
     assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 0, files: 0 });
   });
 
+  it("NEVER drops a key that has been written to, however unknown", () => {
+    // A non-zero offset is proof the destination accepted bytes: setOffsetFor
+    // records only after a successful commit. The registry is not reliably
+    // complete — seedDestinationsFromBlockers seeds HELD destinations only, so
+    // a first run after upgrade can name one offline Fortress and nothing else,
+    // making every healthy destination look unknown. Without this guard, a
+    // session fully delivered to a real Fortress and since pruned from disk
+    // would have its proof of delivery erased and come back as a fabricated
+    // gap in `hx doctor sync`.
+    const state = stateWith({ letai: 1000, orgReal: 1000 }, registry);
+    const r = pruneStrandedOffsetsFrom(state, () => false);
+    assert.deepEqual(r, { keys: 0, files: 0 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgReal: 1000 });
+  });
+
+  it("drops a zero-offset key while keeping a written one on the same file", () => {
+    const state = stateWith({ letai: 1000, orgReal: 400, phantom: 0 }, registry);
+    const r = pruneStrandedOffsetsFrom(state, () => false);
+    assert.deepEqual(r, { keys: 1, files: 1 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgReal: 400 });
+  });
+
+  it("survives a registry seeded from blockers alone (held-only)", () => {
+    // The realistic post-upgrade shape: the registry names the offline org and
+    // nothing else, so a delivered Fortress reads as unknown.
+    const heldOnly: HxState["destinations"] = {
+      orgHeld: {
+        vaultOrgId: "orgHeld",
+        status: "held",
+        orgName: null,
+        orgSlug: null,
+        lastSeenAt: null,
+        observedAtMs: 0,
+      },
+    };
+    const state = stateWith({ letai: 1000, orgDelivered: 1000 }, heldOnly);
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 0, files: 0 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgDelivered: 1000 });
+  });
+
   it("does nothing at all when no registry has ever been recorded", () => {
     // "we have never seen a destination" must not read as "every destination
     // is dead" — that would wipe real offsets on an old state file.
