@@ -511,29 +511,33 @@ describe("notDelivered diagnosis", () => {
     assert.equal(l.stranded[0]!.bytes, 1000);
   });
 
-  it("bills an unknown destination that is the ONLY key on the file", () => {
-    // reachable === 0 with no complete copy is reachable only when the offsets
-    // map holds no real destination at all — the branch a partially-delivered
-    // letai key never reaches. The session is genuinely nowhere, so it must
-    // read as backlog; the next append-url adds letai and drops the dead key.
+  it("bills a file whose ONLY key is a phantom to the primary", () => {
+    // Nothing real has ever been told about this file, which is the same
+    // situation as no offsets at all — so it is whole-file backlog, billed to
+    // the primary. Billing it to the phantom instead put the bytes in a bucket
+    // nothing drains and no field reported.
     const l = build({ orgX: 0 }, false);
     assert.equal(l.uploading, 1);
     assert.equal(l.uploadingBytes, 1000);
-    assert.equal(l.stranded.length, 0);
     assert.equal(l.percent, 0);
+    // And the dead key is still named.
+    assert.equal(l.stranded.length, 1);
+    assert.equal(l.stranded[0]!.key, "orgX");
   });
 
-  it("DOES bill an unknown destination when no reachable store has the bytes", () => {
-    // The safety case: unknown is only inert because a store we can reach
-    // already holds the whole session. Without that, the session is genuinely
-    // undelivered and must stay backlog — the next append-url sends it and
-    // prunes the dead key.
+  it("counts only the REAL debt when a phantom sits beside a live destination", () => {
+    // letai is 600 short; orgX is a phantom owed nothing real. The headline and
+    // the per-session line must agree on 600 — asserting only `uploading === 1`
+    // here let 1000 phantom bytes leak into the per-session total while the
+    // headline said 600, and the test name claimed to check exactly that.
     const l = build({ letai: 400, orgX: 0 }, false);
     assert.equal(l.uploading, 1);
-    assert.equal(l.stranded.length, 0);
+    assert.equal(l.uploadingBytes, 600);
+    assert.equal(l.notDelivered[0]!.owedBytes, 600);
+    // Named, not counted.
+    assert.equal(l.stranded.length, 1);
     const orgX = l.notDelivered[0]!.destinations.find((x) => x.key === "orgX")!;
     assert.equal(orgX.state, "unknown");
-    assert.equal(orgX.owed, 1000);
   });
 
   it("marks a registered held destination as offline, not unknown", () => {
@@ -749,5 +753,71 @@ describe("proof of a destination is per-destination, not per-file", () => {
     const l = twoFiles({ letai: 1000, orgX: 500 }, { letai: 1000, orgX: 0 });
     const d = l.notDelivered.find((x) => x.sessionId === "a")!;
     assert.equal(d.destinations.find((x) => x.key === "orgX")!.state, "unregistered");
+  });
+});
+
+// The invariant the erasures kept breaking: every byte a session still owes
+// must land in exactly one reported field, and the per-session detail must add
+// up to the headline. Both were false in three different ways across review.
+describe("ledger accounting invariant", () => {
+  const check = (offsets: Record<string, number>, destinations: HxState["destinations"]) => {
+    const state: HxState = { files: { a: entry("a", offsets) }, destinations };
+    const l = buildLedger({
+      files: [file("a", 1000)],
+      state,
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    const perSession = l.notDelivered.reduce((n, d) => n + d.owedBytes, 0);
+    return { l, perSession };
+  };
+  const reg: HxState["destinations"] = {
+    letai: { vaultOrgId: null, status: "ready", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+    orgHeld: { vaultOrgId: "orgHeld", status: "held", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+  };
+
+  it("per-session detail sums to the headline backlog", () => {
+    const { l, perSession } = check({ letai: 400, phantom: 0 }, reg);
+    assert.equal(perSession, l.uploadingBytes);
+  });
+
+  it("a phantom is named exactly once and counted zero times", () => {
+    const { l } = check({ letai: 1000, phantom: 0 }, reg);
+    assert.equal(l.uploadingBytes, 0);
+    assert.equal(l.waitingBytes, 0);
+    assert.equal(l.stranded.length, 1);
+  });
+
+  it("an offline store's debt is waiting, never uploading", () => {
+    const { l } = check({ letai: 1000, orgHeld: 200 }, reg);
+    assert.equal(l.uploadingBytes, 0);
+    assert.equal(l.waitingBytes, 800);
+  });
+
+  it("a complete copy at an OFFLINE store still reads delivered", () => {
+    // Its bytes are committed; snapshotFrom agrees, and the two surfaces must
+    // not disagree about the same session.
+    const { l } = check({ orgHeld: 1000, phantom: 0 }, reg);
+    assert.equal(l.delivered, 1);
+    assert.equal(l.percent, 100);
+  });
+});
+
+// The ledger and the pruner must agree on every state, including the degenerate
+// one. pruneStrandedOffsets bails when no registry has ever been recorded;
+// without the same guard here, the ledger called every real destination on a
+// pre-registry state file a dead key while the pruner refused to touch it.
+describe("a state file with no registry at all", () => {
+  it("treats nothing as a phantom", () => {
+    const state: HxState = { files: { a: entry("a", { letai: 1000, orgReal: 0 }) } };
+    const l = buildLedger({
+      files: [file("a", 1000)],
+      state,
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    assert.deepEqual(l.stranded, []);
+    assert.equal(l.uploadingBytes, 1000);
+    assert.equal(l.percent, 0);
   });
 });

@@ -293,19 +293,28 @@ function lagOf(
   const offsets = fs?.offsets ?? {};
   const keys = Object.keys(offsets);
   if (keys.length === 0) return { reachable: size, offline, unknown };
+  let sawRealDestination = false;
   for (const key of keys) {
+    if (isPhantomKey(state, key, offsets[key] ?? 0, everWritten)) {
+      const pending = size - (offsets[key] ?? 0);
+      if (pending > 0) unknown.set(key, pending);
+      continue;
+    }
+    // Counted even when fully satisfied: what matters below is whether ANY real
+    // destination is on record, not whether it still owes.
+    sawRealDestination = true;
     const pending = size - (offsets[key] ?? 0);
     if (pending <= 0) continue;
-    if (isPhantomKey(state, key, offsets[key] ?? 0, everWritten)) {
-      unknown.set(key, pending);
-    } else if (isDestinationOfflineKey(state, key)) {
-      offline.set(key, pending);
-    } else {
-      // Reachable, or unknown-but-proven: a store that has taken bytes from
-      // this file is owed the rest of them whatever the registry currently says.
-      reachable += pending;
-    }
+    if (isDestinationOfflineKey(state, key)) offline.set(key, pending);
+    // Reachable, or unregistered-but-proven: a store that has taken bytes from
+    // this file is owed the rest of them whatever the registry currently says.
+    else reachable += pending;
   }
+  // Every key on this file is a phantom, so nothing real has ever been told
+  // about it. That is the same situation as no offsets at all, and gets the
+  // same answer: bill the whole file to the primary. Billing it to the phantom
+  // instead put the bytes in a bucket nothing drains and no field reported.
+  if (!sawRealDestination) return { reachable: size, offline, unknown };
   return { reachable, offline, unknown };
 }
 
@@ -374,6 +383,11 @@ export function isPhantomKey(
   everWritten: ReadonlySet<string>,
 ): boolean {
   if (offset > 0) return false;
+  // No registry has ever been recorded — the same guard pruneStrandedOffsets
+  // applies before deleting anything. Without it the two rules disagreed on a
+  // pre-registry state file: the ledger called every real destination a dead
+  // key while the pruner deliberately refused to touch it.
+  if (state.destinations === undefined) return false;
   // Proof is per-DESTINATION, not per-file. A store that took bytes from ANY
   // session exists, so this file sitting at 0 for it means unsent, not dead.
   // Applying the offset test per file wrote off 39 MB owed to a live Fortress
@@ -422,7 +436,11 @@ export function classifyFile(
   const { reachable, offline, unknown } = lagOf(fs, file.size, state, everWritten);
   const complete = hasReachableCompleteCopy(fs, file.size, state);
   const unprotected = offline.size > 0 && !complete;
-  const strandedUnknown = unknown.size > 0 && complete;
+  // Not conditioned on `complete`: a phantom is dead because the destination
+  // does not exist, not because the bytes happen to be safe somewhere else.
+  // Requiring completeness meant a session that still owed a real store never
+  // reported its dead key at all.
+  const strandedUnknown = unknown.size > 0;
   // Live tail first, and unconditionally: see LIVE_WINDOW_MS. A session still
   // being written on this device is never a backlog and never a fault,
   // whatever it still owes.
@@ -438,21 +456,6 @@ export function classifyFile(
   }
   if (reachable > 0) {
     return { state: "uploading", reachableBytes: reachable, offline, unknown, unprotected, strandedUnknown };
-  }
-  // Bytes owed ONLY to an unknown destination are not backlog: nothing will
-  // ever write there, so counting them pins the percentage below 100 forever
-  // for a debt no action can settle. They ARE a real fault when no destination
-  // we can reach holds the whole file — that session is genuinely undelivered,
-  // and the next append-url both sends it and prunes the dead key.
-  if (unknown.size > 0 && !complete) {
-    return {
-      state: "uploading",
-      reachableBytes: Math.max(...unknown.values()),
-      offline,
-      unknown,
-      unprotected,
-      strandedUnknown,
-    };
   }
   if (offline.size > 0) {
     return { state: "waiting", reachableBytes: 0, offline, unknown, unprotected, strandedUnknown };
@@ -546,7 +549,12 @@ export function buildLedger(input: LedgerInput): SyncLedger {
           path: file.path,
           bucket: c.state,
           sizeBytes: file.size,
-          owedBytes: standings.reduce((n, d) => n + d.owed, 0),
+          // Phantom debt excluded, because no total anywhere counts it. Summing
+          // it here made the per-session line disagree with the headline it
+          // sits under — 1.6 KB owed against 600 B of backlog for the same
+          // session. The dead key still gets its own line below, and its own
+          // section.
+          owedBytes: standings.reduce((n, d) => n + (d.state === "unknown" ? 0 : d.owed), 0),
           ageDays: Math.floor((nowMs - file.mtimeMs) / 86_400_000),
           lastUploadAt: fs?.lastUploadAtMs ? new Date(fs.lastUploadAtMs).toISOString() : null,
           skipReason: fs?.skipReason ?? null,

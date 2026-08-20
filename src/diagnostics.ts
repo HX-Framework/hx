@@ -378,21 +378,6 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
     }
     const rest = ledger.notDelivered.length - MAX_LISTED_SESSIONS;
     if (rest > 0) lines.push(`  …and ${rest} more (see --json)`);
-    // Only for sessions whose unknown debt is ACTUALLY counted. A `waiting` or
-    // `live` session can carry a dead key while a reachable store already holds
-    // every byte; claiming those are counted contradicts the DEAD DESTINATION
-    // KEYS section printed directly below.
-    if (
-      ledger.notDelivered.some(
-        (d) => !d.strandedUnknown && d.destinations.some((x) => x.state === "unknown" && x.owed > 0),
-      )
-    ) {
-      lines.push("");
-      lines.push("  A destination marked NOT KNOWN was advertised to this device once and");
-      lines.push("  never registered. These bytes ARE still counted, because no store this");
-      lines.push("  device can reach holds the whole session yet — the next upload sends");
-      lines.push("  them to the primary and drops the dead key.");
-    }
   }
   if (ledger.stranded.length > 0) {
     lines.push("");
