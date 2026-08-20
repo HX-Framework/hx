@@ -45,6 +45,9 @@ export function DeviceDetail() {
   const doctor = snap?.doctor;
   const waiting = Math.max(0, (snap?.sync.total ?? 0) - (snap?.sync.done ?? 0));
   const q = probeLine(probe, probing);
+  // Held lanes are invisible to every session-derived number on this panel:
+  // discovery never walks the child-lane tree.
+  const heldLanes = doctor?.childLanes?.held ?? 0;
   const nextRetry = doctor?.blockers.map((b) => (b.nextRetryAt ? Date.parse(b.nextRetryAt) : 0)).filter((t) => t > 0).sort()[0];
 
   const copyDiagnostics = () => {
@@ -140,7 +143,11 @@ export function DeviceDetail() {
             <span><span className="v" id="lpV">{fmtRelative(snap?.sync.lastUploadAtMs ?? 0)}</span><div className="vs">most recent successful upload from this device</div></span>
             <button className="btn ghost sm" id="tickBtn" disabled={engBusy || !running} onClick={() => engAction("restart")}>Sync now</button>
           </div>
-          <div className="frw"><span className="k">Queue</span><span><span className="v">{waiting > 0 ? plural(waiting, "session") : "Empty"}</span><div className="vs">{waiting > 0 ? "waiting to upload on the next pass" : "fully caught up"}</div></span></div>
+          {/* "fully caught up" is a claim about the device, and `waiting` counts
+              SESSIONS only — a held agent lane is invisible to it. Unqualified,
+              this row said "Empty / fully caught up" in the same panel as
+              "Catching up" and "1 lane held". */}
+          <div className="frw"><span className="k">Queue</span><span><span className="v">{waiting > 0 ? plural(waiting, "session") : heldLanes > 0 ? plural(heldLanes, "lane") : "Empty"}</span><div className="vs">{waiting > 0 ? "waiting to upload on the next pass" : heldLanes > 0 ? "agent lanes held — release with hx retry --blocked" : "fully caught up"}</div></span></div>
           <div className="frw"><span className="k">Backoff</span><span><span className="v">{nextRetry ? `next retry ${fmtClock(nextRetry)}` : "None"}</span></span></div>
           <div className="frw"><span className="k">Cadence</span><span><span className="v">Every 1.5 seconds</span><div className="vs">file changes are noticed by polling</div></span></div>
         </div>
@@ -219,7 +226,10 @@ export function DeviceDetail() {
               ))}
             </div>
           )}
-          {doctor && doctor.blockers.length > 0 && (
+          {/* Held lanes are releasable by exactly this button, and blockers
+              contains parent sessions only — so the panel told the user to run
+              `hx retry --blocked` and then withheld the control that runs it. */}
+          {doctor && (doctor.blockers.length > 0 || (doctor.childLanes?.held ?? 0) > 0) && (
             <>
               {/* A quarantine has no destination to bring online and no
                   repository to move — the gateway has simply not chosen where

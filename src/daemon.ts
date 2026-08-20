@@ -1095,6 +1095,11 @@ let rotationInFlight: Promise<string[]> | null = null;
 export async function rotateLogsIfLarge(
   maxBytes: number = LOG_MAX_BYTES,
   targets: readonly string[] = [STDOUT_LOG, STDERR_LOG],
+  /** Where the mutual-exclusion lock lives. Injectable for the same reason
+   *  `targets` is: tests must not touch the real ~/.let/hx, which holds
+   *  state.json and config.json for whatever daemon is running on the machine
+   *  executing the suite. */
+  lockDir: string = HX_DIR,
 ): Promise<string[]> {
   // These paths are DEVICE-global while callers are per-lane and in the same
   // process (cli.ts runs the main and `--local` watchers concurrently). Two
@@ -1103,7 +1108,7 @@ export async function rotateLogsIfLarge(
   // half-written, destroying the history this exists to preserve. Callers are
   // gated too; this makes the function safe on its own terms.
   if (rotationInFlight) return rotationInFlight;
-  rotationInFlight = rotateGuarded(maxBytes, targets).finally(() => {
+  rotationInFlight = rotateGuarded(maxBytes, targets, lockDir).finally(() => {
     rotationInFlight = null;
   });
   return rotationInFlight;
@@ -1128,8 +1133,12 @@ const ROTATE_LOCK_STALE_MS = 5 * 60_000;
  *
  * O_EXCL create is the check — an exists-then-create leaves the same window.
  */
-async function rotateGuarded(maxBytes: number, targets: readonly string[]): Promise<string[]> {
-  const lock = join(HX_DIR, "rotate.lock");
+async function rotateGuarded(
+  maxBytes: number,
+  targets: readonly string[],
+  lockDir: string,
+): Promise<string[]> {
+  const lock = join(lockDir, "rotate.lock");
   let held: ReturnType<typeof statSync> | undefined;
   try {
     await writeFile(lock, String(process.pid), { flag: "wx", mode: 0o600 });

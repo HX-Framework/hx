@@ -172,7 +172,7 @@ export function Overview() {
           <h2>Right Now</h2>
           <div className="facts">
             <div className="frw"><span className="k">Mirror</span><span><span className="v">{daemon ? (daemon.loaded && daemon.pid ? "Running" : "Stopped") : "…"}</span><div className="vs">{daemon?.pid ? `${daemon.managerName} · pid ${daemon.pid}` : daemon?.managerName ?? ""}</div></span></div>
-            <div className="frw"><span className="k">Still syncing</span><span><span className="v">{inFlight > 0 ? plural(inFlight, "session") : "nothing"}</span><div className="vs">{inFlight > 0 ? (held > 0 ? `${held} held on an offline store` : "finishing on the next pass") : "fully caught up"}</div></span></div>
+            <div className="frw"><span className="k">Still syncing</span><span><span className="v">{inFlight > 0 ? plural(inFlight, "session") : heldLanes > 0 ? plural(heldLanes, "agent lane") : "nothing"}</span><div className="vs">{inFlight > 0 ? (held > 0 ? `${held} held on an offline store` : "finishing on the next pass") : heldLanes > 0 ? "held — not retrying until released" : "fully caught up"}</div></span></div>
             <div className="frw"><span className="k">Last upload</span><span><span className="v">{fmtRelative(snap?.sync.lastUploadAtMs ?? 0)}</span></span></div>
             <div className="frw"><span className="k">What’s uploaded</span><span><span className="v"><a href="#" onClick={(e) => { e.preventDefault(); goto("privacy"); }}>See what leaves this machine</a></span></span></div>
           </div>

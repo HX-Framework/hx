@@ -117,7 +117,7 @@ export function SyncStatus() {
         </div>
       )}
 
-      {doctor && doctor.blockers.length > 0 && (
+      {doctor && (doctor.blockers.length > 0 || (doctor.childLanes?.held ?? 0) > 0) && (
         <div className="panel">
           <h2>Held Right Now</h2>
           <div className="h2sub">Destinations that can’t take uploads at the moment — nothing is lost; queued sessions send on reconnect.</div>

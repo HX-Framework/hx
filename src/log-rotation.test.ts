@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, openSync, writeSync, closeSync, statSync, fstatSync, existsSync, utimesSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rotateLogsIfLarge, seedBacklogLines, HX_DIR } from "./daemon.js";
+import { rotateLogsIfLarge, seedBacklogLines } from "./daemon.js";
 
 let dir = "";
 const make = (): string => {
@@ -28,14 +28,14 @@ describe("rotateLogsIfLarge", () => {
   it("leaves a log under the cap untouched", async () => {
     const p = make();
     writeFileSync(p, "small\n");
-    assert.deepEqual(await rotateLogsIfLarge(1024, [p]), []);
+    assert.deepEqual(await rotateLogsIfLarge(1024, [p], dir), []);
     assert.equal(readFileSync(p, "utf8"), "small\n");
   });
 
   it("copies to .1 and truncates in place once over the cap", async () => {
     const p = make();
     writeFileSync(p, "x".repeat(2048));
-    assert.deepEqual(await rotateLogsIfLarge(1024, [p]), [p]);
+    assert.deepEqual(await rotateLogsIfLarge(1024, [p], dir), [p]);
     assert.equal(statSync(p).size, 0);
     assert.equal(readFileSync(`${p}.1`, "utf8").length, 2048);
   });
@@ -44,7 +44,7 @@ describe("rotateLogsIfLarge", () => {
     const p = make();
     writeFileSync(p, "y".repeat(2048));
     const before = statSync(p).ino;
-    await rotateLogsIfLarge(1024, [p]);
+    await rotateLogsIfLarge(1024, [p], dir);
     assert.equal(statSync(p).ino, before);
   });
 
@@ -56,7 +56,7 @@ describe("rotateLogsIfLarge", () => {
     const fd = openSync(p, "a");
     try {
       writeSync(fd, "z".repeat(2048));
-      await rotateLogsIfLarge(1024, [p]);
+      await rotateLogsIfLarge(1024, [p], dir);
       writeSync(fd, "after\n");
       // Asserted through the DESCRIPTOR rather than the path: the file it still
       // points at being exactly 6 bytes is the proof. The write landed at
@@ -71,15 +71,15 @@ describe("rotateLogsIfLarge", () => {
   it("keeps only one previous generation", async () => {
     const p = make();
     writeFileSync(p, "a".repeat(2048));
-    await rotateLogsIfLarge(1024, [p]);
+    await rotateLogsIfLarge(1024, [p], dir);
     appendFileSync(p, "b".repeat(2048));
-    await rotateLogsIfLarge(1024, [p]);
+    await rotateLogsIfLarge(1024, [p], dir);
     assert.equal(readFileSync(`${p}.1`, "utf8"), "b".repeat(2048));
   });
 
   it("never throws on a missing log", async () => {
     const p = make();
-    assert.deepEqual(await rotateLogsIfLarge(1024, [join(dir, "absent.log")]), []);
+    assert.deepEqual(await rotateLogsIfLarge(1024, [join(dir, "absent.log")], dir), []);
     assert.ok(p);
   });
 });
@@ -94,8 +94,8 @@ describe("rotateLogsIfLarge under concurrent callers", () => {
     const p = make();
     writeFileSync(p, "q".repeat(4096));
     const [a, b] = await Promise.all([
-      rotateLogsIfLarge(1024, [p]),
-      rotateLogsIfLarge(1024, [p]),
+      rotateLogsIfLarge(1024, [p], dir),
+      rotateLogsIfLarge(1024, [p], dir),
     ]);
     // Whatever the interleaving, the kept generation must be the real history.
     assert.equal(readFileSync(`${p}.1`, "utf8").length, 4096);
@@ -163,17 +163,25 @@ describe("seedBacklogLines at scale", () => {
 // on to copy a file being emptied underneath it, then renames that short copy
 // over the complete generation. Measured on a 600 MB log: 375 MB survived.
 describe("rotateLogsIfLarge cross-process lock", () => {
-  const lockPath = (): string => join(HX_DIR, "rotate.lock");
+  // dir, not HX_DIR: the real one holds state.json and config.json for the
+  // daemon running on whatever machine executes this suite, and one of these
+  // tests chmods it to 000.
+  const lockPath = (): string => join(dir, "rotate.lock");
 
   it("stands down while another process holds the lock", async () => {
     const p = make();
     writeFileSync(p, "z".repeat(4096));
     writeFileSync(lockPath(), "99999");
     try {
-      assert.deepEqual(await rotateLogsIfLarge(1024, [p]), []);
+      assert.deepEqual(await rotateLogsIfLarge(1024, [p], dir), []);
       // Untouched: no truncate, no generation written.
       assert.equal(statSync(p).size, 4096);
       assert.equal(existsSync(`${p}.1`), false);
+      // And the LIVE lock must survive. Asserting only the return value let a
+      // missing freshness check pass: without it every process breaks a live
+      // lock on sight, which re-opens the concurrent-rotation history loss the
+      // lock exists to prevent.
+      assert.equal(existsSync(lockPath()), true, "a live lock must not be broken");
     } finally {
       rmSync(lockPath(), { force: true });
     }
@@ -194,7 +202,7 @@ describe("rotateLogsIfLarge cross-process lock", () => {
     const old = Date.now() / 1000 - 3600;
     utimesSync(lockPath(), old, old);
     try {
-      assert.deepEqual(await rotateLogsIfLarge(1024, [p]), []);
+      assert.deepEqual(await rotateLogsIfLarge(1024, [p], dir), []);
       assert.equal(statSync(p).size, 4096, "the log must be untouched this round");
       assert.equal(existsSync(lockPath()), false, "the stale lock must be gone");
     } finally {
@@ -209,8 +217,8 @@ describe("rotateLogsIfLarge cross-process lock", () => {
     const old = Date.now() / 1000 - 3600;
     utimesSync(lockPath(), old, old);
     try {
-      await rotateLogsIfLarge(1024, [p]);
-      assert.deepEqual(await rotateLogsIfLarge(1024, [p]), [p]);
+      await rotateLogsIfLarge(1024, [p], dir);
+      assert.deepEqual(await rotateLogsIfLarge(1024, [p], dir), [p]);
       assert.equal(statSync(p).size, 0);
       assert.equal(readFileSync(`${p}.1`, "utf8").length, 4096);
     } finally {
@@ -225,11 +233,11 @@ describe("rotateLogsIfLarge cross-process lock", () => {
     const p = make();
     writeFileSync(p, "z".repeat(4096));
     writeFileSync(lockPath(), "99999");
-    chmodSync(HX_DIR, 0o000);
+    chmodSync(dir, 0o000);
     try {
-      assert.deepEqual(await rotateLogsIfLarge(1024, [p]), []);
+      assert.deepEqual(await rotateLogsIfLarge(1024, [p], dir), []);
     } finally {
-      chmodSync(HX_DIR, 0o755);
+      chmodSync(dir, 0o755);
       rmSync(lockPath(), { force: true });
     }
   });
@@ -237,12 +245,12 @@ describe("rotateLogsIfLarge cross-process lock", () => {
   it("releases the lock when it is done", async () => {
     const p = make();
     writeFileSync(p, "z".repeat(4096));
-    await rotateLogsIfLarge(1024, [p]);
+    await rotateLogsIfLarge(1024, [p], dir);
     assert.equal(existsSync(lockPath()), false);
   });
 
   it("releases the lock even when every target fails", async () => {
-    await rotateLogsIfLarge(1024, [join(dir, "absent.log")]);
+    await rotateLogsIfLarge(1024, [join(dir, "absent.log")], dir);
     assert.equal(existsSync(lockPath()), false);
   });
 });

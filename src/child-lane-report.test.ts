@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeSyncReport, formatWait, isChildLane, snapshotFrom } from "./watch.js";
+import { computeSyncReport, formatWait, isChildLane, logStuck, snapshotFrom } from "./watch.js";
 import {
   loadState,
   pruneStrandedOffsets,
@@ -420,5 +420,58 @@ describe("isChildLane across platforms", () => {
   it("does not mistake a session transcript for a lane", () => {
     assert.equal(isChildLane("/home/u/.claude/projects/-p/sess.jsonl", "linux"), false);
     assert.equal(isChildLane("C:\\Users\\u\\.claude\\projects\\-p\\sess.jsonl", "win32"), false);
+  });
+});
+
+// stuckLogKey is unit-tested; logStuck's USE of it was not. Reverting the cache
+// to key on the rendered message left the whole suite green while restoring the
+// flood: the message carries a countdown, so it changes every 1.5s tick and the
+// 30-minute suppression matches nothing.
+describe("logStuck suppresses on the key, not the message", () => {
+  const lines: string[] = [];
+  const log = (m: string): void => void lines.push(m);
+  beforeEach(() => {
+    lines.length = 0;
+  });
+
+  it("stays quiet while the condition holds, however the message moves", () => {
+    logStuck("/a.jsonl", "backoff:3:quarantine", "waiting 40s", log);
+    logStuck("/a.jsonl", "backoff:3:quarantine", "waiting 38s", log);
+    logStuck("/a.jsonl", "backoff:3:quarantine", "waiting 36s", log);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0]!, /waiting 40s/);
+  });
+
+  it("speaks up the moment the CONDITION changes", () => {
+    // The transition is the interesting part, so a new key reports at once.
+    logStuck("/a.jsonl", "bench:-", "benched for 20s", log);
+    logStuck("/a.jsonl", "backoff:1:quarantine", "backoff 20s", log);
+    assert.equal(lines.length, 2);
+  });
+
+  it("tracks files independently", () => {
+    logStuck("/a.jsonl", "bench:-", "a", log);
+    logStuck("/b.jsonl", "bench:-", "b", log);
+    assert.equal(lines.length, 2);
+  });
+});
+
+// heldReasons is a breakdown printed beside a total, so it has to accumulate:
+// with `= 1` the total said 3 while the itemisation summed to 2.
+describe("heldReasons itemises the held total", () => {
+  it("counts every lane of the same reason", async () => {
+    for (const n of ["a", "b", "c"]) {
+      const p = lanePath(`agent-${n}.jsonl`);
+      writeFileSync(p, "y".repeat(100));
+      await upsertFileState(laneState(p, { letai: 0 }, n === "c" ? "vault_offline" : "quarantine"));
+    }
+    const c = await report();
+    assert.equal(c.held, 3);
+    assert.deepEqual(c.heldReasons, { quarantine: 2, vault_offline: 1 });
+    // The breakdown must sum to the total it sits beside.
+    assert.equal(
+      Object.values(c.heldReasons).reduce((n, v) => n + v, 0),
+      c.held,
+    );
   });
 });

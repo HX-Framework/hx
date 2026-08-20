@@ -237,7 +237,7 @@ export function stuckLogKey(pending: {
   return `${failures === undefined ? "bench" : `backoff:${failures}`}:${pending.skipReason ?? "-"}`;
 }
 
-function logStuck(
+export function logStuck(
   path: string,
   /** STABLE identity of the condition — never the countdown, the byte counts or
    *  anything else that moves while the condition holds. Suppression compares
