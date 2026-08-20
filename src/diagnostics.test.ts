@@ -212,6 +212,21 @@ describe("held child lanes are reported", () => {
     assert.doesNotMatch(text, /hx retry --blocked/);
   });
 
+  it("never claims 'all delivered' while lanes are held", () => {
+    // childLanes.owing is computed from the file on disk; a held lane can be
+    // fully uploaded and still carry a stale skipReason, so owing can be 0 with
+    // held > 0. The report printed "all delivered" directly above "706 of them
+    // are HELD" for exactly that shape.
+    const r = withHeldLanes();
+    r.childLanes = { ...r.childLanes, owing: 0, owedBytes: 0 };
+    const text = formatSyncDoctorText(
+      buildSyncDoctorReport(r, "https://let.ai/_api/hx-gateway", 0),
+    );
+    assert.doesNotMatch(text, /all delivered/);
+    assert.match(text, /81 held/);
+    assert.match(text, /are HELD/);
+  });
+
   it("says how to release them", () => {
     const text = formatSyncDoctorText(
       buildSyncDoctorReport(withHeldLanes(), "https://let.ai/_api/hx-gateway", 0),

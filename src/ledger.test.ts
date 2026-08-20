@@ -877,6 +877,38 @@ describe("accounting invariants", () => {
     });
   }
 
+  it("does not list a LIVE session as owing when only a phantom is unpaid", () => {
+    // The bucket the shapes above never reach: classifyFile tests the live
+    // window first, so a session touched in the last 15 minutes with every real
+    // destination satisfied is `live`, not `delivered` — and the admission gate
+    // counted the phantom's owed bytes while owedBytes excluded them, so it was
+    // listed under "SESSIONS STILL OWING BYTES" saying it owed 0. On a device
+    // carrying dead keys that is the most ordinary state there is.
+    const state: HxState = { files: { a: entry("a", { letai: 1000, phantom: 0 }) }, destinations: reg };
+    const l = buildLedger({
+      files: [{ path: "a", size: 1000, mtimeMs: NOW - 60_000 }],
+      state,
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    assert.equal(l.live, 1);
+    assert.deepEqual(l.notDelivered, []);
+    // Still named, so it is not silent.
+    assert.equal(l.stranded.length, 1);
+  });
+
+  it("still lists a LIVE session that owes a REAL destination", () => {
+    const state: HxState = { files: { a: entry("a", { letai: 400, phantom: 0 }) }, destinations: reg };
+    const l = buildLedger({
+      files: [{ path: "a", size: 1000, mtimeMs: NOW - 60_000 }],
+      state,
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    assert.equal(l.notDelivered.length, 1);
+    assert.equal(l.notDelivered[0]!.owedBytes, 600);
+  });
+
   it("detail matches the headline when nothing is offline", () => {
     const noOffline: Record<string, number>[] = [{ phantom: 0 }, { letai: 400, phantom: 0 }, {}];
     for (const offsets of noOffline) {

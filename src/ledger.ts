@@ -556,7 +556,13 @@ export function buildLedger(input: LedgerInput): SyncLedger {
               : standing,
         };
       });
-      if (standings.some((d) => d.owed > 0)) {
+      // The SAME rule owedBytes uses. Gating on any standing that owes admitted
+      // sessions whose only remaining debt is to a phantom, which owedBytes then
+      // reports as 0 — so `hx status --detailed` listed a session under
+      // "SESSIONS STILL OWING BYTES" saying it owed nothing. The live bucket is
+      // where that lands in practice: a session touched in the last 15 minutes,
+      // fully uploaded, carrying one dead key.
+      if (standings.some((d) => d.state !== "unknown" && d.owed > 0)) {
         notDelivered.push({
           sessionId: fs?.sessionId ?? file.path,
           family: fs?.family ?? "unknown",

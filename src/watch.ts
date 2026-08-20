@@ -12,7 +12,7 @@
 //   4. POST commit (gateway composes into canonical)
 //   5. bump state.offset
 
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { stat, open } from "node:fs/promises";
 import path from "node:path";
 import { homedir } from "node:os";
@@ -1988,7 +1988,12 @@ export async function computeSyncReport(
   for (const [p, fs] of Object.entries(state.files)) {
     if (isChildLane(p)) {
       childLanes.tracked += 1;
-      const here = existsSync(p);
+      // One stat, not existsSync-then-maybe-stat: it answers BOTH questions,
+      // and a child lane never carries lastKnownSize (only ensureFileState
+      // writes that, and only the parent path calls it), so the on-disk size is
+      // the sole way to know what a lane still owes.
+      const st = statSync(p, { throwIfNoEntry: false });
+      const here = st !== undefined;
       if (here) childLanes.onDisk += 1;
       else childLanes.gone += 1;
       // Only an ON-DISK lane can be held in any useful sense: releasing a hold
@@ -2004,9 +2009,15 @@ export async function computeSyncReport(
       }
       // Only an on-disk lane can still be sent; a pruned one is as final as a
       // pruned session and must not read as backlog.
-      if (here && fs.lastKnownSize !== undefined && minOffset(fs) < fs.lastKnownSize) {
+      //
+      // Sized from the file, NOT from lastKnownSize. ensureFileState is the
+      // only writer of that field and only the parent path calls it, so for a
+      // child lane it is ALWAYS undefined — this counter could never fire, and
+      // the report therefore said "all delivered" unconditionally, including
+      // for a device with every one of its lanes held.
+      if (st !== undefined && minOffset(fs) < st.size) {
         childLanes.owing += 1;
-        childLanes.owedBytes += fs.lastKnownSize - minOffset(fs);
+        childLanes.owedBytes += st.size - minOffset(fs);
       }
       continue;
     }

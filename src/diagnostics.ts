@@ -487,7 +487,16 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
     const c = report.childLanes;
     lines.push(
       `Child agent lanes: ${c.tracked} tracked · ${c.onDisk} on disk · ${c.gone} pruned` +
-        (c.owing > 0 ? ` · ${c.owing} still owing ${fmtBytes(c.owedBytes)}` : " · all delivered"),
+        (c.owing > 0
+          ? ` · ${c.owing} still owing ${fmtBytes(c.owedBytes)}`
+          // "all delivered" is a claim about the whole set, so a single held
+          // lane disproves it — and a hold does NOT imply owed bytes (a lane can
+          // be fully uploaded and still carry a stale skipReason). Belt and
+          // braces on top of the accounting fix: this line once printed "all
+          // delivered" directly above "706 of them are HELD".
+          : c.held > 0
+            ? ` · ${c.held} held`
+            : " · all delivered"),
     );
     if (c.owing > 0) {
       lines.push("These upload on their own pass; a stall here is invisible in the session counts above.");
