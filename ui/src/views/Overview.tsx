@@ -30,6 +30,12 @@ export function Overview() {
   // growing/active transcript), not only ones held on an offline store — so
   // "not caught up" and "nothing in flight" can never contradict each other.
   const inFlight = Math.max(0, (snap?.sync.total ?? 0) - (snap?.sync.done ?? 0));
+  // Held CHILD LANES clear `ok` too, and no session number above can see them:
+  // discovery never walks the child-lane tree, so a device whose every lane is
+  // refused shows total === done and blockedSessions === 0. Without this the
+  // card said "Caught up: No" beside "nothing in flight" and "100% mirrored",
+  // which is exactly the contradiction the comment above swears cannot happen.
+  const heldLanes = doctor?.childLanes?.held ?? 0;
   const held = snap?.sync.waiting ?? 0; // held on an unavailable store (subset)
   const onDisk = snap?.sync.total ?? 0;
   const firstUnlinked = unlinkedFolders[0];
@@ -90,7 +96,11 @@ export function Overview() {
             {caughtUp === false && doctor ? (
               <>
                 <b>{doctor.sync.done} of {doctor.sync.total} sessions mirrored ({doctor.sync.percent}%).</b>
-                <div style={{ marginTop: 6 }}>{doctor.blockedSessions > 0 ? `${plural(doctor.blockedSessions, "session")} held at a destination — ` : "The rest is still uploading — an active session is normally a little behind. "}Device Detail → Sync Doctor explains exactly what’s pending and why.</div>
+                <div style={{ marginTop: 6 }}>{doctor.blockedSessions > 0
+                  ? `${plural(doctor.blockedSessions, "session")} held at a destination — `
+                  : heldLanes > 0
+                    ? `${plural(heldLanes, "agent lane")} held and not retrying until released — `
+                    : "The rest is still uploading — an active session is normally a little behind. "}Device Detail → Sync Doctor explains exactly what’s pending and why.</div>
               </>
             ) : (
               <>
@@ -99,7 +109,11 @@ export function Overview() {
               </>
             )}
           </div></span></div>
-          <div className="sub">{inFlight > 0 ? (held > 0 ? `${plural(held, "session")} held` : `${plural(inFlight, "session")} still syncing`) : "nothing in flight"}</div>
+          <div className="sub">{inFlight > 0
+            ? (held > 0 ? `${plural(held, "session")} held` : `${plural(inFlight, "session")} still syncing`)
+            : heldLanes > 0
+              ? `${plural(heldLanes, "agent lane")} held`
+              : "nothing in flight"}</div>
         </div>
       </div>
 

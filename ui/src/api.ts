@@ -71,6 +71,18 @@ export interface DoctorInfo {
   blockedSessions: number;
   gaps: { sessions: number; localFileDeleted: number; outsideScanWindow: number };
   blockers: DoctorBlockerInfo[];
+  /** `ok` depends on `held`, and every other number here counts parent sessions
+   *  only — discovery never walks the child-lane tree — so without this the UI
+   *  can report "not caught up" with nothing to attribute it to. */
+  childLanes?: {
+    tracked: number;
+    onDisk: number;
+    gone: number;
+    owing: number;
+    owedBytes: number;
+    held: number;
+    heldReasons: Record<string, number>;
+  };
 }
 
 /** One watched data root (config dir), as reported by the server. */

@@ -63,7 +63,10 @@ export interface SyncDoctorReport {
   excluded: SyncReport["excluded"];
   /** Tracked files discovery did not return, split by whether they still exist. */
   undiscovered: SyncReport["undiscovered"];
-  /** Child agent lanes — tracked, uploaded separately, previously unreported. */
+  /** Child agent lanes — tracked, uploaded separately, previously unreported.
+   *  `ok` depends on `held`, so any consumer that renders `ok` must read this
+   *  to explain it: every other number in this report counts parent sessions
+   *  only, because discovery never walks the child-lane tree. */
   childLanes: SyncReport["childLanes"];
 }
 
@@ -376,10 +379,16 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
             // saying "already delivered" there was simply false.
             ? "  <-- NOT KNOWN to this device; dead key, not counted"
             : dest.state === "unregistered"
-              // Absent from the registry but demonstrably paid: these bytes ARE
-              // counted, and calling this a dead key would contradict the
-              // number printed beside it.
-              ? "  <-- not in this device's registry, but has accepted bytes; still owed"
+              // Absent from the registry but treated as real, so its bytes ARE
+              // counted and calling it a dead key would contradict the number
+              // beside it. Only claim payment when THIS file's offset shows it:
+              // the same state is reached when another file proves the store,
+              // and when no registry has been recorded at all, and both of
+              // those print an offset of 0 — "has accepted bytes" next to
+              // "0 / 109 B" is refuted by the line it is written on.
+              ? dest.offset > 0
+                ? "  <-- not in this device's registry, but has accepted bytes; still owed"
+                : "  <-- not in this device's registry; treated as real, still owed"
               : dest.state === "offline"
                 ? "  (offline)"
                 : "";

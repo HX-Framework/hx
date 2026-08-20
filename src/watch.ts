@@ -217,6 +217,25 @@ function formatWait(ms: number): string {
   return `${Math.round(ms / 60_000)} min`;
 }
 
+/**
+ * The dedupe identity for a waiting file: bench-vs-backoff, the failure streak,
+ * and the hold reason. All three change only when something real changes, so a
+ * new line means new information.
+ *
+ * Exported because the ONE thing this must never do is vary with the
+ * countdown. It used to be the rendered message, which carries the remaining
+ * time, so below a minute the string changed on every 1.5s tick and the
+ * 30-minute suppression matched nothing — a benched file emitted ~57,600 lines
+ * a day while appearing to be rate limited.
+ */
+export function stuckLogKey(pending: {
+  consecutiveFailures?: number;
+  skipReason?: string;
+}): string {
+  const failures = pending.consecutiveFailures;
+  return `${failures === undefined ? "bench" : `backoff:${failures}`}:${pending.skipReason ?? "-"}`;
+}
+
 function logStuck(
   path: string,
   /** STABLE identity of the condition — never the countdown, the byte counts or
@@ -1875,6 +1894,20 @@ export function collectSkipped(files: DiscoveredFile[], state: HxState): SyncSki
  *  byte-identical (fresh unwindowed discovery + fresh settings). Injected
  *  lists MUST be unwindowed-equivalent — the report's behind/incomplete math
  *  is meaningless over a windowed subset. */
+/**
+ * Is there anything `hx retry --blocked` could actually release?
+ *
+ * Child lanes count. collectSkipped reports only files present in DISCOVERY,
+ * and discovery never walks the subagents tree, so `report.skipped` cannot see
+ * a held lane — and gating on it alone answered "No blocked sessions to retry"
+ * to a device whose every lane was refused, exiting before
+ * clearBlockedFailuresFromState, which walks all of state.files and would have
+ * released them.
+ */
+export function hasReleasableHolds(report: SyncReport): boolean {
+  return report.skipped.length > 0 || report.childLanes.held > 0;
+}
+
 export interface SyncReportInputs {
   claude: DiscoveredFile[];
   codex: DiscoveredFile[];
@@ -2213,10 +2246,7 @@ export async function tickOnce(
       const why = pending.skipReason ? `, ${pending.skipReason}` : "";
       logStuck(
         f.path,
-        // Key on the CONDITION, not the countdown: bench-vs-backoff, the hold
-        // reason, and the failure streak. All three change only when something
-        // real changes, so a new line means new information.
-        `${failures === undefined ? "bench" : `backoff:${failures}`}:${pending.skipReason ?? "-"}`,
+        stuckLogKey(pending),
         // A bench and a backoff are different conditions and were printed
         // identically. benchFileProbe deliberately leaves consecutiveFailures
         // alone (the outage is not this file's fault), so the old line reported

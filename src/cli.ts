@@ -11,7 +11,7 @@ import {
   type HxConfig,
 } from "./config.js";
 import { connect } from "./connect.js";
-import { backfillArtifacts, computeSyncReport, computeSyncSnapshot, startWatch, tickOnce } from "./watch.js";
+import { backfillArtifacts, computeSyncReport, computeSyncSnapshot, hasReleasableHolds, startWatch, tickOnce } from "./watch.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { getDaemonOps, tailLogs, teeStdioToLogs, type DaemonOps, type DaemonState } from "./daemon.js";
 import { probeConnection, formatRate } from "./probe.js";
@@ -912,7 +912,7 @@ async function cmdRetry(): Promise<void> {
   // `hx retry --blocked` answer "nothing to retry" to a device whose every lane
   // was held. clearBlockedFailuresFromState already walks all of state.files —
   // only this early exit stood between the user and the release.
-  if (!all && report.skipped.length === 0 && report.childLanes.held === 0) {
+  if (!all && !hasReleasableHolds(report)) {
     log("No blocked sessions to retry. (`hx retry --all` clears every backoff.)");
     return;
   }
