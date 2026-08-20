@@ -358,11 +358,11 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
         // bytes to a store it has no record of, so nothing will ever drain it.
         const note =
           dest.state === "unknown"
-            ? d.strandedUnknown
-              // Already safe elsewhere: say so, or the same report tells the
-              // reader both that these bytes are counted and that they are not.
-              ? "  <-- NOT KNOWN to this device; dead key, bytes already delivered"
-              : "  <-- NOT KNOWN to this device; nothing will ever send here"
+            // No claim about delivery. A dead key's debt is excluded because
+            // the destination does not exist, NOT because the bytes are safe
+            // somewhere else — the session may still owe a live store, and
+            // saying "already delivered" there was simply false.
+            ? "  <-- NOT KNOWN to this device; dead key, not counted"
             : dest.state === "unregistered"
               // Absent from the registry but demonstrably paid: these bytes ARE
               // counted, and calling this a dead key would contradict the
@@ -387,11 +387,13 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
         `  ${d.label}  —  ${d.sessions} session${d.sessions === 1 ? "" : "s"} · ${fmtBytes(d.bytes)} nominally owed`,
       );
     }
-    lines.push("  Every session above is COMPLETE at a store this device can reach, so this");
-    lines.push("  debt is inert: excluded from the percentage and from bytes-left. Left in");
-    lines.push("  the total it would hold the bar below 100% forever, for bytes no action");
-    lines.push("  could ever deliver. The key is dropped on the next upload of a session");
-    lines.push("  still on disk, or at startup once it leaves.");
+    lines.push("  These keys name no destination this device has any record of, and none of");
+    lines.push("  them has ever accepted a byte from any session here. Nothing will ever be");
+    lines.push("  sent to them, so the debt is excluded from the percentage and from");
+    lines.push("  bytes-left — counted, it would hold the bar below 100% forever for bytes");
+    lines.push("  no action could deliver. A session listed here may still owe a REAL store;");
+    lines.push("  that debt is counted and appears above. The key is dropped on the next");
+    lines.push("  upload of a session still on disk, or at startup once it leaves.");
   }
   if (ledger.lagging.length > 0) {
     lines.push("");

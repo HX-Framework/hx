@@ -112,9 +112,11 @@ export interface SyncLedger {
    *  double-count a fanned-out session, deliberately — each store really is
    *  owed those bytes — but a headline "held" figure must not. */
   waitingBytes: number;
-  /** Dead offset keys carried by on-disk sessions whose bytes are already safe
-   *  at a reachable store. Excluded from `uploadingBytes` and the percentage,
-   *  reported so they can be recognised and cleared. */
+  /** Dead offset keys carried by on-disk sessions: no registry entry, and no
+   *  file anywhere has ever written to them. Excluded from `uploadingBytes` and
+   *  the percentage because nothing will ever be sent there — NOT because the
+   *  sessions are safe; one may still owe a real store, and that debt is
+   *  counted separately. Reported so the keys can be recognised and cleared. */
   stranded: StrandedDestination[];
   /** Per-session detail for every on-disk session that still owes bytes —
    *  what `hx status --detailed` prints so a stuck session explains itself. */
@@ -187,9 +189,10 @@ export interface SessionDiagnosis {
   repoSlug: string | null;
   attributed: boolean | null;
   destinations: DestinationStanding[];
-  /** This session's unknown-key debt is already moot — a reachable store holds
-   *  the whole transcript. The bytes are NOT counted, so any prose about them
-   *  must not claim otherwise. */
+  /** This session carries at least one dead key. Its debt is NOT counted — the
+   *  destination does not exist — which says nothing about whether the session
+   *  is fully delivered: it may still owe a live store. Prose about these bytes
+   *  must not claim delivery. */
   strandedUnknown: boolean;
 }
 
@@ -312,9 +315,13 @@ function lagOf(
   }
   // Every key on this file is a phantom, so nothing real has ever been told
   // about it. That is the same situation as no offsets at all, and gets the
-  // same answer: bill the whole file to the primary. Billing it to the phantom
-  // instead put the bytes in a bucket nothing drains and no field reported.
-  if (!sawRealDestination) return { reachable: size, offline, unknown };
+  // same answer: bill the whole file to the primary.
+  //
+  // The unknown map is DROPPED here, exactly as the `keys.length === 0` sibling
+  // above returns an empty one. Returning it populated billed the same bytes
+  // twice — once as backlog and again as stranded — so a 1000-byte file
+  // accounted for 2000, and with two phantom keys, 3000.
+  if (!sawRealDestination) return { reachable: size, offline, unknown: new Map() };
   return { reachable, offline, unknown };
 }
 
@@ -520,8 +527,15 @@ export function buildLedger(input: LedgerInput): SyncLedger {
       const fs = state.files[file.path];
       const offsets = fs?.offsets ?? {};
       const keys = Object.keys(offsets);
-      const standings: DestinationStanding[] = (keys.length === 0
-        ? [{ key: destKey(null), offset: 0 }]
+      // A file whose recorded keys are ALL phantoms is billed to the primary by
+      // lagOf, so the primary needs a standing here or the detail line reports
+      // 0 owed under a headline that says otherwise. The dead keys are still
+      // listed alongside it — named, and contributing nothing to the total.
+      const allPhantom =
+        keys.length > 0 &&
+        keys.every((k) => isPhantomKey(state, k, offsets[k] ?? 0, everWritten));
+      const standings: DestinationStanding[] = (keys.length === 0 || allPhantom
+        ? [{ key: destKey(null), offset: 0 }, ...keys.map((k) => ({ key: k, offset: offsets[k] ?? 0 }))]
         : keys.map((k) => ({ key: k, offset: offsets[k] ?? 0 }))
       ).map(({ key, offset }) => {
         const record = state.destinations?.[key];

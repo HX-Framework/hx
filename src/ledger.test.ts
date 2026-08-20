@@ -511,18 +511,29 @@ describe("notDelivered diagnosis", () => {
     assert.equal(l.stranded[0]!.bytes, 1000);
   });
 
-  it("bills a file whose ONLY key is a phantom to the primary", () => {
+  it("bills a file whose ONLY key is a phantom to the primary, ONCE", () => {
     // Nothing real has ever been told about this file, which is the same
     // situation as no offsets at all — so it is whole-file backlog, billed to
-    // the primary. Billing it to the phantom instead put the bytes in a bucket
-    // nothing drains and no field reported.
+    // the primary. Reporting the phantom's notional debt on top of that counted
+    // the same 1000 bytes twice: 1000 in uploadingBytes and 1000 again in
+    // stranded, for a 1000-byte file.
     const l = build({ orgX: 0 }, false);
     assert.equal(l.uploading, 1);
     assert.equal(l.uploadingBytes, 1000);
     assert.equal(l.percent, 0);
-    // And the dead key is still named.
-    assert.equal(l.stranded.length, 1);
-    assert.equal(l.stranded[0]!.key, "orgX");
+    const strandedBytes = l.stranded.reduce((n, x) => n + x.bytes, 0);
+    assert.equal(l.uploadingBytes + l.waitingBytes + strandedBytes, 1000);
+    // The per-session line has to agree with the headline it sits under.
+    assert.equal(l.notDelivered[0]!.owedBytes, 1000);
+  });
+
+  it("still names the dead key, and says where the bytes are actually going", () => {
+    const l = build({ orgX: 0 }, false);
+    const dests = l.notDelivered[0]!.destinations;
+    // The primary is synthesised so the backlog has a visible home...
+    assert.equal(dests.find((d) => d.key === "letai")!.owed, 1000);
+    // ...and the dead key is still listed beside it, contributing nothing.
+    assert.equal(dests.find((d) => d.key === "orgX")!.state, "unknown");
   });
 
   it("counts only the REAL debt when a phantom sits beside a live destination", () => {
@@ -819,5 +830,78 @@ describe("a state file with no registry at all", () => {
     assert.deepEqual(l.stranded, []);
     assert.equal(l.uploadingBytes, 1000);
     assert.equal(l.percent, 0);
+  });
+});
+
+// The two accounting invariants, over every shape that has broken one of them
+// in review. Note what is NOT asserted: stranded[].bytes is explicitly the
+// NOMINAL debt of a destination that does not exist, so adding it to real
+// backlog is meaningless — the defect was never "the sum is wrong", it was the
+// same bytes being reported as real backlog AND as stranded for one file.
+describe("accounting invariants", () => {
+  const reg: HxState["destinations"] = {
+    letai: { vaultOrgId: null, status: "ready", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+    orgHeld: { vaultOrgId: "orgHeld", status: "held", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+  };
+  const ledgerFor = (offsets: Record<string, number>) => {
+    const state: HxState = { files: { a: entry("a", offsets) }, destinations: reg };
+    return buildLedger({
+      files: [file("a", 1000)],
+      state,
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+  };
+  const shapes: Array<[string, Record<string, number>]> = [
+    ["only a phantom", { phantom: 0 }],
+    ["two phantoms and nothing else", { p1: 0, p2: 0 }],
+    ["phantom beside a partly-filled primary", { letai: 400, phantom: 0 }],
+    ["phantom beside a complete primary", { letai: 1000, phantom: 0 }],
+    ["phantom beside an offline debt", { letai: 1000, orgHeld: 200, phantom: 0 }],
+    ["an unregistered store that has been paid", { letai: 1000, orgPaid: 500 }],
+    ["no offsets at all", {}],
+  ];
+
+  for (const [name, offsets] of shapes) {
+    it(`never reports a session as owing while its detail says 0 — ${name}`, () => {
+      // notDelivered only admits sessions with a standing that owes something,
+      // so owedBytes of 0 there is self-contradictory. That is exactly what a
+      // file billed to the primary printed: "0 B owed" beneath a headline
+      // reporting 1000. Deliberately NOT asserting that owedBytes sums to
+      // uploadingBytes — owedBytes includes offline debt, which is counted in
+      // waitingBytes instead, so the two agree only when no store is offline.
+      const l = ledgerFor(offsets);
+      for (const d of l.notDelivered) {
+        assert.ok(d.owedBytes > 0, `${d.sessionId} listed as owing but detail says 0`);
+      }
+    });
+  }
+
+  it("detail matches the headline when nothing is offline", () => {
+    for (const offsets of [{ phantom: 0 }, { letai: 400, phantom: 0 }, {}]) {
+      const l = ledgerFor(offsets);
+      const perSession = l.notDelivered.reduce((n, d) => n + d.owedBytes, 0);
+      assert.equal(perSession, l.uploadingBytes);
+    }
+  });
+
+  for (const [name, offsets] of shapes.slice(0, 2)) {
+    it(`a file billed to the primary is not ALSO reported stranded — ${name}`, () => {
+      // Every key is a phantom, so lagOf bills the whole file to the primary.
+      // Reporting the phantom's notional debt on top counted a 1000-byte file
+      // as 2000 — and 3000 with two phantom keys.
+      const l = ledgerFor(offsets);
+      assert.equal(l.uploadingBytes, 1000);
+      assert.deepEqual(l.stranded, []);
+    });
+  }
+
+  it("a phantom beside a REAL destination is still named", () => {
+    // The opposite guard: suppressing it here is how a dead key gets carried
+    // forever with nothing reporting it.
+    const l = ledgerFor({ letai: 400, phantom: 0 });
+    assert.equal(l.uploadingBytes, 600);
+    assert.equal(l.stranded.length, 1);
+    assert.equal(l.stranded[0]!.key, "phantom");
   });
 });
