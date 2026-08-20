@@ -31,8 +31,30 @@ describe("classifyUpstreamError", () => {
     );
   });
 
-  it("never classifies a 4xx as unavailable", () => {
+  it("classifies an ordinary 4xx as this file's own fault, not unavailable", () => {
     expect(classifyUpstreamError(new HxHttpError(404, "nope"), false)).toBeNull();
+  });
+
+  // The one deliberate exception to the 4xx rule. A quarantine is the gateway
+  // declining to CHOOSE a destination (ambiguous multi-org routing), which has
+  // nothing to do with the file. Left as a per-file fault it retried on every
+  // poll with no blocker and no skip reason: one device logged 798,704 of them
+  // across every child agent lane it owned, and `hx status` showed nothing.
+  it("treats a 409 quarantine as a per-session hold", () => {
+    const err = new HxHttpError(409, 'agent-append-url failed: 409 {"error":"quarantine"}');
+    const out = classifyUpstreamError(err, false);
+    expect(out).toBeInstanceOf(SessionUpstreamUnavailable);
+    expect(out?.reason).toBe("quarantine");
+  });
+
+  it("holds on quarantine over a fortress-direct route too", () => {
+    const err = new HxHttpError(409, 'append-url failed: 409 {"error":"quarantine"}');
+    expect(classifyUpstreamError(err, true)?.reason).toBe("quarantine");
+  });
+
+  it("does not read a bare 409 as a quarantine", () => {
+    // Only the gateway's own word for it — a conflict is otherwise a real fault.
+    expect(classifyUpstreamError(new HxHttpError(409, "conflict"), false)).toBeNull();
   });
 
   it("prefers the structured blocker's reason over message sniffing", () => {

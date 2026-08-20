@@ -112,6 +112,10 @@ export interface SyncLedger {
    *  double-count a fanned-out session, deliberately — each store really is
    *  owed those bytes — but a headline "held" figure must not. */
   waitingBytes: number;
+  /** Dead offset keys carried by on-disk sessions whose bytes are already safe
+   *  at a reachable store. Excluded from `uploadingBytes` and the percentage,
+   *  reported so they can be recognised and cleared. */
+  stranded: StrandedDestination[];
   /** Per-session detail for every on-disk session that still owes bytes —
    *  what `hx status --detailed` prints so a stuck session explains itself. */
   notDelivered: SessionDiagnosis[];
@@ -122,6 +126,21 @@ export interface SyncLedger {
    *  reachable — bytes should be moving), but the headline names the failure
    *  instead of reading as an innocent backlog. */
   failing: FailingDestination[];
+}
+
+/** An offset key that owes bytes, has no registry entry, and is already moot —
+ *  a reachable store holds the whole session. Nothing will ever be written to
+ *  it, so it is kept out of the backlog and the percentage; it is reported
+ *  because a key that appeared from nowhere and drains nowhere is a fault, and
+ *  a device that stays silent about one carries it forever. */
+export interface StrandedDestination {
+  key: string;
+  /** Friendly name where we have one, else the raw key. */
+  label: string;
+  /** Distinct on-disk sessions carrying this dead key. */
+  sessions: number;
+  /** Bytes those sessions nominally still "owe" it. */
+  bytes: number;
 }
 
 /** One destination's standing for a session that still owes bytes. */
@@ -197,8 +216,31 @@ export interface LedgerInput {
  * let the device claim 100% while nothing at all was being delivered.
  */
 export function isDestinationOffline(state: HxState, key: string): boolean {
-  if (key === destKey(null)) return false;
-  return state.destinations?.[key]?.status === "held";
+  return destinationStanding(state, key) === "offline";
+}
+
+/**
+ * Three-way standing for one offset key.
+ *
+ * `unknown` — an offset key with NO registry entry — is why this exists. A
+ * two-way offline/not-offline test bills it as reachable, so a destination the
+ * device has never heard of is owed every byte of the file forever: nothing
+ * writes to it, so the debt never drains, and no error is ever logged because
+ * no attempt is ever made. One device carried 43 such keys for an org that
+ * advertised itself once during a routing-flag experiment and was never seen
+ * again; they read as permanent backlog with an empty log beside them.
+ */
+export function destinationStanding(
+  state: HxState,
+  key: string,
+): "reachable" | "offline" | "unknown" {
+  // The primary shared bucket is always reachable and always known: a total
+  // gateway outage is reported by the connection probe, and excusing the
+  // primary would let the device claim 100% while nothing was being delivered.
+  if (key === destKey(null)) return "reachable";
+  const record = state.destinations?.[key];
+  if (record === undefined) return "unknown";
+  return record.status === "held" ? "offline" : "reachable";
 }
 
 /**
@@ -218,7 +260,9 @@ function hasReachableCompleteCopy(
   state: HxState,
 ): boolean {
   for (const [key, offset] of Object.entries(fs?.offsets ?? {})) {
-    if (isDestinationOffline(state, key)) continue;
+    // Only a destination we know AND can reach is proof of safety. An unknown
+    // key is not evidence of a stored copy — it is evidence of nothing.
+    if (destinationStanding(state, key) !== "reachable") continue;
     if (offset >= size) return true;
   }
   return false;
@@ -229,21 +273,30 @@ function lagOf(
   fs: FileState | undefined,
   size: number,
   state: HxState,
-): { reachable: number; offline: Map<string, number> } {
+): { reachable: number; offline: Map<string, number>; unknown: Map<string, number> } {
   const offline = new Map<string, number>();
+  const unknown = new Map<string, number>();
   let reachable = 0;
   // A file with no recorded offsets has never been sent anywhere; bill it to
   // the primary destination so it reads as backlog rather than vanishing.
   const offsets = fs?.offsets ?? {};
   const keys = Object.keys(offsets);
-  if (keys.length === 0) return { reachable: size, offline };
+  if (keys.length === 0) return { reachable: size, offline, unknown };
   for (const key of keys) {
     const pending = size - (offsets[key] ?? 0);
     if (pending <= 0) continue;
-    if (isDestinationOffline(state, key)) offline.set(key, pending);
-    else reachable += pending;
+    switch (destinationStanding(state, key)) {
+      case "offline":
+        offline.set(key, pending);
+        break;
+      case "unknown":
+        unknown.set(key, pending);
+        break;
+      default:
+        reachable += pending;
+    }
   }
-  return { reachable, offline };
+  return { reachable, offline, unknown };
 }
 
 /** Classify one discovered file. `incomplete` is decided elsewhere (the source
@@ -256,22 +309,64 @@ export function classifyFile(
   state: Exclude<SessionState, "incomplete">;
   reachableBytes: number;
   offline: Map<string, number>;
+  /** Debt owed to offset keys with no registry entry. Reported, never billed
+   *  as backlog unless it is the ONLY record of the bytes (see below). */
+  unknown: Map<string, number>;
   /** Waiting AND no complete copy anywhere reachable — the only whole
    *  transcript is the local file, which Claude Code prunes at 30 days. */
   unprotected: boolean;
+  /** Unknown-key debt that a reachable store has already made moot. Inert: it
+   *  is excluded from the backlog, so it must be REPORTED somewhere or the
+   *  device goes quiet about a key it will carry forever. */
+  strandedUnknown: boolean;
 } {
   const fs = state.files[file.path];
-  const { reachable, offline } = lagOf(fs, file.size, state);
-  const unprotected = offline.size > 0 && !hasReachableCompleteCopy(fs, file.size, state);
+  const { reachable, offline, unknown } = lagOf(fs, file.size, state);
+  const complete = hasReachableCompleteCopy(fs, file.size, state);
+  const unprotected = offline.size > 0 && !complete;
+  const strandedUnknown = unknown.size > 0 && complete;
   // Live tail first, and unconditionally: see LIVE_WINDOW_MS. A session still
   // being written on this device is never a backlog and never a fault,
   // whatever it still owes.
   if (nowMs - file.mtimeMs < LIVE_WINDOW_MS) {
-    return { state: "live", reachableBytes: reachable, offline, unprotected: false };
+    return {
+      state: "live",
+      reachableBytes: reachable,
+      offline,
+      unknown,
+      unprotected: false,
+      strandedUnknown,
+    };
   }
-  if (reachable > 0) return { state: "uploading", reachableBytes: reachable, offline, unprotected };
-  if (offline.size > 0) return { state: "waiting", reachableBytes: 0, offline, unprotected };
-  return { state: "delivered", reachableBytes: 0, offline, unprotected: false };
+  if (reachable > 0) {
+    return { state: "uploading", reachableBytes: reachable, offline, unknown, unprotected, strandedUnknown };
+  }
+  // Bytes owed ONLY to an unknown destination are not backlog: nothing will
+  // ever write there, so counting them pins the percentage below 100 forever
+  // for a debt no action can settle. They ARE a real fault when no destination
+  // we can reach holds the whole file — that session is genuinely undelivered,
+  // and the next append-url both sends it and prunes the dead key.
+  if (unknown.size > 0 && !complete) {
+    return {
+      state: "uploading",
+      reachableBytes: Math.max(...unknown.values()),
+      offline,
+      unknown,
+      unprotected,
+      strandedUnknown,
+    };
+  }
+  if (offline.size > 0) {
+    return { state: "waiting", reachableBytes: 0, offline, unknown, unprotected, strandedUnknown };
+  }
+  return {
+    state: "delivered",
+    reachableBytes: 0,
+    offline,
+    unknown,
+    unprotected: false,
+    strandedUnknown,
+  };
 }
 
 function offlineDaysOf(state: HxState, key: string, nowMs: number): number | null {
@@ -297,6 +392,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
   let uploadingBytes = 0;
   let waitingBytes = 0;
   const lag = new Map<string, { sessions: number; bytes: number }>();
+  const strandedLag = new Map<string, { sessions: number; bytes: number }>();
   const notDelivered: SessionDiagnosis[] = [];
 
   for (const file of files) {
@@ -307,6 +403,17 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     if (oldestMs === null || file.mtimeMs < oldestMs) oldestMs = file.mtimeMs;
     if (newestMs === null || file.mtimeMs > newestMs) newestMs = file.mtimeMs;
     const c = classifyFile(file, state, nowMs);
+    // Folded for EVERY bucket, delivered included: the whole point of the
+    // stranded list is that these sessions are otherwise fully in the clear and
+    // would appear nowhere at all.
+    if (c.strandedUnknown) {
+      for (const [key, pending] of c.unknown) {
+        const entry = strandedLag.get(key) ?? { sessions: 0, bytes: 0 };
+        entry.sessions += 1;
+        entry.bytes += pending;
+        strandedLag.set(key, entry);
+      }
+    }
     if (c.state !== "delivered") {
       const fs = state.files[file.path];
       const offsets = fs?.offsets ?? {};
@@ -318,17 +425,12 @@ export function buildLedger(input: LedgerInput): SyncLedger {
         const record = state.destinations?.[key];
         const label =
           (record?.vaultOrgId && orgNames[record.vaultOrgId]) || record?.orgName || key;
-        const known = key === destKey(null) || record !== undefined;
         return {
           key,
           label,
           offset,
           owed: Math.max(0, file.size - offset),
-          state: isDestinationOffline(state, key)
-            ? ("offline" as const)
-            : known
-              ? ("reachable" as const)
-              : ("unknown" as const),
+          state: destinationStanding(state, key),
         };
       });
       if (standings.some((d) => d.owed > 0)) {
@@ -415,6 +517,15 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     // Longest outage first: the one most likely to need a decision leads.
     .sort((a, b) => (b.offlineDays ?? -1) - (a.offlineDays ?? -1) || b.sessions - a.sessions);
 
+  const stranded: StrandedDestination[] = [...strandedLag.entries()]
+    .map(([key, v]) => {
+      const record = state.destinations?.[key];
+      const vaultOrgId = record?.vaultOrgId ?? (key === destKey(null) ? null : key);
+      const label = (vaultOrgId && orgNames[vaultOrgId]) || record?.orgName || key;
+      return { key, label, sessions: v.sessions, bytes: v.bytes };
+    })
+    .sort((a, b) => b.sessions - a.sessions || b.bytes - a.bytes);
+
   return {
     total: files.length,
     totalBytes,
@@ -431,6 +542,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     uploadingBytes,
     waitingBytes,
     notDelivered: notDelivered.sort((a, b) => b.owedBytes - a.owedBytes),
+    stranded,
     lagging,
     failing: failingDestinations(state, nowMs, orgNames),
   };

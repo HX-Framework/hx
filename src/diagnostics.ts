@@ -372,9 +372,24 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
     if (ledger.notDelivered.some((d) => d.destinations.some((x) => x.state === "unknown" && x.owed > 0))) {
       lines.push("");
       lines.push("  A destination marked NOT KNOWN was advertised to this device once and");
-      lines.push("  never registered. Its bytes can never be delivered and the session will");
-      lines.push("  sit here forever. This is a client bug — please report it.");
+      lines.push("  never registered. These bytes ARE still counted, because no store this");
+      lines.push("  device can reach holds the whole session yet — the next upload sends");
+      lines.push("  them to the primary and drops the dead key.");
     }
+  }
+  if (ledger.stranded.length > 0) {
+    lines.push("");
+    lines.push("DEAD DESTINATION KEYS — held in state, never delivered to, NOT counted");
+    for (const d of ledger.stranded) {
+      lines.push(
+        `  ${d.label}  —  ${d.sessions} session${d.sessions === 1 ? "" : "s"} · ${fmtBytes(d.bytes)} nominally owed`,
+      );
+    }
+    lines.push("  Every session above is COMPLETE at a store this device can reach, so this");
+    lines.push("  debt is inert: excluded from the percentage and from bytes-left. Left in");
+    lines.push("  the total it would hold the bar below 100% forever, for bytes no action");
+    lines.push("  could ever deliver. The key is dropped on the next upload of a session");
+    lines.push("  still on disk, or at startup once it leaves.");
   }
   if (ledger.lagging.length > 0) {
     lines.push("");

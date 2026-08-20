@@ -44,6 +44,7 @@ import {
   type SyncBlockerDetails,
   type StateScope,
   benchFileProbe,
+  pruneStrandedOffsets,
   clearFileFailure,
   clearHeal,
   destKey,
@@ -81,6 +82,7 @@ import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
 import { buildLedger, type SyncLedger } from "./ledger.js";
+import { rotateLogsIfLarge } from "./daemon.js";
 import { backfillDue, discoverBackfill, markBackfillRun } from "./backfill.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
@@ -207,6 +209,14 @@ const stuckLogged = new Map<string, { reason: string; atMs: number }>();
  * Absence of output read as "nothing happening" when it meant "nothing will
  * ever happen".
  */
+/** A wait a reader can act on. `Math.round(ms / 60_000)` rendered every delay
+ *  under 30 seconds as "0 min" — which reads as a stopped clock rather than a
+ *  short one. On one device 749 of 760 stuck lines said "another 0 min". */
+function formatWait(ms: number): string {
+  if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  return `${Math.round(ms / 60_000)} min`;
+}
+
 function logStuck(path: string, reason: string, log: (m: string) => void): void {
   const prev = stuckLogged.get(path);
   const now = Date.now();
@@ -257,6 +267,12 @@ export function classifyUpstreamError(
     if (blockReason !== null) {
       return new SessionUpstreamUnavailable(blockReason, err.status, err, err.blocker);
     }
+    // Before the generic 4xx rule: a quarantine is a routing decision the
+    // gateway has not made, identical in kind to an offline vault and equally
+    // unrelated to this file. Treated as a fault it retries forever in silence.
+    if (err.routingQuarantined) {
+      return new SessionUpstreamUnavailable("quarantine", err.status, err);
+    }
     if (fortress && err.serverUnavailable) {
       return new SessionUpstreamUnavailable("store_unreachable", err.status, err);
     }
@@ -276,6 +292,7 @@ export function classifyUpstreamError(
 function describeSkip(reason: FileSkipReason): string {
   if (reason === "vault_offline") return "session vault temporarily unavailable";
   if (reason === "vault_home_unreachable") return "session's home fortress not connected";
+  if (reason === "quarantine") return "gateway has no routing decision for this session";
   return "session store unreachable";
 }
 
@@ -2088,10 +2105,19 @@ export async function tickOnce(
     // sits out its window instead of burning a gateway round trip every poll.
     const pending = state.files[f.path];
     if (pending?.nextAttemptAtMs && pending.nextAttemptAtMs > Date.now()) {
-      const mins = Math.round((pending.nextAttemptAtMs - Date.now()) / 60_000);
+      const waitMs = pending.nextAttemptAtMs - Date.now();
+      const failures = pending.consecutiveFailures;
+      const why = pending.skipReason ? `, ${pending.skipReason}` : "";
       logStuck(
         f.path,
-        `waiting out a retry backoff for another ${mins} min (${pending.consecutiveFailures ?? 0} consecutive failures${pending.skipReason ? `, ${pending.skipReason}` : ""})`,
+        // A bench and a backoff are different conditions and were printed
+        // identically. benchFileProbe deliberately leaves consecutiveFailures
+        // alone (the outage is not this file's fault), so the old line reported
+        // every benched file as "waiting out a retry backoff (0 consecutive
+        // failures)" — a sentence that describes nothing that happened.
+        failures === undefined
+          ? `benched for another ${formatWait(waitMs)} behind a gateway outage; no failures of its own${why}`
+          : `waiting out a retry backoff for another ${formatWait(waitMs)} (${failures} consecutive failure${failures === 1 ? "" : "s"}${why})`,
         log,
       );
       return;
@@ -2433,6 +2459,11 @@ export async function startWatch(
   log(`[hx] watching data roots: ${describeRoots(resolveDataRoots(await readSettings()))}`);
   log(`[hx] poll interval ${FAST_POLL_MS}ms; gateway ${cfg.gatewayBaseUrl}`);
   void trimActivity(); // cap the UI journal once per daemon lifetime
+  // A daemon that has been down for a while may be starting behind an already
+  // oversized log; do not wait an hour to bound it.
+  for (const target of await rotateLogsIfLarge()) {
+    log(`[hx] rotated ${path.basename(target)} on start (kept one previous generation)`);
+  }
 
   // Coalesced state persistence is a LONG-RUNNING-LOOP privilege: this loop
   // owns flush points (end of pass, the timer below, flush-through commits).
@@ -2446,6 +2477,12 @@ export async function startWatch(
   // the gateway said the store is DOWN, and that is still true until it says
   // otherwise (`hx retry --blocked` / `--all` release those deliberately).
   try {
+    const stranded = await pruneStrandedOffsets(scopeOf(cfg));
+    if (stranded.keys > 0) {
+      log(
+        `[hx] dropped ${stranded.keys} offset key${stranded.keys === 1 ? "" : "s"} for unknown destinations across ${stranded.files} session${stranded.files === 1 ? "" : "s"} no longer on disk`,
+      );
+    }
     const dropped = await clearGenericBackoffs(scopeOf(cfg));
     if (dropped > 0) {
       log(`[hx] cleared ${dropped} stale retry backoff${dropped === 1 ? "" : "s"} on start`);
@@ -2670,6 +2707,11 @@ export async function startWatch(
     );
   }, STATE_FLUSH_MS);
   const perfTimer = setInterval(() => {
+    // Same cadence as the perf line: an hourly check bounds a log that took
+    // months to reach 242 MB, without a stat on every 1.5s pass.
+    void rotateLogsIfLarge().then((rotated) => {
+      for (const target of rotated) log(`[hx] rotated ${path.basename(target)} (kept one previous generation)`);
+    });
     if (perf.passes === 0) return;
     log(formatPerfLine(perf));
     perf.passes = 0;

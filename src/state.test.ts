@@ -6,6 +6,7 @@ import {
   offsetFor,
   migrateFileState,
   reconcileDestinationOffsets,
+  pruneStrandedOffsetsFrom,
   type FileState,
   type HxState,
 } from "./state.js";
@@ -139,5 +140,67 @@ describe("migrateFileState", () => {
       blocker,
     });
     assert.deepEqual(out.blocker, blocker);
+  });
+});
+
+// The phantom: one device carried 43 offset keys for an org that advertised
+// itself once during a routing experiment and was never seen again. Every one
+// of those sessions read as owing its whole size, forever, with an empty log
+// beside it — reconcileDestinations only ever runs inside the append-url path,
+// so a file no longer on disk is never attempted and never repaired.
+describe("pruneStrandedOffsetsFrom", () => {
+  const entry = (offsets: Record<string, number>): FileState => ({
+    path: "/p",
+    family: "claude-cli",
+    sessionId: "s",
+    offsets,
+    lastMtimeMs: 0,
+    lastUploadAtMs: 0,
+  });
+  const stateWith = (
+    offsets: Record<string, number>,
+    destinations: HxState["destinations"],
+  ): HxState => ({ files: { "/gone": { ...entry(offsets), path: "/gone" } }, destinations });
+  const registry: HxState["destinations"] = {
+    letai: { vaultOrgId: null, status: "ready", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+  };
+
+  it("drops an unregistered key on a file that is gone", () => {
+    const state = stateWith({ letai: 1000, phantom: 0 }, registry);
+    const r = pruneStrandedOffsetsFrom(state, () => false);
+    assert.deepEqual(r, { keys: 1, files: 1 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000 });
+  });
+
+  it("leaves a file that is STILL ON DISK alone", () => {
+    // It will be attempted again, and append-url's reconcile is the right
+    // repair — a newly attached vault also sits at 0 before any pass sees it.
+    const state = stateWith({ letai: 1000, phantom: 0 }, registry);
+    const r = pruneStrandedOffsetsFrom(state, () => true);
+    assert.deepEqual(r, { keys: 0, files: 0 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, phantom: 0 });
+  });
+
+  it("never touches a REGISTERED destination, however offline", () => {
+    const state = stateWith({ letai: 1000, orgHeld: 0 }, {
+      ...registry,
+      orgHeld: { vaultOrgId: "orgHeld", status: "held", orgName: "Acme", orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+    });
+    const r = pruneStrandedOffsetsFrom(state, () => false);
+    assert.deepEqual(r, { keys: 0, files: 0 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgHeld: 0 });
+  });
+
+  it("never touches the primary key", () => {
+    const state = stateWith({ letai: 500 }, registry);
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 0, files: 0 });
+  });
+
+  it("does nothing at all when no registry has ever been recorded", () => {
+    // "we have never seen a destination" must not read as "every destination
+    // is dead" — that would wipe real offsets on an old state file.
+    const state = stateWith({ letai: 1000, orgA: 0 }, undefined);
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 0, files: 0 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgA: 0 });
   });
 });

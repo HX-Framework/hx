@@ -14,7 +14,7 @@
 
 import { homedir, platform, userInfo } from "node:os";
 import { join, dirname, win32 as winPath } from "node:path";
-import { writeFile, mkdir, unlink, readFile, open } from "node:fs/promises";
+import { writeFile, mkdir, unlink, readFile, open, stat, copyFile, truncate } from "node:fs/promises";
 import { existsSync, readFileSync, createWriteStream, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { HX_DIR } from "./hx-home.js";
@@ -1053,6 +1053,61 @@ export function teeStdioToLogs(): void {
       }
     }) as typeof stream.write;
   }
+}
+
+/** Cap for each daemon log. One previous generation is kept alongside, so the
+ *  daemon's log footprint is bounded at twice this per stream. */
+export const LOG_MAX_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Bound the daemon logs, by copy-truncate.
+ *
+ * Nothing has ever rotated these. One device's stdout.log reached 242 MB and
+ * 1,144,348 lines, spanning two gateway migrations — 70% of it a single error
+ * repeated 798,704 times. A log that large is not a diagnostic; it is a reason
+ * not to look.
+ *
+ * Renaming cannot be used. launchd (`StandardOutPath`) and systemd
+ * (`StandardOutput=append:`) open the file themselves and hold the descriptor
+ * for the life of the process, so a rename leaves them writing to the same
+ * inode under its new name: `stdout.log` would sit empty while `stdout.log.1`
+ * grew without limit — strictly worse than not rotating at all.
+ *
+ * Both open with O_APPEND, as does the Windows tee above, so every write is
+ * positioned at end-of-file as it happens. Truncating in place is therefore
+ * safe with the descriptor open: the next line lands at offset 0.
+ *
+ * `hx logs` already handles the result — it reads a shrink as "truncated or
+ * rotated" and restarts from the top. The reader was built for a rotator that
+ * was never written; this is it.
+ *
+ * Best-effort throughout: a log we cannot rotate must never take the daemon
+ * down. Returns the paths actually rotated, for the caller to report.
+ */
+export async function rotateLogsIfLarge(
+  maxBytes: number = LOG_MAX_BYTES,
+  targets: readonly string[] = [STDOUT_LOG, STDERR_LOG],
+): Promise<string[]> {
+  const rotated: string[] = [];
+  for (const target of targets) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- the
+      // daemon's own two log paths under ~/.let/hx (tests inject a tmp path),
+      // never request input.
+      const st = await stat(target);
+      if (st.size <= maxBytes) continue;
+      // Copy BEFORE truncating: a crash between the two costs the previous
+      // generation, never the live one.
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
+      await copyFile(target, `${target}.1`);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
+      await truncate(target, 0);
+      rotated.push(target);
+    } catch {
+      /* missing, unreadable, or a full disk — never fatal */
+    }
+  }
+  return rotated;
 }
 
 // ─────────────────────────────── tail logs ────────────────────────────────

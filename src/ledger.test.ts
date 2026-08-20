@@ -481,15 +481,40 @@ describe("notDelivered diagnosis", () => {
       nowMs: NOW,
     });
 
-  it("marks a destination with NO registry entry as unknown", () => {
-    // The phantom: advertised once, never registered, billed as reachable.
+  it("does not bill a session whose only debt is to an unknown destination", () => {
+    // The phantom: advertised once, never registered. letai holds all 1000
+    // bytes, so the session IS delivered — nothing will ever be written to
+    // orgX, and counting its debt pinned the percentage below 100 forever for
+    // something no action could settle.
     const l = build({ letai: 1000, orgX: 0 }, false);
-    const d = l.notDelivered[0]!;
-    const orgX = d.destinations.find((x) => x.key === "orgX")!;
+    assert.equal(l.delivered, 1);
+    assert.equal(l.uploading, 0);
+    assert.equal(l.uploadingBytes, 0);
+    assert.equal(l.percent, 100);
+    assert.equal(l.notDelivered.length, 0);
+  });
+
+  it("still NAMES the unknown destination it stopped billing", () => {
+    // Excluding the debt must not make the key silent: it is carried forever
+    // otherwise, and the device that carried 43 of them reported none.
+    const l = build({ letai: 1000, orgX: 0 }, false);
+    assert.equal(l.stranded.length, 1);
+    assert.equal(l.stranded[0]!.key, "orgX");
+    assert.equal(l.stranded[0]!.sessions, 1);
+    assert.equal(l.stranded[0]!.bytes, 1000);
+  });
+
+  it("DOES bill an unknown destination when no reachable store has the bytes", () => {
+    // The safety case: unknown is only inert because a store we can reach
+    // already holds the whole session. Without that, the session is genuinely
+    // undelivered and must stay backlog — the next append-url sends it and
+    // prunes the dead key.
+    const l = build({ letai: 400, orgX: 0 }, false);
+    assert.equal(l.uploading, 1);
+    assert.equal(l.stranded.length, 0);
+    const orgX = l.notDelivered[0]!.destinations.find((x) => x.key === "orgX")!;
     assert.equal(orgX.state, "unknown");
     assert.equal(orgX.owed, 1000);
-    // and the complete one is reported as complete, so the contrast is visible
-    assert.equal(d.destinations.find((x) => x.key === "letai")!.owed, 0);
   });
 
   it("marks a registered held destination as offline, not unknown", () => {

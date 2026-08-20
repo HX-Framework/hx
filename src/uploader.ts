@@ -107,6 +107,22 @@ export class HxHttpError extends Error {
     return null;
   }
 
+  /** 409 quarantine: the gateway cannot decide WHERE to write this session.
+   *  It happens when routing is ambiguous — the uploader belongs to more than
+   *  one self-hosted org and the session has no parent row to inherit routing
+   *  from — and the gateway refuses to guess which enterprise's bucket to use.
+   *
+   *  A 4xx is normally this file's own fault, so this would otherwise fall
+   *  through to the generic per-file backoff: no blocker, no skip reason,
+   *  nothing in `hx status`, and a retry on every poll forever. One device
+   *  logged 798,704 of them — every child agent lane it owns, refused for
+   *  weeks — with no indication anywhere that a routing decision was missing.
+   *  It is a per-session HOLD, not a fault: nothing about the file changes it,
+   *  and it clears the moment routing resolves. */
+  get routingQuarantined(): boolean {
+    return this.status === 409 && this.message.includes('"error":"quarantine"');
+  }
+
   /** 410 session_deleted: the session was PERMANENTLY deleted server-side. The
    *  one terminal per-session signal in the protocol — callers record it in
    *  state (deletedSessions) and never upload any lane of the session again.

@@ -26,7 +26,14 @@ export type StateScope = "main" | "local";
  *  gateway reported the session's vault down (503 vault_offline); `store_unreachable`
  *  = a store this session routes to directly answered with a 5xx or couldn't be
  *  reached at all. Surfaced by `hx status` so a stuck session shows a reason. */
-export type FileSkipReason = "vault_offline" | "vault_home_unreachable" | "store_unreachable";
+export type FileSkipReason =
+  | "vault_offline"
+  | "vault_home_unreachable"
+  | "store_unreachable"
+  /** 409 quarantine: the gateway cannot decide where to write this session
+   *  (ambiguous multi-org routing). A hold, not a fault — see
+   *  HxHttpError.routingQuarantined. */
+  | "quarantine";
 
 /** Non-sensitive routing context returned by the gateway for a held upload. */
 export interface SyncBlockerDestination {
@@ -715,6 +722,58 @@ export async function reconcileDestinations(
   // append-url's destination set; a lost key reads as offset 0, so no
   // committed-byte durability rides on this write.
   if (changed) await persistOrMark(state, scope);
+}
+
+/**
+ * Drop offset keys naming a destination this device has no record of, on files
+ * that are no longer on disk.
+ *
+ * `reconcileDestinations` already prunes a departed destination — but only from
+ * inside the append-url path, so it can only ever repair a file the daemon
+ * still uploads. A file that has left the disk is never attempted again, so a
+ * key it picked up during a routing experiment stays in state forever. One
+ * device carried 43 of them for an org that advertised itself once and was
+ * never seen again; every one of those sessions read as owing its whole size.
+ *
+ * BOTH conditions are required, and the pairing is the whole safety argument.
+ * Absence from the registry alone is NOT evidence of a dead destination — a
+ * newly attached vault legitimately sits at offset 0 before any pass records
+ * it — but that file is on disk and still uploading, so requiring absence from
+ * disk leaves every live case untouched. A state with no registry at all is
+ * skipped outright: "we have never recorded a destination" would otherwise
+ * read as "every destination is dead".
+ */
+export async function pruneStrandedOffsets(
+  scope: StateScope = "main",
+  onDisk: (filePath: string) => boolean = existsSync,
+): Promise<{ keys: number; files: number }> {
+  const state = await loadState(scope);
+  const pruned = pruneStrandedOffsetsFrom(state, onDisk);
+  if (pruned.keys > 0) await persistThrough(state, scope);
+  return pruned;
+}
+
+/** The prune itself, as a pure mutation over a loaded state — exported so the
+ *  two-condition contract above is directly tested without a filesystem. */
+export function pruneStrandedOffsetsFrom(
+  state: HxState,
+  onDisk: (filePath: string) => boolean,
+): { keys: number; files: number } {
+  if (state.destinations === undefined) return { keys: 0, files: 0 };
+  let keys = 0;
+  let files = 0;
+  for (const [filePath, fs] of Object.entries(state.files)) {
+    const offsets = fs.offsets ?? {};
+    const dead = Object.keys(offsets).filter(
+      (k) => k !== destKey(null) && state.destinations?.[k] === undefined,
+    );
+    if (dead.length === 0) continue;
+    if (onDisk(filePath)) continue;
+    for (const k of dead) delete offsets[k];
+    keys += dead.length;
+    files += 1;
+  }
+  return { keys, files };
 }
 
 /** Apply a gateway's current destination set to an offset map. Exported as a

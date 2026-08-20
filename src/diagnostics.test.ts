@@ -7,6 +7,7 @@ import {
 } from "./diagnostics.js";
 import type { SyncReport } from "./watch.js";
 import { buildLedger } from "./ledger.js";
+import type { HxState } from "./state.js";
 
 /** Real (empty) ledger — the doctor report reads only the blocker fields, so
  *  these fixtures exercise the same shape computeSyncReport produces. */
@@ -105,5 +106,61 @@ describe("sync diagnostics", () => {
     );
     assert.equal(out.ok, true);
     assert.match(formatSyncDoctorText(out), /healthy — 100% uploaded/);
+  });
+});
+
+// A dead destination key is excluded from the percentage, so the ONE thing it
+// must never be is silent — that combination is how a device carried 43 of
+// them across two gateway migrations while reporting a clean bill of health.
+describe("dead destination keys in the detailed report", () => {
+  const withStranded = (): SyncReport => {
+    const state: HxState = {
+      files: {
+        "/a.jsonl": {
+          path: "/a.jsonl",
+          family: "claude-desktop",
+          sessionId: "sess-a",
+          offsets: { letai: 1000, "org-phantom": 0 },
+          lastMtimeMs: 0,
+          lastUploadAtMs: 0,
+        },
+      },
+      destinations: {
+        letai: { vaultOrgId: null, status: "ready", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+      },
+    };
+    return {
+      snapshot: { total: 1, done: 1, totalBytes: 1000 },
+      behind: [],
+      unwatched: 0,
+      excluded: [],
+      undiscovered: { fileGone: 0, onDiskButUndiscovered: 0 },
+      childLanes: { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0 },
+      skipped: [],
+      ledger: buildLedger({
+        files: [{ path: "/a.jsonl", size: 1000, mtimeMs: 0 }],
+        state,
+        incompleteSessions: 0,
+        nowMs: 30 * 24 * 60 * 60 * 1000,
+      }),
+    };
+  };
+
+  it("names the dead key even though the session counts as delivered", () => {
+    const text = formatSyncDoctorText(buildSyncDoctorReport(withStranded(), "https://let.ai/_api/hx-gateway", 0));
+    assert.match(text, /DEAD DESTINATION KEYS/);
+    assert.match(text, /org-phantom/);
+  });
+
+  it("says plainly that the debt is not counted", () => {
+    const text = formatSyncDoctorText(buildSyncDoctorReport(withStranded(), "https://let.ai/_api/hx-gateway", 0));
+    assert.match(text, /NOT counted/);
+  });
+
+  it("keeps the session out of the owing list entirely", () => {
+    const r = withStranded();
+    assert.equal(r.ledger.delivered, 1);
+    assert.equal(r.ledger.percent, 100);
+    assert.equal(r.ledger.notDelivered.length, 0);
   });
 });
