@@ -44,7 +44,7 @@ export function FortressDetail() {
               <>
                 <div className="frw"><span className="k">Status</span><span><span className="v">{dest.blocked ? "Held — retrying" : "Connected"}</span><div className="vs">last upload {fmtRelative(dest.lastUploadAtMs)}</div></span></div>
                 {dest.blocked && (
-                  <div className="frw"><span className="k">Held</span><span><span className="v">{plural(dest.blocked.sessions, "session")}</span><div className="vs">{dest.blocked.reason === "vault_offline" ? "Session Vault offline — held safely until it reconnects; nothing is lost" : dest.blocked.reason === "vault_home_unreachable" ? "Home Fortress not connected — held safely until it comes online; nothing is lost" : dest.blocked.reason === "quarantine" ? "Routing not decided yet — the gateway will place these once the parent upload lands" : "store unreachable — retrying with backoff"}</div></span></div>
+                  <div className="frw"><span className="k">Held</span><span><span className="v">{plural(dest.blocked.sessions, "session")}</span><div className="vs">{dest.blocked.reason === "vault_offline" ? "Session Vault offline — held safely until it reconnects; nothing is lost" : dest.blocked.reason === "vault_home_unreachable" ? "Home Fortress not connected — held safely until it comes online; nothing is lost" : "store unreachable — retrying with backoff"}</div></span></div>
                 )}
               </>
             )}
