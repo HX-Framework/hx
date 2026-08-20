@@ -15,7 +15,7 @@
 import { homedir, platform, userInfo } from "node:os";
 import { join, dirname, win32 as winPath } from "node:path";
 import { writeFile, mkdir, unlink, readFile, open, stat, copyFile, truncate, rename } from "node:fs/promises";
-import { existsSync, readFileSync, createWriteStream, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, createWriteStream, mkdirSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { HX_DIR } from "./hx-home.js";
 
@@ -1103,10 +1103,56 @@ export async function rotateLogsIfLarge(
   // half-written, destroying the history this exists to preserve. Callers are
   // gated too; this makes the function safe on its own terms.
   if (rotationInFlight) return rotationInFlight;
-  rotationInFlight = rotateOnce(maxBytes, targets).finally(() => {
+  rotationInFlight = rotateGuarded(maxBytes, targets).finally(() => {
     rotationInFlight = null;
   });
   return rotationInFlight;
+}
+
+/** How long a rotate lock may sit before another process treats it as abandoned.
+ *  Comfortably longer than copying a capped log, short enough that a killed
+ *  daemon does not disable rotation until someone notices. */
+const ROTATE_LOCK_STALE_MS = 5 * 60_000;
+
+/**
+ * Cross-process mutual exclusion, which the in-process guard cannot provide.
+ *
+ * A foreground `hx watch` runs the same command as the installed service, so
+ * nothing distinguishes them and both may rotate. Staging plus an atomic rename
+ * is NOT sufficient, and the comment that said it was overstated the guarantee:
+ * the rename is atomic, but it says nothing about what was copied. A second
+ * process that stats the log before the first truncates goes on to copy a file
+ * being emptied underneath it, then renames that short copy over the complete
+ * generation. Measured on a 600 MB log with a 350 ms stagger: 600 MB of history
+ * became 375 MB. Started later still, `.1` ends up empty.
+ *
+ * O_EXCL create is the check — an exists-then-create leaves the same window.
+ */
+async function rotateGuarded(maxBytes: number, targets: readonly string[]): Promise<string[]> {
+  const lock = join(HX_DIR, "rotate.lock");
+  try {
+    await writeFile(lock, String(process.pid), { flag: "wx", mode: 0o600 });
+  } catch {
+    // Held. Abandoned locks would otherwise disable rotation forever, so a
+    // stale one may be taken over; a live one means someone else is already
+    // doing this and there is nothing to add.
+    const held = statSync(lock, { throwIfNoEntry: false });
+    if (!held || Date.now() - held.mtimeMs < ROTATE_LOCK_STALE_MS) return [];
+    try {
+      await writeFile(lock, String(process.pid), { mode: 0o600 });
+    } catch {
+      return [];
+    }
+  }
+  try {
+    return await rotateOnce(maxBytes, targets);
+  } finally {
+    try {
+      await unlink(lock);
+    } catch {
+      /* already gone */
+    }
+  }
 }
 
 async function rotateOnce(maxBytes: number, targets: readonly string[]): Promise<string[]> {
@@ -1118,18 +1164,12 @@ async function rotateOnce(maxBytes: number, targets: readonly string[]): Promise
       // never request input.
       const st = await stat(target);
       if (st.size <= maxBytes) continue;
-      // Copy to a temp, then RENAME into place, then truncate. The in-process
-      // guard above cannot help across processes — a foreground `hx watch` runs
-      // the same command as the service, so nothing in `opts` distinguishes
-      // them — and copying straight onto `.1` opens it O_TRUNC, so an overlap
-      // could leave the kept generation empty or half-written: the exact loss
-      // rotation exists to prevent. Rename is atomic, so `.1` is only ever a
-      // complete copy, whoever wins.
-      // Per-process staging name. A single shared `.rotating` path is the same
-      // inode in every process, so two rotations would stream into one file —
-      // one renames it into place while the other is still writing, and the
-      // kept generation is short. That is the very failure the rename was added
-      // to prevent, so the name has to be unique for the claim to hold.
+      // Copy to a per-process staging file, then RENAME into place, then
+      // truncate. Copying straight onto `.1` opens it O_TRUNC, so a reader
+      // would see a half-written generation; the rename makes the swap atomic.
+      // Mutual exclusion is the LOCK's job, not the rename's — see
+      // rotateGuarded. Staging stays per-pid so a stale lock takeover cannot
+      // have two processes streaming into one inode.
       const staging = `${target}.rotating.${process.pid}`;
       // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above
       await copyFile(target, staging);

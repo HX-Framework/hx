@@ -9,10 +9,10 @@
 // keeps working across a rotation, which is the whole safety argument.
 import { describe, it, afterEach } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, openSync, writeSync, closeSync, statSync, fstatSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, openSync, writeSync, closeSync, statSync, fstatSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rotateLogsIfLarge, seedBacklogLines } from "./daemon.js";
+import { rotateLogsIfLarge, seedBacklogLines, HX_DIR } from "./daemon.js";
 
 let dir = "";
 const make = (): string => {
@@ -100,8 +100,12 @@ describe("rotateLogsIfLarge under concurrent callers", () => {
     // Whatever the interleaving, the kept generation must be the real history.
     assert.equal(readFileSync(`${p}.1`, "utf8").length, 4096);
     assert.equal(statSync(p).size, 0);
-    // Exactly one rotation happened; the other observed the same result.
-    assert.deepEqual(a, b);
+    // IDENTITY, not deepEqual. The guard hands the second caller the first
+    // call's promise, so both slots are the same array object; deepEqual passes
+    // for any implementation — including one with the guard removed, where two
+    // independent rotations return two equal arrays — so it asserted nothing
+    // about the property this test is named for.
+    assert.ok(a === b, "second caller must observe the first rotation, not run its own");
   });
 });
 
@@ -149,5 +153,57 @@ describe("seedBacklogLines at scale", () => {
     const out = seedBacklogLines("tail\n", prev, 1_000_000);
     assert.equal(out.length, 1_000_000);
     assert.equal(out[out.length - 1], "tail");
+  });
+});
+
+// The in-process guard cannot see another PROCESS, and a foreground `hx watch`
+// runs the same command as the installed service. Staging plus an atomic rename
+// is not enough: the rename is atomic, but it says nothing about what was
+// copied — a second process that stats the log before the first truncates goes
+// on to copy a file being emptied underneath it, then renames that short copy
+// over the complete generation. Measured on a 600 MB log: 375 MB survived.
+describe("rotateLogsIfLarge cross-process lock", () => {
+  const lockPath = (): string => join(HX_DIR, "rotate.lock");
+
+  it("stands down while another process holds the lock", async () => {
+    const p = make();
+    writeFileSync(p, "z".repeat(4096));
+    writeFileSync(lockPath(), "99999");
+    try {
+      assert.deepEqual(await rotateLogsIfLarge(1024, [p]), []);
+      // Untouched: no truncate, no generation written.
+      assert.equal(statSync(p).size, 4096);
+      assert.equal(existsSync(`${p}.1`), false);
+    } finally {
+      rmSync(lockPath(), { force: true });
+    }
+  });
+
+  it("takes over a lock left behind by a dead process", async () => {
+    // Otherwise one killed daemon disables rotation permanently.
+    const p = make();
+    writeFileSync(p, "z".repeat(4096));
+    writeFileSync(lockPath(), "99999");
+    const old = Date.now() / 1000 - 3600;
+    utimesSync(lockPath(), old, old);
+    try {
+      assert.deepEqual(await rotateLogsIfLarge(1024, [p]), [p]);
+      assert.equal(statSync(p).size, 0);
+      assert.equal(readFileSync(`${p}.1`, "utf8").length, 4096);
+    } finally {
+      rmSync(lockPath(), { force: true });
+    }
+  });
+
+  it("releases the lock when it is done", async () => {
+    const p = make();
+    writeFileSync(p, "z".repeat(4096));
+    await rotateLogsIfLarge(1024, [p]);
+    assert.equal(existsSync(lockPath()), false);
+  });
+
+  it("releases the lock even when every target fails", async () => {
+    await rotateLogsIfLarge(1024, [join(dir, "absent.log")]);
+    assert.equal(existsSync(lockPath()), false);
   });
 });

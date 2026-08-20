@@ -198,9 +198,21 @@ export function buildSyncDoctorReport(
   }));
   const gapSessions = new Set([...gone, ...aged]).size;
   return {
+    // childLanes.held is part of the verdict, not decoration. Every other input
+    // here is parent-session-only: blockedSessionKeys comes from
+    // report.skipped, which collectSkipped builds from DISCOVERED files, and
+    // discovery never walks the subagents tree. So a device whose every child
+    // lane was refused still answered "healthy — 100% uploaded", and the UI
+    // (which reads this same `ok`) still showed "caught up". That blind spot is
+    // what this whole change set exists to close; leaving it in the headline
+    // verdict would have closed it everywhere except the one line people read.
+    //
+    // `held`, not `owing`: lanes owing bytes are ordinary in-flight work, while
+    // a hold means this lane will NOT retry until released.
     ok:
       blockedSessionKeys.size === 0 &&
       gapSessions === 0 &&
+      report.childLanes.held === 0 &&
       report.snapshot.done >= report.snapshot.total,
     generatedAt: new Date(nowMs).toISOString(),
     sync: {

@@ -321,7 +321,18 @@ function lagOf(
   // above returns an empty one. Returning it populated billed the same bytes
   // twice — once as backlog and again as stranded — so a 1000-byte file
   // accounted for 2000, and with two phantom keys, 3000.
-  if (!sawRealDestination) return { reachable: size, offline, unknown: new Map() };
+  if (!sawRealDestination) {
+    // Keys kept, debts zeroed. Dropping the map entirely also dropped the
+    // session from the stranded SUMMARY, while its per-session detail still
+    // listed the key — so the report showed three sessions carrying a dead key
+    // above a summary that said one. The bytes must stay out (they are already
+    // billed to the primary above); the session count must not.
+    return {
+      reachable: size,
+      offline,
+      unknown: new Map([...unknown.keys()].map((k) => [k, 0])),
+    };
+  }
   return { reachable, offline, unknown };
 }
 

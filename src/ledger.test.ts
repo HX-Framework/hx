@@ -919,13 +919,22 @@ describe("accounting invariants", () => {
   });
 
   for (const [name, offsets] of shapes.slice(0, 2)) {
-    it(`a file billed to the primary is not ALSO reported stranded — ${name}`, () => {
+    it(`a file billed to the primary contributes NO stranded bytes — ${name}`, () => {
       // Every key is a phantom, so lagOf bills the whole file to the primary.
-      // Reporting the phantom's notional debt on top counted a 1000-byte file
-      // as 2000 — and 3000 with two phantom keys.
+      // Adding the phantom's notional debt on top counted a 1000-byte file as
+      // 2000 — and 3000 with two phantom keys.
       const l = ledgerFor(offsets);
       assert.equal(l.uploadingBytes, 1000);
-      assert.deepEqual(l.stranded, []);
+      assert.equal(l.stranded.reduce((n, x) => n + x.bytes, 0), 0);
+    });
+
+    it(`...but its session is still COUNTED against the dead key — ${name}`, () => {
+      // Suppressing the bytes must not suppress the session: the per-session
+      // detail lists the key, so a summary that omits the session contradicts
+      // the lines directly above it.
+      const l = ledgerFor(offsets);
+      assert.equal(l.stranded.length, Object.keys(offsets).length);
+      for (const d of l.stranded) assert.equal(d.sessions, 1);
     });
   }
 
