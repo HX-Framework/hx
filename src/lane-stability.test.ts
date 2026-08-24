@@ -68,21 +68,30 @@ function mkCopy(project: string, sid: string, laneMtime: number, dirMtime: numbe
   return lane;
 }
 
-/** A workflow run (journal only) under a session dir, re-pinning the project
- *  and session dir mtimes afterwards — creating files bumps them, and dormancy
- *  is the condition under test. */
-function mkRun(project: string, sid: string, runId: string, dirMtime: number): void {
+/** A workflow run (journal only) under a session dir.
+ *
+ *  Everything it creates or touches is pinned AGED, deliberately and without a
+ *  knob. Creating the run bumps every ancestor mtime up to the project dir, so
+ *  a helper that let the caller choose could — and did — silently un-dormant
+ *  the project dir and hand the walk the very thing the test was checking the
+ *  walk could not see. The journal's own mtime is free to be old: the run scan
+ *  is unwindowed, which is the whole reason runs are the observable here. */
+function mkRun(project: string, sid: string, runId: string): void {
   const projectDir = join(base, "claude", "projects", project);
   const runDir = join(projectDir, sid, "subagents", "workflows", runId);
   mkdirSync(runDir, { recursive: true });
   const journal = join(runDir, "journal.jsonl");
   writeFileSync(journal, "{}");
-  touch(journal, dirMtime);
-  touch(runDir, dirMtime);
-  touch(join(projectDir, sid, "subagents", "workflows"), dirMtime);
-  touch(join(projectDir, sid, "subagents"), dirMtime);
-  touch(join(projectDir, sid), dirMtime);
-  touch(projectDir, dirMtime);
+  for (const p of [
+    journal,
+    runDir,
+    join(projectDir, sid, "subagents", "workflows"),
+    join(projectDir, sid, "subagents"),
+    join(projectDir, sid),
+    projectDir,
+  ]) {
+    touch(p, AGED);
+  }
 }
 
 afterEach(() => {
@@ -202,7 +211,7 @@ describe("session-dir registration is gated to the lanes that need it", () => {
     const roots = mkRoots();
     const sid = "44444444-4444-4444-4444-444444444444";
     mkCopy("proj-dormant", sid, AGED, AGED);
-    mkRun("proj-dormant", sid, "wf_dormant", AGED);
+    mkRun("proj-dormant", sid, "wf_dormant");
 
     const cat = new DiscoveryCatalog();
     await cat.sweep(roots, NOW);
@@ -223,7 +232,7 @@ describe("session-dir registration is gated to the lanes that need it", () => {
     const roots = mkRoots();
     const sid = "66666666-6666-6666-6666-666666666666";
     mkCopy("proj-dormant", sid, NEWER, AGED);
-    mkRun("proj-dormant", sid, "wf_live", NEWER);
+    mkRun("proj-dormant", sid, "wf_live");
 
     const cat = new DiscoveryCatalog();
     await cat.sweep(roots, NOW);
@@ -233,7 +242,6 @@ describe("session-dir registration is gated to the lanes that need it", () => {
     await cat.sweep(roots, NOW + 10_000);
     assert.deepEqual(cat.listChildren().runs.map((r) => r.runId), ["wf_live"]);
   });
-
 });
 
 describe("sessionDirOfLane", () => {

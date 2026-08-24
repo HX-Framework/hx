@@ -2333,7 +2333,14 @@ export async function tickOnce(
       // those as owed. Merged before election and contention counting so a
       // swept lane rides the identical gates, and merged BY PATH because a
       // duplicate here reads as lane contention and would reset offsets.
-      if (backfillDue(`${scope}:children`, Date.now())) {
+      // Catalog only, and not merely because adoption needs it. Legacy mode
+      // has nowhere to register a rescued lane, so the lane would be visible
+      // on sweep ticks and invisible on every other one — and that flicker is
+      // read as an uploader takeover, clearing the lane's offsets every hour.
+      // Legacy had no child sweep at all before this PR, so stranded-but-quiet
+      // is the shape it is supposed to restore; giving it an hourly wipe loop
+      // instead would be a new wart, not a preserved one.
+      if (catalog && backfillDue(`${scope}:children`, Date.now())) {
         markBackfillRun(`${scope}:children`, Date.now());
         try {
           const swept = await discoverChildBackfill(roots, state);
@@ -2354,10 +2361,8 @@ export async function tickOnce(
           // reads as a takeover and answers by clearing offsets. Offer, not
           // hand: the catalog takes only in-window lanes, which is the whole
           // population that can oscillate. See DiscoveryCatalog.adoptSessionDir.
-          if (catalog) {
-            const at = Date.now();
-            for (const c of merged.added) catalog.adoptSessionDir(c, at);
-          }
+          const at = Date.now();
+          for (const c of merged.added) catalog.adoptSessionDir(c, at);
           children = merged.children;
           runs = merged.runs;
         } catch (err) {
