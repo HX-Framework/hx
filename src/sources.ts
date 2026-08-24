@@ -187,7 +187,16 @@ export async function readdirSafe(p: string): Promise<string[]> {
   }
 }
 
-/** Collect agent-*.jsonl files in one directory into `out`. */
+/** Collect agent-*.jsonl files in one directory into `out`.
+ *
+ *  `maxAgeMs` is the caller's window, not a constant: the hot loop bounds it
+ *  for cadence, the hourly sweep passes Infinity because a lane that has been
+ *  quiet for months is exactly the one that needs rescuing. Hard-coding
+ *  RECENT_WINDOW_MS here made the child half of discovery permanently blind to
+ *  its own backlog — a lane paused by the parent-lane latch or benched by an
+ *  offline vault simply left discovery 30 days later, while still being billed
+ *  as owed. Note the asymmetry with the workflow-run and journal scans in
+ *  scanSessionArtifacts, which never windowed at all. */
 async function collectAgentFiles(
   dir: string,
   parentSessionId: string,
@@ -195,6 +204,7 @@ async function collectAgentFiles(
   now: number,
   rootDir: string,
   out: DiscoveredChildFile[],
+  maxAgeMs: number = RECENT_WINDOW_MS,
 ): Promise<void> {
   for (const f of await readdirSafe(dir)) {
     const m = AGENT_FILE_RE.exec(f);
@@ -202,7 +212,7 @@ async function collectAgentFiles(
     const p = path.join(dir, f);
     const st = await statSafe(p);
     if (!st || st.isDir || st.size === 0) continue;
-    if (now - st.mtimeMs > RECENT_WINDOW_MS) continue;
+    if (now - st.mtimeMs > maxAgeMs) continue;
     const metaPath = path.join(dir, `agent-${m[1]}.meta.json`);
     out.push({
       path: p,
@@ -222,10 +232,14 @@ async function collectAgentFiles(
  * Scans only session-id SUBDIRECTORIES (rare next to the flat jsonl files), so
  * the added cost over discoverClaudeFiles is a few readdirs per active session.
  */
-export async function discoverClaudeChildren(roots: DataRoot[]): Promise<{
+export async function discoverClaudeChildren(
+  roots: DataRoot[],
+  opts: { maxAgeMs?: number } = {},
+): Promise<{
   children: DiscoveredChildFile[];
   runs: DiscoveredWorkflowRun[];
 }> {
+  const maxAgeMs = opts.maxAgeMs ?? RECENT_WINDOW_MS;
   const children: DiscoveredChildFile[] = [];
   const runs: DiscoveredWorkflowRun[] = [];
   const now = Date.now();
@@ -234,13 +248,16 @@ export async function discoverClaudeChildren(roots: DataRoot[]): Promise<{
     if (dir.startsWith(".") || dir === "memory") continue;
     const projectDir = path.join(claudeProjectsDir(root.configDir), dir);
     const pst = await statSafe(projectDir);
-    if (!pst?.isDir || now - pst.mtimeMs > RECENT_WINDOW_MS) continue;
+    // Same dir-mtime prune as the parent walk, and the same reason it must be
+    // liftable: a child written today lives under a project dir whose mtime
+    // has not moved in a year.
+    if (!pst?.isDir || now - pst.mtimeMs > maxAgeMs) continue;
     for (const entry of await readdirSafe(projectDir)) {
       if (entry.endsWith(".jsonl") || entry.startsWith(".")) continue;
       const sessionDir = path.join(projectDir, entry);
       const sst = await statSafe(sessionDir);
       if (!sst?.isDir) continue;
-      await scanSessionArtifacts(sessionDir, entry, root.configDir, now, children, runs);
+      await scanSessionArtifacts(sessionDir, entry, root.configDir, now, children, runs, maxAgeMs);
     }
   }
   }
@@ -262,10 +279,11 @@ export async function scanSessionArtifacts(
   now: number,
   children: DiscoveredChildFile[],
   runs: DiscoveredWorkflowRun[],
+  maxAgeMs: number = RECENT_WINDOW_MS,
 ): Promise<void> {
   // Interactive subagents.
   const subagentsDir = path.join(sessionDir, "subagents");
-  await collectAgentFiles(subagentsDir, sessionId, null, now, rootDir, children);
+  await collectAgentFiles(subagentsDir, sessionId, null, now, rootDir, children, maxAgeMs);
 
   // Workflow runs: per-run agent transcripts + journal.
   const wfRoot = path.join(subagentsDir, "workflows");
@@ -273,7 +291,7 @@ export async function scanSessionArtifacts(
     const runDir = path.join(wfRoot, runId);
     const rst = await statSafe(runDir);
     if (!rst?.isDir) continue;
-    await collectAgentFiles(runDir, sessionId, runId, now, rootDir, children);
+    await collectAgentFiles(runDir, sessionId, runId, now, rootDir, children, maxAgeMs);
     const journalPath = path.join(runDir, "journal.jsonl");
     const jst = await statSafe(journalPath);
     // One session can appear under SEVERAL project dirs (the cwd changed

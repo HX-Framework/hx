@@ -82,7 +82,14 @@ import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
 import { buildLedger, everWrittenKeys, reportableOffset, type SyncLedger } from "./ledger.js";
-import { backfillDue, discoverBackfill, markBackfillRun } from "./backfill.js";
+import {
+  backfillDue,
+  discoverBackfill,
+  discoverChildBackfill,
+  markBackfillRun,
+  mergeBackfill,
+  mergeChildBackfill,
+} from "./backfill.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
@@ -295,6 +302,11 @@ export interface WatchOptions {
 }
 
 const DEFAULT_CHUNK_LIMIT = 4 * 1024 * 1024;
+/** Chunks one backfilled child lane may send within a single pass. A rescued
+ *  lane is invisible to the walk, so its only other cadence is the hourly
+ *  sweep — without an in-pass drain a large lane would trickle for days.
+ *  Bounded so one lane cannot monopolise a pass. */
+const SWEPT_LANE_MAX_CHUNKS = 16;
 
 // Which state file this config's offsets live in (see StateScope in state.ts).
 // The `--local` tee runs the same pipeline against the local dev gateway with
@@ -2022,32 +2034,42 @@ export async function tickOnce(
   // The unwindowed sweep: once on start, then hourly. Live discovery above
   // prunes to 30 days for CADENCE (a 1.5s loop cannot stat 100k files), but
   // that bound was also silently deciding what would ever be uploaded at all —
-  // so a file that went 30 days unignested was abandoned with no report. This
-  // reaches everything still on disk that has not been fully delivered.
+  // so a file the hot loop could not see was abandoned with no report. This
+  // reaches everything still on disk that has not been fully delivered,
+  // whatever its age: the hot loop prunes by project-DIRECTORY mtime, which an
+  // append never bumps, so "recent" is no guarantee anyone else looked.
   // Merged BEFORE election/filtering so a backfilled file passes through the
-  // identical gates (twin election, settings excludes, tombstones, routing).
+  // identical gates (twin election, settings excludes, tombstones, routing),
+  // and merged BY PATH so the overlap with the hot loop costs nothing.
   if (!opts.only && backfillDue(scope, Date.now())) {
     markBackfillRun(scope, Date.now());
     try {
-      const older = await discoverBackfill(roots, state, Date.now());
-      if (older.length > 0) {
-        const known = new Set(files.map((f) => f.path));
-        const added = older.filter((f) => !known.has(f.path));
+      const owed = await discoverBackfill(roots, state, Date.now());
+      if (owed.length > 0) {
+        const merged = mergeBackfill(files, owed);
+        const added = merged.added;
         const unseen = added.filter((f) => !state.files[f.path]).length;
         if (added.length > 0) {
           log(
-            `[hx] backfill: ${added.length} session${added.length === 1 ? "" : "s"} older than the 30-day window still undelivered (${unseen} never ingested) — queueing`,
+            `[hx] backfill: ${added.length} session${added.length === 1 ? "" : "s"} the live sweep did not reach still owe bytes (${unseen} never ingested) — queueing`,
           );
-          files = [...files, ...added];
+          files = merged.files;
+          // Hand them to the catalog so they ride normal tiers from here on.
+          // Without this the sweep re-finds the same blind-spot files every
+          // hour, uploads them at hourly cadence while they are still being
+          // written, and makes the progress snapshot breathe as they appear
+          // and vanish from the pass. Adoption grants no exemptions — see
+          // DiscoveryCatalog.adopt.
+          catalog?.adopt(added, Date.now());
         } else {
           // Silence here was ambiguous: "the sweep is not running" and "the
           // sweep ran and found nothing" looked identical from the log.
           log(
-            `[hx] backfill: ${older.length} session(s) older than the window, all already queued this pass — nothing to add`,
+            `[hx] backfill: ${owed.length} session(s) still owed, all already queued this pass — nothing to add`,
           );
         }
       } else {
-        log("[hx] backfill: nothing older than the 30-day window still owes bytes");
+        log("[hx] backfill: nothing on disk still owes bytes");
       }
     } catch (err) {
       // Never let the slow sweep break a pass: the live backlog matters more,
@@ -2286,10 +2308,44 @@ export async function tickOnce(
   // counts sessions, and a child stream is part of its session, not a new one.
   if (!opts.only && Date.now() >= (childEndpointsMissingUntilMs.get(scope) ?? 0)) {
     const parentByArtifactSession = buildChildParentIndex(state);
+    // Lanes this pass rescued from the blind spot. They get to drain here
+    // rather than one chunk per sweep: nothing will re-discover them next tick
+    // (the walk still cannot see them), so a lane bigger than one chunk would
+    // otherwise trickle at one chunk per HOUR.
+    const sweptLanes = new Set<string>();
     try {
-      const { children, runs } = catalog
+      let { children, runs } = catalog
         ? catalog.listChildren()
         : await discoverClaudeChildren(roots.claude);
+      // The child sweep, on its own hourly lane. The walk cannot reach a lane
+      // inside a dormant project dir, and it used to drop any lane quiet for
+      // 30 days — but quiet is the NORMAL state of a lane the parent-lane
+      // latch froze or an offline vault benched, and the ledger keeps billing
+      // those as owed. Merged before election and contention counting so a
+      // swept lane rides the identical gates, and merged BY PATH because a
+      // duplicate here reads as lane contention and would reset offsets.
+      if (backfillDue(`${scope}:children`, Date.now())) {
+        markBackfillRun(`${scope}:children`, Date.now());
+        try {
+          const swept = await discoverChildBackfill(roots, state);
+          const merged = mergeChildBackfill(children, runs, swept.children, swept.runs);
+          if (merged.added.length > 0) {
+            const unseen = merged.added.filter((c) => !state.files[c.path]).length;
+            log(
+              `[hx] child backfill: ${merged.added.length} lane${merged.added.length === 1 ? "" : "s"} the live sweep did not reach still owe bytes (${unseen} never ingested) — queueing`,
+            );
+          }
+          for (const c of merged.added) sweptLanes.add(c.path);
+          children = merged.children;
+          runs = merged.runs;
+        } catch (err) {
+          // Same contract as the parent sweep: never let the slow scan break
+          // the pass. The live lanes still upload; the next hour retries.
+          log(
+            `[hx] child backfill skipped: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
       const electedChildren = electChildUploaders(children, log);
       const lanePlan = planChildLaneResets(
         electedChildren,
@@ -2337,8 +2393,17 @@ export async function tickOnce(
           return;
         }
         try {
-          const did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
+          let did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
           if (did) uploaded += 1;
+          // Drain a rescued lane in place, bounded so one large lane cannot
+          // monopolise the pass or starve the lanes queued behind it.
+          if (did && sweptLanes.has(c.path)) {
+            for (let i = 1; i < SWEPT_LANE_MAX_CHUNKS && !stopChildren; i++) {
+              did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
+              if (!did) break;
+              uploaded += 1;
+            }
+          }
           if (
             pendingChild?.consecutiveFailures !== undefined ||
             pendingChild?.nextAttemptAtMs !== undefined

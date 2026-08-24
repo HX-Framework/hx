@@ -7,6 +7,12 @@
 // SURVIVES (re-stat-first), and the D-A dir-edge file DROPS (a member's
 // recent mtime must not rescue it — today's hole, replicated deliberately).
 //
+// The dir-edge DROP assertion stays a statement about the CATALOG only. It is
+// no longer a statement about whether the file gets uploaded: the hourly sweep
+// now covers what the walk drops, and admission.test.ts pins that union. Read
+// the two together — this file says what the hot loop sees, that one says what
+// is guaranteed to reach the server.
+//
 // Clock discipline: discover*() uses the real Date.now() internally, so the
 // harness keeps fixture mtimes relative to real now and drives the CATALOG's
 // clock forward explicitly (sweep(roots, at(...))). Window-edge margins are
