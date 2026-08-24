@@ -106,7 +106,9 @@ interface FileEntry {
  *  ≤60 s (M1's cold bound). Dir-level age-out drops are NOT routed here —
  *  D-A replicates the dir prune exactly, and dir re-admission happens
  *  through the dir's own mtime, as today — or, for a dir whose mtime will
- *  never move again, through the hourly sweep and adopt(). Codex rides the same lane: its
+ *  never move again, through the hourly sweep and adopt(). An adopted entry
+ *  can be dropped again by a later D-A transition; that is not a loss, the
+ *  sweep re-adopts it within the hour while it is still owed. Codex rides the same lane: its
  *  readdir is mtime-gated, so a quiet dir's not-yet-admitted rollouts are
  *  never re-statted by the walk itself. */
 interface ExcludedEntry {
@@ -242,9 +244,38 @@ export class DiscoveryCatalog {
    * one the walk inserted. Paths already tracked — including ones the file pass
    * deliberately demoted — are left alone rather than re-promoted.
    */
+  /**
+   * Register a session-artifact dir so childPass walks it on the normal
+   * cadence. The child sweep calls this for every lane it rescues, and it is
+   * not an optimisation — it is what keeps lane election stable.
+   *
+   * A lane that is visible only on sweep ticks makes electChildUploaders
+   * oscillate whenever the lane has a second on-disk candidate (a cwd-change
+   * twin, a copied tree). The sweep tick elects the rescued copy, the next
+   * tick elects the always-visible one, and planChildLaneResets treats each
+   * flip as an uploader takeover — clearing the winner's offsets every time.
+   * A lane larger than one pass's drain would restart from zero every hour and
+   * never finish. Registering the dir keeps the rescued copy in `children`
+   * between sweeps, so the takeover happens once and then stays put.
+   */
+  adoptSessionDir(sessionDir: string, sessionId: string, rootDir: string): boolean {
+    if (this.sessionDirs.has(sessionDir)) return false;
+    // lastWalkMs 0 — due on the next childPass, like a freshly listed dir.
+    this.sessionDirs.set(sessionDir, { sessionDir, sessionId, rootDir, lastWalkMs: 0 });
+    return true;
+  }
+
   adopt(files: readonly DiscoveredFile[], nowMs: number): number {
     let adopted = 0;
     for (const f of files) {
+      // Only files the tiers can actually hold. A file past the window would
+      // enter `parents` and be demoted to `excluded` by the next stat pass —
+      // and the excluded lane has no eviction, so on a fresh install with
+      // years of history every one of them would become a permanent 60s stat
+      // obligation, long after it delivered. That is a scaled-down version of
+      // the burn the tiering was built to remove. Old files are dormant by
+      // definition: the hourly sweep was already the right cadence for them.
+      if (nowMs - f.mtimeMs > RECENT_WINDOW_MS) continue;
       if (this.parents.has(f.path) || this.excluded.has(f.path)) continue;
       this.insertParent(f.path, f.size, f.mtimeMs, f.source, f.rootDir, nowMs);
       // Discovery just statted it; no need to phase-shift toward an early

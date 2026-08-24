@@ -40,29 +40,26 @@ describe("selectBackfill", () => {
     // The exact shape measured on a real device: 106 files, 112.5 MB, no state
     // entry at all. Live discovery cannot see them (past the window) and the
     // reattribute sweep skips them ("live ingest owns them" — it does not).
-    const out = selectBackfill([file("old", 5_000, 45)], { files: {} }, NOW);
+    const out = selectBackfill([file("old", 5_000, 45)], { files: {} });
     assert.equal(out.length, 1);
     assert.equal(out[0]?.path, "old");
   });
 
   it("picks up a partial that aged out mid-upload", () => {
-    const out = selectBackfill([file("old", 5_000, 45)], stateWith(entry("old", { letai: 1_000 })), NOW);
+    const out = selectBackfill([file("old", 5_000, 45)], stateWith(entry("old", { letai: 1_000 })));
     assert.equal(out.length, 1);
   });
 
   it("leaves a fully delivered old file alone", () => {
-    const out = selectBackfill([file("old", 5_000, 45)], stateWith(entry("old", { letai: 5_000 })), NOW);
+    const out = selectBackfill([file("old", 5_000, 45)], stateWith(entry("old", { letai: 5_000 })));
     assert.equal(out.length, 0);
   });
 
   it("stays eligible while ANY destination is still owed bytes", () => {
     // minOffset, not one store: a file complete on the primary but zero on a
     // second destination is not delivered.
-    const out = selectBackfill(
-      [file("old", 5_000, 45)],
-      stateWith(entry("old", { letai: 5_000, orgA: 0 })),
-      NOW,
-    );
+    const out = selectBackfill([file("old", 5_000, 45)],
+      stateWith(entry("old", { letai: 5_000, orgA: 0 })));
     assert.equal(out.length, 1);
   });
 
@@ -73,31 +70,30 @@ describe("selectBackfill", () => {
     // that. While selection mirrored the live window this file belonged to no
     // sweep at all: owed forever, and reported as owed, because the status
     // report scans unwindowed. Age is not a proxy for "someone else owns it".
-    const out = selectBackfill([file("fresh", 5_000, 0)], { files: {} }, NOW);
+    const out = selectBackfill([file("fresh", 5_000, 0)], { files: {} });
     assert.equal(out.length, 1, "owed-ness alone decides — never age");
   });
 
-  it("ignores the clock entirely", () => {
-    // Selection must be a pure function of (on disk, still owed). Pinning it
-    // stops anyone reintroducing a window as an optimisation.
-    const files = [file("a", 10, 0), file("b", 10, 400)];
-    const at = (now: number) => selectBackfill(files, { files: {} }, now).map((f) => f.path);
-    assert.deepEqual(at(NOW), ["a", "b"]);
-    assert.deepEqual(at(NOW + 1_000 * DAY), ["a", "b"]);
-    assert.deepEqual(at(0), ["a", "b"]);
+  it("selects on owed-ness across the whole age range at once", () => {
+    // Selection takes no clock at all — the signature is the proof that no
+    // window can come back as an "optimisation", which is stronger than any
+    // assertion over sampled timestamps. This pins the consequence: age
+    // spreads across four hundred days and changes nothing.
+    const files = [file("today", 10, 0), file("ancient", 10, 400)];
+    assert.deepEqual(
+      selectBackfill(files, { files: {} }).map((f) => f.path),
+      ["today", "ancient"],
+    );
   });
 
   it("separates a mixed disk correctly", () => {
-    const out = selectBackfill(
-      [
+    const out = selectBackfill([
         file("fresh-undelivered", 100, 1),
         file("old-never-seen", 100, 60),
         file("old-partial", 100, 60),
         file("old-done", 100, 60),
       ],
-      stateWith(entry("old-partial", { letai: 40 }), entry("old-done", { letai: 100 })),
-      NOW,
-    );
+      stateWith(entry("old-partial", { letai: 40 }), entry("old-done", { letai: 100 })));
     assert.deepEqual(out.map((f) => f.path).sort(), [
       "fresh-undelivered",
       "old-never-seen",
@@ -134,7 +130,7 @@ describe("gateway-change coverage matrix", () => {
   const NEW = 2;  // days — inside it
 
   it("backfill owns >30d files with NO delivery record", () => {
-    const out = selectBackfill([file("old-never", 100, OLD)], { files: {} }, NOW);
+    const out = selectBackfill([file("old-never", 100, OLD)], { files: {} });
     assert.equal(out.length, 1);
   });
 
@@ -143,7 +139,7 @@ describe("gateway-change coverage matrix", () => {
     // stale-but-complete, so the file looks done. If the audit is windowed,
     // nothing reaches this file and its history never re-uploads.
     const state = stateWith(entry("old-looks-done", { letai: 100 }));
-    const out = selectBackfill([file("old-looks-done", 100, OLD)], state, NOW);
+    const out = selectBackfill([file("old-looks-done", 100, OLD)], state);
     assert.equal(out.length, 0, "backfill must not claim it — the audit verifies it against the server");
   });
 
@@ -151,7 +147,7 @@ describe("gateway-change coverage matrix", () => {
     // Selection is deliberately overlapping now; mergeBackfill is what keeps
     // the hot loop and the sweep from queueing one file twice.
     const state = stateWith(entry("fresh", { letai: 40 }));
-    const picked = selectBackfill([file("fresh", 100, NEW)], state, NOW);
+    const picked = selectBackfill([file("fresh", 100, NEW)], state);
     assert.equal(picked.length, 1, "owed is owed, whatever its age");
     const live = [file("fresh", 100, NEW)];
     assert.deepEqual(mergeBackfill(live, picked).added, [], "the pass already holds it");
@@ -159,7 +155,7 @@ describe("gateway-change coverage matrix", () => {
 
   it("a partial >30d file is still claimed by backfill", () => {
     const state = stateWith(entry("old-partial", { letai: 40 }));
-    assert.equal(selectBackfill([file("old-partial", 100, OLD)], state, NOW).length, 1);
+    assert.equal(selectBackfill([file("old-partial", 100, OLD)], state).length, 1);
   });
 });
 

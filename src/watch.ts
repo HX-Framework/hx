@@ -89,6 +89,7 @@ import {
   markBackfillRun,
   mergeBackfill,
   mergeChildBackfill,
+  sessionDirOfLane,
 } from "./backfill.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
@@ -2014,6 +2015,10 @@ export async function tickOnce(
   // `watch --once`) see identical results either way.
   const legacySweep =
     tuningValue(settings, "sweep") === "legacy" || process.env["HX_SWEEP"] === "legacy";
+  // Legacy mode has no catalog, so no adoption and no session-dir
+  // registration: rescued files and lanes are re-found by the hourly sweep
+  // each time, exactly as they were before the catalog existed. That is the
+  // point of the escape hatch — it restores the old shape, warts included.
   const catalog = legacySweep ? null : catalogFor(scope);
   let files: DiscoveredFile[];
   if (catalog) {
@@ -2044,7 +2049,7 @@ export async function tickOnce(
   if (!opts.only && backfillDue(scope, Date.now())) {
     markBackfillRun(scope, Date.now());
     try {
-      const owed = await discoverBackfill(roots, state, Date.now());
+      const owed = await discoverBackfill(roots, state);
       if (owed.length > 0) {
         const merged = mergeBackfill(files, owed);
         const added = merged.added;
@@ -2060,12 +2065,13 @@ export async function tickOnce(
           // written, and makes the progress snapshot breathe as they appear
           // and vanish from the pass. Adoption grants no exemptions — see
           // DiscoveryCatalog.adopt.
-          catalog?.adopt(added, Date.now());
+          const adopted = catalog?.adopt(added, Date.now()) ?? 0;
+          if (adopted > 0) log(`[hx] backfill: ${adopted} adopted into the live sweep`);
         } else {
           // Silence here was ambiguous: "the sweep is not running" and "the
           // sweep ran and found nothing" looked identical from the log.
           log(
-            `[hx] backfill: ${owed.length} session(s) still owed, all already queued this pass — nothing to add`,
+            "[hx] backfill: swept, every owed session was already queued this pass — nothing to add",
           );
         }
       } else {
@@ -2334,8 +2340,22 @@ export async function tickOnce(
             log(
               `[hx] child backfill: ${merged.added.length} lane${merged.added.length === 1 ? "" : "s"} the live sweep did not reach still owe bytes (${unseen} never ingested) — queueing`,
             );
+          } else {
+            log("[hx] child backfill: swept, no lane outside the live sweep owes bytes");
           }
           for (const c of merged.added) sweptLanes.add(c.path);
+          // Hand each rescued lane's session dir to the catalog so childPass
+          // keeps walking it. Without this a rescued lane is visible only on
+          // sweep ticks, and a lane with a second on-disk candidate would then
+          // flip its elected uploader every tick — which planChildLaneResets
+          // reads as a takeover and answers by clearing offsets. See
+          // DiscoveryCatalog.adoptSessionDir.
+          if (catalog) {
+            for (const c of merged.added) {
+              const dir = sessionDirOfLane(c.path);
+              if (dir) catalog.adoptSessionDir(dir, c.parentSessionId, c.rootDir);
+            }
+          }
           children = merged.children;
           runs = merged.runs;
         } catch (err) {
@@ -2393,15 +2413,16 @@ export async function tickOnce(
           return;
         }
         try {
-          let did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
+          const did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
           if (did) uploaded += 1;
           // Drain a rescued lane in place, bounded so one large lane cannot
-          // monopolise the pass or starve the lanes queued behind it.
+          // monopolise the pass or starve the lanes queued behind it. The
+          // extra chunks do NOT increment `uploaded`: everywhere else in this
+          // pass it counts FILES, and inflating it here would quietly change
+          // what the end-of-pass line and the perf counters mean.
           if (did && sweptLanes.has(c.path)) {
             for (let i = 1; i < SWEPT_LANE_MAX_CHUNKS && !stopChildren; i++) {
-              did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
-              if (!did) break;
-              uploaded += 1;
+              if (!(await ingestChildOne(cfg, c, parentByArtifactSession, opts, log))) break;
             }
           }
           if (

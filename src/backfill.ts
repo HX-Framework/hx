@@ -70,11 +70,7 @@ export const BACKFILL_INTERVAL_MS = 60 * 60_000;
  * as a fresh one would be. Pure so the selection rule is unit-tested without
  * touching a filesystem.
  */
-export function selectBackfill(
-  all: DiscoveredFile[],
-  state: HxState,
-  _nowMs?: number,
-): DiscoveredFile[] {
+export function selectBackfill(all: DiscoveredFile[], state: HxState): DiscoveredFile[] {
   const out: DiscoveredFile[] = [];
   for (const f of all) {
     const fs = state.files[f.path];
@@ -91,10 +87,13 @@ export function selectBackfill(
  * already holds. This is the ONLY thing standing between the two sweeps and
  * duplicate work, now that selection no longer partitions by age.
  *
- * Deduping matters more than it looks: downstream, a path appearing twice in
- * one pass reads as two devices contending for one session, and the contention
- * path resets offsets. Collapsing against `files` AND within `older` keeps that
- * from being reachable. Pure and total — no state, no clock.
+ * The parent hazard a duplicate creates is concurrent writers, not a reset:
+ * electUploaders keeps EVERY stateless copy of a path (`if (!fs)` admits them
+ * all, by design, so a genuinely new file is never dropped), so one path twice
+ * in a pass becomes two pooled workers appending to the same canonical,
+ * interleaving their chunks. Collapsing against `files` AND within `older`
+ * keeps that unreachable. (The lane-RESET hazard is the child side — see
+ * mergeChildBackfill.) Pure and total — no state, no clock.
  */
 export function mergeBackfill(
   files: DiscoveredFile[],
@@ -116,13 +115,12 @@ export function mergeBackfill(
 export async function discoverBackfill(
   roots: ResolvedRoots,
   state: HxState,
-  nowMs: number,
 ): Promise<DiscoveredFile[]> {
   const [claude, codex] = await Promise.all([
     discoverClaudeFiles(roots.claude, { maxAgeMs: Infinity }),
     discoverCodexFiles(roots.codex, { maxAgeMs: Infinity }),
   ]);
-  return selectBackfill([...claude, ...codex], state, nowMs);
+  return selectBackfill([...claude, ...codex], state);
 }
 
 /** Per-lane schedule for the sweep. Module state rather than a field on the
@@ -192,9 +190,13 @@ export function selectChildBackfill(
  * in a pass is indistinguishable from two devices racing for the same lane —
  * which routes it into the lane-reset arm and clears its offsets. A duplicate
  * introduced here would therefore re-upload a perfectly healthy lane from byte
- * zero, once an hour, forever. Runs get the same fill-missing merge the walk
- * applies across project dirs and roots, for the same reason: two entries
- * sharing an upload key re-send the sidecar every pass.
+ * zero, once an hour, forever. Runs are merged fill-missing on BOTH paths,
+ * which deliberately diverges from the walk: scanSessionArtifacts and
+ * listChildren overwrite scriptPath unconditionally and only fill journalPath.
+ * Here the live walk's value must win, because it is the value every
+ * NON-sweep tick resolves — letting the sweep overwrite it would make the
+ * sidecar's content hash alternate hourly wherever two copies differ,
+ * re-uploading it forever.
  */
 export function mergeChildBackfill(
   children: DiscoveredChildFile[],
@@ -242,11 +244,33 @@ export function mergeChildBackfill(
 
 /** Unwindowed child discovery + owed-ness selection. Lane key is separate
  *  from the parent sweep's so each keeps its own hourly schedule (and its own
- *  always-due first call after a restart). */
+ *  always-due first call after a restart).
+ *
+ *  Runs are NOT returned wholesale. Unwindowed discovery surfaces every
+ *  workflow run in history, and syncWorkflowRun reads the full journal and
+ *  script to hash each one — returning all of them would make the first sweep
+ *  a sequential upload of every sidecar ever written, and every sweep after it
+ *  a full re-read of them. Only the sidecars of sessions whose lanes this
+ *  sweep actually rescued come along; that set shrinks as those lanes deliver,
+ *  so it converges. A run in a dormant dir whose lanes are ALL delivered
+ *  therefore stays out of reach — narrower than the lane fix, deliberately. */
 export async function discoverChildBackfill(
   roots: ResolvedRoots,
   state: HxState,
 ): Promise<{ children: DiscoveredChildFile[]; runs: DiscoveredWorkflowRun[] }> {
   const { children, runs } = await discoverClaudeChildren(roots.claude, { maxAgeMs: Infinity });
-  return { children: selectChildBackfill(children, state), runs };
+  const owedChildren = selectChildBackfill(children, state);
+  const owedSessions = new Set(owedChildren.map((c) => c.parentSessionId));
+  return {
+    children: owedChildren,
+    runs: runs.filter((r) => owedSessions.has(r.parentSessionId)),
+  };
+}
+
+/** The session-artifact dir a child lane lives under — everything above the
+ *  `subagents` component scanSessionArtifacts joins on. Both separators are
+ *  accepted so a path is parsed the same wherever it was written. */
+export function sessionDirOfLane(childPath: string): string | null {
+  const i = childPath.search(/[\\/]subagents[\\/]/);
+  return i === -1 ? null : childPath.slice(0, i);
 }

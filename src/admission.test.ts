@@ -122,7 +122,7 @@ describe("admission coverage — parents", () => {
     const cat = new DiscoveryCatalog();
     await cat.sweep(roots, NOW);
     const admitted = new Set(cat.listFiles().map((f) => f.path));
-    for (const f of await discoverBackfill(roots, state, NOW)) admitted.add(f.path);
+    for (const f of await discoverBackfill(roots, state)) admitted.add(f.path);
 
     const missed: string[] = [];
     for (const [p, c] of paths) {
@@ -155,7 +155,7 @@ describe("admission coverage — parents", () => {
       "the hot loop still cannot see it — that behaviour is deliberate and unchanged",
     );
 
-    const swept = await discoverBackfill(roots, { files: {} }, NOW);
+    const swept = await discoverBackfill(roots, { files: {} });
     assert.equal(swept.some((f) => f.path === p), true, "the sweep must reach it");
   });
 });
@@ -169,9 +169,11 @@ describe("admission coverage — child lanes", () => {
       const sid = `s-${c.name}`;
       const subagents = join(projectDir, sid, "subagents");
       mkdirSync(subagents, { recursive: true });
-      // A parent transcript beside it: a lane whose parent is fully delivered
-      // is the shape the lane-pause and vault-bench paths manufacture, and it
-      // is covered by construction here since parent delivery is independent.
+      // A parent transcript beside it. Note the delivered-parent/owed-lane
+      // shape is NOT constructed here — stateFor only ever writes state for
+      // lane paths, so no fixture parent is ever delivered. That case rests on
+      // selectChildBackfill being parent-independent (it never reads the
+      // parent at all), which this fixture does not prove.
       const parent = join(projectDir, `${sid}.jsonl`);
       writeFileSync(parent, "x".repeat(SIZE));
       touch(parent, c.fileAged ? AGED : FRESH);
