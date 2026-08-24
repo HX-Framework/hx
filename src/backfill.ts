@@ -169,7 +169,7 @@ export function resetBackfillSchedule(): void {
  * with no state entry at all are included; a child with no state is seeded
  * lazily by the ingest path exactly as a fresh one is.
  */
-export function selectChildBackfill(
+function selectChildBackfill(
   all: DiscoveredChildFile[],
   state: HxState,
 ): DiscoveredChildFile[] {
@@ -242,9 +242,9 @@ export function mergeChildBackfill(
   };
 }
 
-/** Unwindowed child discovery + owed-ness selection. Lane key is separate
- *  from the parent sweep's so each keeps its own hourly schedule (and its own
- *  always-due first call after a restart).
+/** Unwindowed child discovery + owed-ness selection. The caller schedules it
+ *  on a lane of its own, separate from the parent sweep's, so the two keep
+ *  independent hourly clocks and independent always-due first calls.
  *
  *  Runs are NOT returned wholesale. Unwindowed discovery surfaces every
  *  workflow run in history, and syncWorkflowRun reads the full journal and

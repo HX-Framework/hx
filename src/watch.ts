@@ -2016,10 +2016,13 @@ export async function tickOnce(
   // `watch --once`) see identical results either way.
   const legacySweep =
     tuningValue(settings, "sweep") === "legacy" || process.env["HX_SWEEP"] === "legacy";
-  // Legacy mode has no catalog, so no adoption and no session-dir
-  // registration: rescued files and lanes are re-found by the hourly sweep
-  // each time, exactly as they were before the catalog existed. That is the
-  // point of the escape hatch — it restores the old shape, warts included.
+  // Legacy mode has no catalog, and the two sweeps diverge there. The PARENT
+  // sweep still runs: with no adoption its finds are simply re-discovered
+  // every hour, which is wasteful and nothing worse. The CHILD sweep does not
+  // run at all — with nowhere to register a rescued lane it would flicker in
+  // and out of visibility, and that reads as an uploader takeover (see the
+  // child section below). The escape hatch restores the old shape, warts
+  // included; it does not get to invent a new one.
   const catalog = legacySweep ? null : catalogFor(scope);
   let files: DiscoveredFile[];
   if (catalog) {

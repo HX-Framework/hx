@@ -234,10 +234,11 @@ export class DiscoveryCatalog {
    * worktree is therefore invisible to every tick — and stays invisible, since
    * an already-aged dir is never re-readdir'd and the catalog is rebuilt from
    * nothing on each restart. Without adoption the hourly sweep would rescue
-   * such a file and then forget it again sixty seconds later, re-finding it
-   * every hour for as long as the session stays warm, and making the progress
-   * snapshot breathe by the blind-spot count once an hour as it appeared and
-   * vanished from the pass.
+   * such a file for exactly one pass and forget it on the next tick — it never
+   * enters the catalog, so listFiles() drops it 1.5 seconds later — re-finding
+   * it every hour for as long as the session stays warm, and making the
+   * progress snapshot breathe by the blind-spot count once an hour as it
+   * appeared and vanished from the pass.
    *
    * Adoption is only an entry point; it grants no exemptions. An adopted entry
    * re-stats, tiers, demotes to the excluded lane once its OWN mtime passes the
