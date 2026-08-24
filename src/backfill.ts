@@ -252,8 +252,11 @@ export function mergeChildBackfill(
  *  a sequential upload of every sidecar ever written, and every sweep after it
  *  a full re-read of them. Only the sidecars of sessions whose lanes this
  *  sweep actually rescued come along; that set shrinks as those lanes deliver,
- *  so it converges. A run in a dormant dir whose lanes are ALL delivered
- *  therefore stays out of reach — narrower than the lane fix, deliberately. */
+ *  so it converges. What stays out of reach, deliberately: a run in a dormant
+ *  dir whose lanes are all delivered, one whose session has no lanes at all
+ *  (journal-only and script-only runs are shapes scanSessionArtifacts really
+ *  produces), and one whose parent transcript is owed but whose lanes are not.
+ *  Narrower than the lane fix, and named here rather than found later. */
 export async function discoverChildBackfill(
   roots: ResolvedRoots,
   state: HxState,
@@ -265,12 +268,4 @@ export async function discoverChildBackfill(
     children: owedChildren,
     runs: runs.filter((r) => owedSessions.has(r.parentSessionId)),
   };
-}
-
-/** The session-artifact dir a child lane lives under — everything above the
- *  `subagents` component scanSessionArtifacts joins on. Both separators are
- *  accepted so a path is parsed the same wherever it was written. */
-export function sessionDirOfLane(childPath: string): string | null {
-  const i = childPath.search(/[\\/]subagents[\\/]/);
-  return i === -1 ? null : childPath.slice(0, i);
 }

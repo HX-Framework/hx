@@ -167,6 +167,14 @@ export interface DiscoveredWorkflowRun {
   scriptName: string | null;
 }
 
+/** The session-artifact dir a child lane lives under — everything above the
+ *  `subagents` component scanSessionArtifacts joins on. Both separators are
+ *  accepted so a path parses the same wherever it was written. */
+export function sessionDirOfLane(childPath: string): string | null {
+  const i = childPath.search(/[\\/]subagents[\\/]/);
+  return i === -1 ? null : childPath.slice(0, i);
+}
+
 const AGENT_FILE_RE = /^agent-([a-zA-Z0-9_-]+)\.jsonl$/;
 const SCRIPT_FILE_RE = /^(.+)-(wf_[a-zA-Z0-9-]+)\.js$/;
 

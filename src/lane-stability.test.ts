@@ -27,7 +27,8 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DiscoveryCatalog } from "./catalog.js";
-import { discoverChildBackfill, mergeChildBackfill, sessionDirOfLane } from "./backfill.js";
+import { discoverChildBackfill, mergeChildBackfill } from "./backfill.js";
+import { sessionDirOfLane } from "./sources.js";
 import { contestedChildLanes, electChildUploaders, planChildLaneResets } from "./watch.js";
 import type { DataRoot, ResolvedRoots } from "./roots.js";
 
@@ -67,6 +68,23 @@ function mkCopy(project: string, sid: string, laneMtime: number, dirMtime: numbe
   return lane;
 }
 
+/** A workflow run (journal only) under a session dir, re-pinning the project
+ *  and session dir mtimes afterwards — creating files bumps them, and dormancy
+ *  is the condition under test. */
+function mkRun(project: string, sid: string, runId: string, dirMtime: number): void {
+  const projectDir = join(base, "claude", "projects", project);
+  const runDir = join(projectDir, sid, "subagents", "workflows", runId);
+  mkdirSync(runDir, { recursive: true });
+  const journal = join(runDir, "journal.jsonl");
+  writeFileSync(journal, "{}");
+  touch(journal, dirMtime);
+  touch(runDir, dirMtime);
+  touch(join(projectDir, sid, "subagents", "workflows"), dirMtime);
+  touch(join(projectDir, sid, "subagents"), dirMtime);
+  touch(join(projectDir, sid), dirMtime);
+  touch(projectDir, dirMtime);
+}
+
 afterEach(() => {
   if (base) rmSync(base, { recursive: true, force: true });
 });
@@ -90,11 +108,7 @@ describe("child lane election across a sweep boundary", () => {
     const swept = await discoverChildBackfill(roots, { files: {} });
     const merged = mergeChildBackfill(walkOnly, [], swept.children, swept.runs);
     assert.equal(merged.added.some((c) => c.path === laneB), true, "the sweep must find B");
-    for (const c of merged.added) {
-      const dir = sessionDirOfLane(c.path);
-      assert.notEqual(dir, null, "a lane path must yield its session dir");
-      if (dir) cat.adoptSessionDir(dir, c.parentSessionId, c.rootDir);
-    }
+    for (const c of merged.added) cat.adoptSessionDir(c, NOW);
 
     const elected1 = electChildUploaders(merged.children);
     const plan1 = planChildLaneResets(elected1, {}, contestedChildLanes(merged.children));
@@ -117,8 +131,11 @@ describe("child lane election across a sweep boundary", () => {
   });
 
   it("wipes offsets every pass if the rescued copy is NOT kept visible", async () => {
-    // The defect itself, pinned so the fix cannot be quietly removed. Identical
-    // to the test above except the session dir is never registered.
+    // The defect itself. Test 1 protects the fix; this one pins why the fix is
+    // NEEDED — identical setup, except the session dir is never registered.
+    // If this ever goes red because planChildLaneResets learned to tolerate a
+    // winner's absence, that is not a regression: it means adoptSessionDir has
+    // become unnecessary and can be deleted along with this test.
     const roots = mkRoots();
     const sid = "22222222-2222-2222-2222-222222222222";
     const laneA = mkCopy("proj-live", sid, FRESH, FRESH);
@@ -171,6 +188,52 @@ describe("child lane election across a sweep boundary", () => {
     assert.deepEqual(plan2.resetPaths, []);
     assert.equal(plan2.changed, false);
   });
+});
+
+describe("session-dir registration is gated to the lanes that need it", () => {
+  it("does NOT register a dormant lane's dir", async () => {
+    // The gate. A dormant lane cannot oscillate (it would have to be newer than
+    // an in-window twin to displace it), and registering its dir is not free:
+    // the walk's LANE scan is windowed, but its RUN scan is not — so a
+    // registered dormant dir puts every workflow sidecar it holds back into the
+    // per-tick syncWorkflowRun hashing, which reads each journal and script in
+    // full. That run is the observable: it appears if and only if the dir got
+    // registered, which makes this test fail the moment the gate is removed.
+    const roots = mkRoots();
+    const sid = "44444444-4444-4444-4444-444444444444";
+    mkCopy("proj-dormant", sid, AGED, AGED);
+    mkRun("proj-dormant", sid, "wf_dormant", AGED);
+
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, NOW);
+    const swept = await discoverChildBackfill(roots, { files: {} });
+    assert.equal(swept.children.length, 1, "the sweep still rescues the lane itself");
+    for (const c of swept.children) cat.adoptSessionDir(c, NOW);
+
+    await cat.sweep(roots, NOW + 10_000);
+    assert.deepEqual(cat.listChildren().runs, [], "no per-tick run hashing bought");
+    assert.deepEqual(cat.listChildren().children, []);
+  });
+
+  it("registers an in-window lane's dir, runs and all — the accepted cost", async () => {
+    // The other side of the same gate, so the trade-off is pinned rather than
+    // implied: an in-window rescue IS registered, and its sidecars do rejoin
+    // per-tick hashing. That is the price of keeping the lane visible, and the
+    // window gate is what keeps the population paying it small.
+    const roots = mkRoots();
+    const sid = "66666666-6666-6666-6666-666666666666";
+    mkCopy("proj-dormant", sid, NEWER, AGED);
+    mkRun("proj-dormant", sid, "wf_live", NEWER);
+
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, NOW);
+    for (const c of (await discoverChildBackfill(roots, { files: {} })).children) {
+      cat.adoptSessionDir(c, NOW);
+    }
+    await cat.sweep(roots, NOW + 10_000);
+    assert.deepEqual(cat.listChildren().runs.map((r) => r.runId), ["wf_live"]);
+  });
+
 });
 
 describe("sessionDirOfLane", () => {

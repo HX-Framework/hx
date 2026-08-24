@@ -57,6 +57,7 @@ import {
   mapPool,
   readdirSafe,
   scanSessionArtifacts,
+  sessionDirOfLane,
   statSafe,
   type DiscoveredChildFile,
   type DiscoveredFile,
@@ -108,9 +109,9 @@ interface FileEntry {
  *  through the dir's own mtime, as today — or, for a dir whose mtime will
  *  never move again, through the hourly sweep and adopt(). An adopted entry
  *  can be dropped again by a later D-A transition; that is not a loss, the
- *  sweep re-adopts it within the hour while it is still owed. Codex rides the same lane: its
- *  readdir is mtime-gated, so a quiet dir's not-yet-admitted rollouts are
- *  never re-statted by the walk itself. */
+ *  sweep re-adopts it within the hour while it is still owed. Codex rides the
+ *  same lane: its readdir is mtime-gated, so a quiet dir's not-yet-admitted
+ *  rollouts are never re-statted by the walk itself. */
 interface ExcludedEntry {
   source: "claude" | "codex";
   rootDir: string;
@@ -244,27 +245,6 @@ export class DiscoveryCatalog {
    * one the walk inserted. Paths already tracked — including ones the file pass
    * deliberately demoted — are left alone rather than re-promoted.
    */
-  /**
-   * Register a session-artifact dir so childPass walks it on the normal
-   * cadence. The child sweep calls this for every lane it rescues, and it is
-   * not an optimisation — it is what keeps lane election stable.
-   *
-   * A lane that is visible only on sweep ticks makes electChildUploaders
-   * oscillate whenever the lane has a second on-disk candidate (a cwd-change
-   * twin, a copied tree). The sweep tick elects the rescued copy, the next
-   * tick elects the always-visible one, and planChildLaneResets treats each
-   * flip as an uploader takeover — clearing the winner's offsets every time.
-   * A lane larger than one pass's drain would restart from zero every hour and
-   * never finish. Registering the dir keeps the rescued copy in `children`
-   * between sweeps, so the takeover happens once and then stays put.
-   */
-  adoptSessionDir(sessionDir: string, sessionId: string, rootDir: string): boolean {
-    if (this.sessionDirs.has(sessionDir)) return false;
-    // lastWalkMs 0 — due on the next childPass, like a freshly listed dir.
-    this.sessionDirs.set(sessionDir, { sessionDir, sessionId, rootDir, lastWalkMs: 0 });
-    return true;
-  }
-
   adopt(files: readonly DiscoveredFile[], nowMs: number): number {
     let adopted = 0;
     for (const f of files) {
@@ -285,6 +265,55 @@ export class DiscoveryCatalog {
       adopted++;
     }
     return adopted;
+  }
+
+  /**
+   * Register a rescued lane's session-artifact dir so childPass keeps walking
+   * it. Not an optimisation — it is what keeps lane election stable.
+   *
+   * A lane visible only on sweep ticks makes electChildUploaders oscillate
+   * whenever that lane has a second on-disk candidate (a cwd-change twin, a
+   * copied tree): the sweep tick elects the rescued copy, the next tick elects
+   * the always-visible one, and planChildLaneResets reads each flip as an
+   * uploader takeover and clears the winner's offsets. A lane larger than one
+   * pass's drain would restart from zero every hour and never finish.
+   * Registering the dir keeps the rescued copy in `children` between sweeps,
+   * so the takeover happens once and stays put.
+   *
+   * Takes the lane rather than a path so the window gate cannot be forgotten
+   * by a caller. Only an IN-WINDOW lane is registered, for two reasons that
+   * agree: childPass's lane scan is windowed, so a dormant lane's dir would be
+   * walked every cadence without ever yielding the lane it was registered for
+   * — while still dragging that dir's sidecars into the per-tick run hashing
+   * described below, which is cost for nothing; and only an in-window lane can
+   * oscillate at all, since it must be newer than an in-window twin to
+   * displace it. Dormant lanes stay on the hourly sweep, where they are
+   * single-candidate and safe.
+   *
+   * No eviction is added for these, and none is needed: removing a session dir
+   * bumps its PROJECT dir's mtime to now, which un-ages that dir, so the next
+   * sweep readdirs it and the existing presence-diff drops the entry. Deleting
+   * the project dir instead goes through dropDirMembers, which prunes by
+   * prefix. Both paths already covered it; a hand-rolled check here would have
+   * been unreachable code.
+   *
+   * One consequence to know: because the walk's RUN scan is unwindowed (unlike
+   * its lane scan), a registered dir's workflow sidecars rejoin the per-tick
+   * syncWorkflowRun hashing, which reads each journal and script in full. The
+   * window gate is what keeps that population small — it is the blind spot
+   * itself, sessions appended recently inside dirs untouched for thirty days.
+   */
+  adoptSessionDir(lane: DiscoveredChildFile, nowMs: number): void {
+    if (nowMs - lane.mtimeMs > RECENT_WINDOW_MS) return;
+    const sessionDir = sessionDirOfLane(lane.path);
+    if (sessionDir === null || this.sessionDirs.has(sessionDir)) return;
+    // lastWalkMs 0 — due on the next childPass, like a freshly listed dir.
+    this.sessionDirs.set(sessionDir, {
+      sessionDir,
+      sessionId: lane.parentSessionId,
+      rootDir: lane.rootDir,
+      lastWalkMs: 0,
+    });
   }
 
   /** The child-lane inventory — a drop-in for discoverClaudeChildren(). */

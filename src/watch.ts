@@ -89,7 +89,6 @@ import {
   markBackfillRun,
   mergeBackfill,
   mergeChildBackfill,
-  sessionDirOfLane,
 } from "./backfill.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
@@ -303,10 +302,12 @@ export interface WatchOptions {
 }
 
 const DEFAULT_CHUNK_LIMIT = 4 * 1024 * 1024;
-/** Chunks one backfilled child lane may send within a single pass. A rescued
- *  lane is invisible to the walk, so its only other cadence is the hourly
- *  sweep — without an in-pass drain a large lane would trickle for days.
- *  Bounded so one lane cannot monopolise a pass. */
+/** Chunks one backfilled child lane may send within a single pass. An
+ *  in-window rescue is handed to the catalog and picked up by the walk from
+ *  the next tick, but a DORMANT rescue is not (the walk is windowed), so the
+ *  hourly sweep stays its only cadence — one chunk per sweep would trickle for
+ *  days. This drains the rescue pass itself, bounded so one large lane cannot
+ *  monopolise it. */
 const SWEPT_LANE_MAX_CHUNKS = 16;
 
 // Which state file this config's offsets live in (see StateScope in state.ts).
@@ -2314,10 +2315,12 @@ export async function tickOnce(
   // counts sessions, and a child stream is part of its session, not a new one.
   if (!opts.only && Date.now() >= (childEndpointsMissingUntilMs.get(scope) ?? 0)) {
     const parentByArtifactSession = buildChildParentIndex(state);
-    // Lanes this pass rescued from the blind spot. They get to drain here
-    // rather than one chunk per sweep: nothing will re-discover them next tick
-    // (the walk still cannot see them), so a lane bigger than one chunk would
-    // otherwise trickle at one chunk per HOUR.
+    // Lanes this pass rescued from the blind spot. They drain here rather than
+    // one chunk per sweep, because for a dormant lane this pass is the only
+    // cadence there is — the walk is windowed and will not pick it up next
+    // tick, so a lane bigger than one chunk would trickle at one chunk per
+    // HOUR. (An in-window rescue is adopted into the walk and does get tick
+    // cadence; draining it here simply gets it moving a little sooner.)
     const sweptLanes = new Set<string>();
     try {
       let { children, runs } = catalog
@@ -2344,17 +2347,16 @@ export async function tickOnce(
             log("[hx] child backfill: swept, no lane outside the live sweep owes bytes");
           }
           for (const c of merged.added) sweptLanes.add(c.path);
-          // Hand each rescued lane's session dir to the catalog so childPass
+          // Offer each rescued lane's session dir to the catalog so childPass
           // keeps walking it. Without this a rescued lane is visible only on
           // sweep ticks, and a lane with a second on-disk candidate would then
           // flip its elected uploader every tick — which planChildLaneResets
-          // reads as a takeover and answers by clearing offsets. See
-          // DiscoveryCatalog.adoptSessionDir.
+          // reads as a takeover and answers by clearing offsets. Offer, not
+          // hand: the catalog takes only in-window lanes, which is the whole
+          // population that can oscillate. See DiscoveryCatalog.adoptSessionDir.
           if (catalog) {
-            for (const c of merged.added) {
-              const dir = sessionDirOfLane(c.path);
-              if (dir) catalog.adoptSessionDir(dir, c.parentSessionId, c.rootDir);
-            }
+            const at = Date.now();
+            for (const c of merged.added) catalog.adoptSessionDir(c, at);
           }
           children = merged.children;
           runs = merged.runs;
