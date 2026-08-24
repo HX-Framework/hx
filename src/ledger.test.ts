@@ -1,6 +1,13 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
-import { buildLedger, classifyFile, isDestinationOffline, LIVE_WINDOW_MS, needsAttention } from "./ledger.js";
+import {
+  buildLedger,
+  classifyFile,
+  isDestinationOffline,
+  reportableOffset,
+  LIVE_WINDOW_MS,
+  needsAttention,
+} from "./ledger.js";
 import {
   applyDestinationReports,
   applyDestinationUploadError,
@@ -481,15 +488,18 @@ describe("notDelivered diagnosis", () => {
       nowMs: NOW,
     });
 
-  it("marks a destination with NO registry entry as unknown", () => {
-    // The phantom: advertised once, never registered, billed as reachable.
+  it("does not bill a destination with NO registry entry that was never written to", () => {
+    // The phantom: offered once while some org's Fortress enrollment was
+    // briefly live, never written to, and billed as reachable ever since. letai
+    // holds all 1000 bytes, so the session IS delivered — nothing will ever be
+    // sent to orgX, and counting its debt pinned the bar below 100% forever
+    // for something no action could settle.
     const l = build({ letai: 1000, orgX: 0 }, false);
-    const d = l.notDelivered[0]!;
-    const orgX = d.destinations.find((x) => x.key === "orgX")!;
-    assert.equal(orgX.state, "unknown");
-    assert.equal(orgX.owed, 1000);
-    // and the complete one is reported as complete, so the contrast is visible
-    assert.equal(d.destinations.find((x) => x.key === "letai")!.owed, 0);
+    assert.equal(l.delivered, 1);
+    assert.equal(l.uploading, 0);
+    assert.equal(l.uploadingBytes, 0);
+    assert.equal(l.percent, 100);
+    assert.equal(l.notDelivered.length, 0);
   });
 
   it("marks a registered held destination as offline, not unknown", () => {
@@ -525,5 +535,65 @@ describe("notDelivered diagnosis", () => {
       nowMs: NOW,
     });
     assert.equal(l.notDelivered[0]!.owedBytes, 5000);
+  });
+});
+
+// A destination the device has no evidence of — absent from the registry AND
+// never written to by any file — is owed bytes nothing will ever send. Billing
+// it pinned one device at a fixed byte count for weeks with an empty log.
+describe("phantom destination keys", () => {
+  const reg: HxState["destinations"] = {
+    letai: { vaultOrgId: null, status: "ready", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+    orgHeld: { vaultOrgId: "orgHeld", status: "held", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+  };
+  const ledgerFor = (offsets: Record<string, number>, destinations = reg, extra?: Record<string, number>) => {
+    const files: HxState["files"] = { a: entry("a", offsets) };
+    if (extra) files["b"] = entry("b", extra);
+    const state: HxState = { files, destinations };
+    const input = [file("a", 1000)];
+    if (extra) input.push(file("b", 1000));
+    return buildLedger({ files: input, state, incompleteSessions: 0, nowMs: NOW });
+  };
+
+  it("is not counted when a real store already holds the session", () => {
+    assert.equal(ledgerFor({ letai: 1000, phantom: 0 }).percent, 100);
+  });
+
+  it("is still counted when it is the ONLY key — the file is genuinely unsent", () => {
+    const l = ledgerFor({ phantom: 0 });
+    assert.equal(l.uploading, 1);
+    assert.equal(l.uploadingBytes, 1000);
+  });
+
+  it("does NOT write off a key another file has written to", () => {
+    // Proof is per-destination: a store that took bytes from one session is
+    // real for all of them, and this one is still owed 1000.
+    const l = ledgerFor({ letai: 1000, orgReal: 0 }, reg, { letai: 1000, orgReal: 500 });
+    assert.equal(l.uploadingBytes, 1500);
+  });
+
+  it("does NOT write off a key with bytes of its own", () => {
+    assert.equal(ledgerFor({ letai: 1000, orgReal: 400 }).uploadingBytes, 600);
+  });
+
+  it("does NOT write off a REGISTERED destination, however offline", () => {
+    const l = ledgerFor({ letai: 1000, orgHeld: 0 });
+    assert.equal(l.waiting, 1);
+    assert.equal(l.delivered, 0);
+  });
+
+  it("judges nothing when no registry has ever been recorded", () => {
+    // "we have never seen a destination" must not read as "every destination
+    // is dead" — the same guard pruneStrandedOffsets applies before deleting.
+    const state: HxState = { files: { a: entry("a", { letai: 1000, orgReal: 0 }) } };
+    const l = buildLedger({ files: [file("a", 1000)], state, incompleteSessions: 0, nowMs: NOW });
+    assert.equal(l.uploadingBytes, 1000);
+    assert.equal(l.percent, 0);
+  });
+
+  it("keeps the snapshot POSTed to the gateway in step with the ledger", () => {
+    // Both derive from the same state; a phantom must not make them disagree.
+    const state: HxState = { files: { a: entry("a", { letai: 1000, phantom: 0 }) }, destinations: reg };
+    assert.equal(reportableOffset(state.files["a"]!, state), 1000);
   });
 });

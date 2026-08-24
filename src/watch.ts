@@ -45,6 +45,7 @@ import {
   type StateScope,
   benchFileProbe,
   clearFileFailure,
+  pruneStrandedOffsets,
   clearHeal,
   destKey,
   getArtifactHash,
@@ -80,7 +81,7 @@ import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
-import { buildLedger, type SyncLedger } from "./ledger.js";
+import { buildLedger, everWrittenKeys, reportableOffset, type SyncLedger } from "./ledger.js";
 import { backfillDue, discoverBackfill, markBackfillRun } from "./backfill.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
@@ -1648,10 +1649,15 @@ export function electChildUploaders(
 export function snapshotFrom(files: DiscoveredFile[], state: HxState): SyncSnapshot {
   let done = 0;
   let totalBytes = 0;
+  // Hoisted: reportableOffset would otherwise rebuild it per file.
+  const everWritten = everWrittenKeys(state);
   for (const f of files) {
     const fs = state.files[f.path];
-    // "Done" = the least-current destination has caught up to the file size.
-    const offset = fs ? minOffset(fs) : 0;
+    // "Done" = the least-current REAL destination has caught up to the file
+    // size. reportableOffset, not minOffset: a phantom key pins the minimum at
+    // 0, and leaving it here would make this snapshot — which is POSTed to the
+    // gateway — contradict the ledger `hx status` prints from the same state.
+    const offset = fs ? reportableOffset(fs, state, everWritten) : 0;
     // A persisted hold is unfinished even when legacy offsets happen to equal
     // the source size: a destination is still explicitly waiting for bytes.
     if (offset >= f.size && !fs?.skipReason) done += 1;
@@ -2446,6 +2452,12 @@ export async function startWatch(
   // the gateway said the store is DOWN, and that is still true until it says
   // otherwise (`hx retry --blocked` / `--all` release those deliberately).
   try {
+    const stranded = await pruneStrandedOffsets(scopeOf(cfg));
+    if (stranded.keys > 0) {
+      log(
+        `[hx] dropped ${stranded.keys} offset key${stranded.keys === 1 ? "" : "s"} for unknown destinations across ${stranded.files} session${stranded.files === 1 ? "" : "s"} no longer on disk`,
+      );
+    }
     const dropped = await clearGenericBackoffs(scopeOf(cfg));
     if (dropped > 0) {
       log(`[hx] cleared ${dropped} stale retry backoff${dropped === 1 ? "" : "s"} on start`);

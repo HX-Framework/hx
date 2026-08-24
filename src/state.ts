@@ -717,6 +717,63 @@ export async function reconcileDestinations(
   if (changed) await persistOrMark(state, scope);
 }
 
+/**
+ * Drop offset keys naming a destination this device has no evidence of, on
+ * files that are no longer on disk.
+ *
+ * `reconcileDestinations` already prunes a departed destination, but only from
+ * inside the append-url path — so it can only ever repair a file the daemon
+ * still uploads. A file that has left the disk is never attempted again, so a
+ * key it picked up while some org's Fortress enrollment was briefly live stays
+ * in state forever.
+ *
+ * The conditions are the same ones isPhantomKey applies, plus absence from
+ * disk: a key that has been written to is proof of a real store, a registry
+ * that has never been recorded judges nothing, and a live file is left to
+ * append-url's reconcile, which is the right repair for it.
+ */
+export async function pruneStrandedOffsets(
+  scope: StateScope = "main",
+  onDisk: (filePath: string) => boolean = existsSync,
+): Promise<{ keys: number; files: number }> {
+  const state = await loadState(scope);
+  const pruned = pruneStrandedOffsetsFrom(state, onDisk);
+  if (pruned.keys > 0) await persistThrough(state, scope);
+  return pruned;
+}
+
+/** The prune itself, as a pure mutation — exported so the contract above is
+ *  directly tested without a filesystem. */
+export function pruneStrandedOffsetsFrom(
+  state: HxState,
+  onDisk: (filePath: string) => boolean,
+): { keys: number; files: number } {
+  if (state.destinations === undefined) return { keys: 0, files: 0 };
+  const everWritten = new Set<string>();
+  for (const fs of Object.values(state.files)) {
+    for (const [k, offset] of Object.entries(fs.offsets ?? {})) {
+      if (offset > 0) everWritten.add(k);
+    }
+  }
+  let keys = 0;
+  let files = 0;
+  for (const [filePath, fs] of Object.entries(state.files)) {
+    const offsets = fs.offsets ?? {};
+    const dead = Object.entries(offsets).filter(
+      ([k, offset]) =>
+        k !== destKey(null) &&
+        offset === 0 &&
+        !everWritten.has(k) &&
+        state.destinations?.[k] === undefined,
+    );
+    if (dead.length === 0 || onDisk(filePath)) continue;
+    for (const [k] of dead) delete offsets[k];
+    keys += dead.length;
+    files += 1;
+  }
+  return { keys, files };
+}
+
 /** Apply a gateway's current destination set to an offset map. Exported as a
  * pure mutation helper so the add-at-zero/prune contract is directly tested. */
 export function reconcileDestinationOffsets(
