@@ -2024,8 +2024,11 @@ export async function tickOnce(
   // election on sweep ticks and loses it on the others, and with self-heal on
   // the per-commit divergence check turns each flip into a replace-from-zero.
   // Capped, not open-ended: recordHeal pauses self-heal after
-  // HEAL_MAX_CONSECUTIVE and the paused branch accepts the offset. A bounded
-  // burst in a rare shape, against stranding every legacy parent otherwise.
+  // HEAL_MAX_CONSECUTIVE and the paused branch accepts the offset. That cap
+  // is a HOSTED-lane guarantee — the check skips vault and fortress routes
+  // entirely — but a twin flip only reaches them if both copies are owed on
+  // the same vault lane, in legacy mode. A bounded burst in a rare shape,
+  // against stranding every legacy parent otherwise.
   //
   // The CHILD sweep does not run at all. With nowhere to register a rescued
   // lane it would flicker in and out of visibility, and planChildLaneResets
