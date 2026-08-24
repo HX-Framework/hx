@@ -224,11 +224,60 @@ function hasReachableCompleteCopy(
   return false;
 }
 
+/**
+ * Every destination key some file has committed bytes to.
+ *
+ * `setOffsetFor` writes an offset only after a successful commit, so a non-zero
+ * offset ANYWHERE is proof that store exists. Proof is per-destination, not
+ * per-file: a store that took bytes from one session is real for all of them.
+ *
+ * Computed once per fold and passed down — deriving it inside the per-file test
+ * would make the ledger O(files²), and snapshotFrom runs on every pass.
+ */
+export function everWrittenKeys(state: HxState): Set<string> {
+  const out = new Set<string>();
+  for (const fs of Object.values(state.files)) {
+    for (const [key, offset] of Object.entries(fs.offsets ?? {})) {
+      if (offset > 0) out.add(key);
+    }
+  }
+  return out;
+}
+
+/**
+ * A key naming a destination this device has no evidence of: absent from the
+ * registry AND never written to by any file.
+ *
+ * Such a key is owed bytes that nothing will ever send. Billing it as backlog
+ * pins a session in `uploading` forever, undrainable, with nothing in the log —
+ * no upload is planned, so no error is ever reported. One device carried 43 of
+ * them for an org whose Fortress enrollment was abandoned mid-setup, and sat at
+ * a fixed byte count for weeks.
+ *
+ * Both halves are required. Registry absence alone is not evidence: the
+ * registry is not reliably complete (seedDestinationsFromBlockers seeds HELD
+ * destinations only), so a live store can be missing from it. And a state with
+ * no registry at all is never judged — "we have never recorded a destination"
+ * must not read as "every destination is dead".
+ */
+export function isPhantomKey(
+  state: HxState,
+  key: string,
+  offset: number,
+  everWritten: ReadonlySet<string>,
+): boolean {
+  if (offset > 0 || key === destKey(null)) return false;
+  if (state.destinations === undefined) return false;
+  if (everWritten.has(key)) return false;
+  return state.destinations[key] === undefined;
+}
+
 /** Per-destination undelivered bytes for one file, split by reachability. */
 function lagOf(
   fs: FileState | undefined,
   size: number,
   state: HxState,
+  everWritten: ReadonlySet<string>,
 ): { reachable: number; offline: Map<string, number> } {
   const offline = new Map<string, number>();
   let reachable = 0;
@@ -237,13 +286,39 @@ function lagOf(
   const offsets = fs?.offsets ?? {};
   const keys = Object.keys(offsets);
   if (keys.length === 0) return { reachable: size, offline };
+  let sawRealDestination = false;
   for (const key of keys) {
+    if (isPhantomKey(state, key, offsets[key] ?? 0, everWritten)) continue;
+    sawRealDestination = true;
     const pending = size - (offsets[key] ?? 0);
     if (pending <= 0) continue;
     if (isDestinationOffline(state, key)) offline.set(key, pending);
     else reachable += pending;
   }
+  // Every key on this file is a phantom, so nothing real has ever been told
+  // about it — the same situation as no offsets at all, and the same answer.
+  if (!sawRealDestination) return { reachable: size, offline };
   return { reachable, offline };
+}
+
+/**
+ * Least-advanced offset across destinations that actually exist.
+ *
+ * For REPORTING only. `minOffset` spans every key including a phantom, which is
+ * right for the upload path — offering the whole file is what makes the gateway
+ * answer with its real destination set, and that answer is what prunes the dead
+ * key — and wrong for any view a human or the gateway reads, where a phantom
+ * pins the minimum at 0 forever.
+ */
+export function reportableOffset(
+  fs: FileState,
+  state: HxState,
+  everWritten: ReadonlySet<string> = everWrittenKeys(state),
+): number {
+  const vals = Object.entries(fs.offsets)
+    .filter(([key, offset]) => !isPhantomKey(state, key, offset, everWritten))
+    .map(([, offset]) => offset);
+  return vals.length === 0 ? 0 : Math.min(...vals);
 }
 
 /** Classify one discovered file. `incomplete` is decided elsewhere (the source
@@ -252,6 +327,7 @@ export function classifyFile(
   file: LedgerFile,
   state: HxState,
   nowMs: number,
+  everWritten: ReadonlySet<string> = everWrittenKeys(state),
 ): {
   state: Exclude<SessionState, "incomplete">;
   reachableBytes: number;
@@ -261,7 +337,7 @@ export function classifyFile(
   unprotected: boolean;
 } {
   const fs = state.files[file.path];
-  const { reachable, offline } = lagOf(fs, file.size, state);
+  const { reachable, offline } = lagOf(fs, file.size, state, everWritten);
   const unprotected = offline.size > 0 && !hasReachableCompleteCopy(fs, file.size, state);
   // Live tail first, and unconditionally: see LIVE_WINDOW_MS. A session still
   // being written on this device is never a backlog and never a fault,
@@ -296,6 +372,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
   let deliveredBytes = 0;
   let uploadingBytes = 0;
   let waitingBytes = 0;
+  const everWritten = everWrittenKeys(state);
   const lag = new Map<string, { sessions: number; bytes: number }>();
   const notDelivered: SessionDiagnosis[] = [];
 
@@ -306,7 +383,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     // range by — a session resumed today belongs at today's end of it.
     if (oldestMs === null || file.mtimeMs < oldestMs) oldestMs = file.mtimeMs;
     if (newestMs === null || file.mtimeMs > newestMs) newestMs = file.mtimeMs;
-    const c = classifyFile(file, state, nowMs);
+    const c = classifyFile(file, state, nowMs, everWritten);
     if (c.state !== "delivered") {
       const fs = state.files[file.path];
       const offsets = fs?.offsets ?? {};

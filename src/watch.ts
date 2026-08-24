@@ -45,6 +45,7 @@ import {
   type StateScope,
   benchFileProbe,
   clearFileFailure,
+  pruneStrandedOffsets,
   clearHeal,
   destKey,
   getArtifactHash,
@@ -80,8 +81,15 @@ import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
-import { buildLedger, type SyncLedger } from "./ledger.js";
-import { backfillDue, discoverBackfill, markBackfillRun } from "./backfill.js";
+import { buildLedger, everWrittenKeys, reportableOffset, type SyncLedger } from "./ledger.js";
+import {
+  backfillDue,
+  discoverBackfill,
+  discoverChildBackfill,
+  markBackfillRun,
+  mergeBackfill,
+  mergeChildBackfill,
+} from "./backfill.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, tuningValue, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
@@ -294,6 +302,13 @@ export interface WatchOptions {
 }
 
 const DEFAULT_CHUNK_LIMIT = 4 * 1024 * 1024;
+/** Chunks one backfilled child lane may send within a single pass. An
+ *  in-window rescue is handed to the catalog and picked up by the walk from
+ *  the next tick, but a DORMANT rescue is not (the walk is windowed), so the
+ *  hourly sweep stays its only cadence — one chunk per sweep would trickle for
+ *  days. This drains the rescue pass itself, bounded so one large lane cannot
+ *  monopolise it. */
+const SWEPT_LANE_MAX_CHUNKS = 16;
 
 // Which state file this config's offsets live in (see StateScope in state.ts).
 // The `--local` tee runs the same pipeline against the local dev gateway with
@@ -1648,10 +1663,15 @@ export function electChildUploaders(
 export function snapshotFrom(files: DiscoveredFile[], state: HxState): SyncSnapshot {
   let done = 0;
   let totalBytes = 0;
+  // Hoisted: reportableOffset would otherwise rebuild it per file.
+  const everWritten = everWrittenKeys(state);
   for (const f of files) {
     const fs = state.files[f.path];
-    // "Done" = the least-current destination has caught up to the file size.
-    const offset = fs ? minOffset(fs) : 0;
+    // "Done" = the least-current REAL destination has caught up to the file
+    // size. reportableOffset, not minOffset: a phantom key pins the minimum at
+    // 0, and leaving it here would make this snapshot — which is POSTed to the
+    // gateway — contradict the ledger `hx status` prints from the same state.
+    const offset = fs ? reportableOffset(fs, state, everWritten) : 0;
     // A persisted hold is unfinished even when legacy offsets happen to equal
     // the source size: a destination is still explicitly waiting for bytes.
     if (offset >= f.size && !fs?.skipReason) done += 1;
@@ -1996,6 +2016,25 @@ export async function tickOnce(
   // `watch --once`) see identical results either way.
   const legacySweep =
     tuningValue(settings, "sweep") === "legacy" || process.env["HX_SWEEP"] === "legacy";
+  // Legacy mode has no catalog, and the two sweeps diverge there.
+  //
+  // The PARENT sweep still runs. With no adoption its finds are re-discovered
+  // every hour — wasteful, and in one shape worse than wasteful: a session
+  // duplicated across project dirs whose NEWER copy is the dormant one wins
+  // election on sweep ticks and loses it on the others, and with self-heal on
+  // the per-commit divergence check turns each flip into a replace-from-zero.
+  // Capped, not open-ended: recordHeal pauses self-heal after
+  // HEAL_MAX_CONSECUTIVE and the paused branch accepts the offset. That cap
+  // is a HOSTED-lane guarantee — the check skips vault and fortress routes
+  // entirely — but a twin flip only reaches them if both copies are owed on
+  // the same vault lane, in legacy mode. A bounded burst in a rare shape,
+  // against stranding every legacy parent otherwise.
+  //
+  // The CHILD sweep does not run at all. With nowhere to register a rescued
+  // lane it would flicker in and out of visibility, and planChildLaneResets
+  // reads that as an uploader takeover and clears the lane — unbounded, since
+  // no latch caps it (see the child section below). The escape hatch restores
+  // the old shape, warts included; it does not get to invent a new one.
   const catalog = legacySweep ? null : catalogFor(scope);
   let files: DiscoveredFile[];
   if (catalog) {
@@ -2016,32 +2055,43 @@ export async function tickOnce(
   // The unwindowed sweep: once on start, then hourly. Live discovery above
   // prunes to 30 days for CADENCE (a 1.5s loop cannot stat 100k files), but
   // that bound was also silently deciding what would ever be uploaded at all —
-  // so a file that went 30 days unignested was abandoned with no report. This
-  // reaches everything still on disk that has not been fully delivered.
+  // so a file the hot loop could not see was abandoned with no report. This
+  // reaches everything still on disk that has not been fully delivered,
+  // whatever its age: the hot loop prunes by project-DIRECTORY mtime, which an
+  // append never bumps, so "recent" is no guarantee anyone else looked.
   // Merged BEFORE election/filtering so a backfilled file passes through the
-  // identical gates (twin election, settings excludes, tombstones, routing).
+  // identical gates (twin election, settings excludes, tombstones, routing),
+  // and merged BY PATH so the overlap with the hot loop costs nothing.
   if (!opts.only && backfillDue(scope, Date.now())) {
     markBackfillRun(scope, Date.now());
     try {
-      const older = await discoverBackfill(roots, state, Date.now());
-      if (older.length > 0) {
-        const known = new Set(files.map((f) => f.path));
-        const added = older.filter((f) => !known.has(f.path));
+      const owed = await discoverBackfill(roots, state);
+      if (owed.length > 0) {
+        const merged = mergeBackfill(files, owed);
+        const added = merged.added;
         const unseen = added.filter((f) => !state.files[f.path]).length;
         if (added.length > 0) {
           log(
-            `[hx] backfill: ${added.length} session${added.length === 1 ? "" : "s"} older than the 30-day window still undelivered (${unseen} never ingested) — queueing`,
+            `[hx] backfill: ${added.length} session${added.length === 1 ? "" : "s"} the live sweep did not reach still owe bytes (${unseen} never ingested) — queueing`,
           );
-          files = [...files, ...added];
+          files = merged.files;
+          // Hand them to the catalog so they ride normal tiers from here on.
+          // Without this the sweep re-finds the same blind-spot files every
+          // hour, uploads them at hourly cadence while they are still being
+          // written, and makes the progress snapshot breathe as they appear
+          // and vanish from the pass. Adoption grants no exemptions — see
+          // DiscoveryCatalog.adopt.
+          const adopted = catalog?.adopt(added, Date.now()) ?? 0;
+          if (adopted > 0) log(`[hx] backfill: ${adopted} adopted into the live sweep`);
         } else {
           // Silence here was ambiguous: "the sweep is not running" and "the
           // sweep ran and found nothing" looked identical from the log.
           log(
-            `[hx] backfill: ${older.length} session(s) older than the window, all already queued this pass — nothing to add`,
+            "[hx] backfill: swept, every owed session was already queued this pass — nothing to add",
           );
         }
       } else {
-        log("[hx] backfill: nothing older than the 30-day window still owes bytes");
+        log("[hx] backfill: nothing on disk still owes bytes");
       }
     } catch (err) {
       // Never let the slow sweep break a pass: the live backlog matters more,
@@ -2280,10 +2330,64 @@ export async function tickOnce(
   // counts sessions, and a child stream is part of its session, not a new one.
   if (!opts.only && Date.now() >= (childEndpointsMissingUntilMs.get(scope) ?? 0)) {
     const parentByArtifactSession = buildChildParentIndex(state);
+    // Lanes this pass rescued from the blind spot. They drain here rather than
+    // one chunk per sweep, because for a dormant lane this pass is the only
+    // cadence there is — the walk is windowed and will not pick it up next
+    // tick, so a lane bigger than one chunk would trickle at one chunk per
+    // HOUR. (An in-window rescue is adopted into the walk and does get tick
+    // cadence; draining it here simply gets it moving a little sooner.)
+    const sweptLanes = new Set<string>();
     try {
-      const { children, runs } = catalog
+      let { children, runs } = catalog
         ? catalog.listChildren()
         : await discoverClaudeChildren(roots.claude);
+      // The child sweep, on its own hourly lane. The walk cannot reach a lane
+      // inside a dormant project dir, and it used to drop any lane quiet for
+      // 30 days — but quiet is the NORMAL state of a lane the parent-lane
+      // latch froze or an offline vault benched, and the ledger keeps billing
+      // those as owed. Merged before election and contention counting so a
+      // swept lane rides the identical gates, and merged BY PATH because a
+      // duplicate here reads as lane contention and would reset offsets.
+      // Catalog only, and not merely because adoption needs it. Legacy mode
+      // has nowhere to register a rescued lane, so the lane would be visible
+      // on sweep ticks and invisible on every other one — and that flicker is
+      // read as an uploader takeover, clearing the lane's offsets every hour.
+      // Legacy had no child sweep at all before this PR, so stranded-but-quiet
+      // is the shape it is supposed to restore; giving it an hourly wipe loop
+      // instead would be a new wart, not a preserved one.
+      if (catalog && backfillDue(`${scope}:children`, Date.now())) {
+        markBackfillRun(`${scope}:children`, Date.now());
+        try {
+          const swept = await discoverChildBackfill(roots, state);
+          const merged = mergeChildBackfill(children, runs, swept.children, swept.runs);
+          if (merged.added.length > 0) {
+            const unseen = merged.added.filter((c) => !state.files[c.path]).length;
+            log(
+              `[hx] child backfill: ${merged.added.length} lane${merged.added.length === 1 ? "" : "s"} the live sweep did not reach still owe bytes (${unseen} never ingested) — queueing`,
+            );
+          } else {
+            log("[hx] child backfill: swept, no lane outside the live sweep owes bytes");
+          }
+          for (const c of merged.added) sweptLanes.add(c.path);
+          // Offer each rescued lane's session dir to the catalog so childPass
+          // keeps walking it. Without this a rescued lane is visible only on
+          // sweep ticks, and a lane with a second on-disk candidate would then
+          // flip its elected uploader every tick — which planChildLaneResets
+          // reads as a takeover and answers by clearing offsets. Offer, not
+          // hand: the catalog takes only in-window lanes, which is the whole
+          // population that can oscillate. See DiscoveryCatalog.adoptSessionDir.
+          const at = Date.now();
+          for (const c of merged.added) catalog.adoptSessionDir(c, at);
+          children = merged.children;
+          runs = merged.runs;
+        } catch (err) {
+          // Same contract as the parent sweep: never let the slow scan break
+          // the pass. The live lanes still upload; the next hour retries.
+          log(
+            `[hx] child backfill skipped: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
       const electedChildren = electChildUploaders(children, log);
       const lanePlan = planChildLaneResets(
         electedChildren,
@@ -2333,6 +2437,16 @@ export async function tickOnce(
         try {
           const did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
           if (did) uploaded += 1;
+          // Drain a rescued lane in place, bounded so one large lane cannot
+          // monopolise the pass or starve the lanes queued behind it. The
+          // extra chunks do NOT increment `uploaded`: everywhere else in this
+          // pass it counts FILES, and inflating it here would quietly change
+          // what the end-of-pass line and the perf counters mean.
+          if (did && sweptLanes.has(c.path)) {
+            for (let i = 1; i < SWEPT_LANE_MAX_CHUNKS && !stopChildren; i++) {
+              if (!(await ingestChildOne(cfg, c, parentByArtifactSession, opts, log))) break;
+            }
+          }
           if (
             pendingChild?.consecutiveFailures !== undefined ||
             pendingChild?.nextAttemptAtMs !== undefined
@@ -2446,6 +2560,12 @@ export async function startWatch(
   // the gateway said the store is DOWN, and that is still true until it says
   // otherwise (`hx retry --blocked` / `--all` release those deliberately).
   try {
+    const stranded = await pruneStrandedOffsets(scopeOf(cfg));
+    if (stranded.keys > 0) {
+      log(
+        `[hx] dropped ${stranded.keys} offset key${stranded.keys === 1 ? "" : "s"} for unknown destinations across ${stranded.files} session${stranded.files === 1 ? "" : "s"} no longer on disk`,
+      );
+    }
     const dropped = await clearGenericBackoffs(scopeOf(cfg));
     if (dropped > 0) {
       log(`[hx] cleared ${dropped} stale retry backoff${dropped === 1 ? "" : "s"} on start`);

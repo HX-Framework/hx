@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import {
   backfillDue,
   BACKFILL_INTERVAL_MS,
-  LIVE_WINDOW_MS,
   markBackfillRun,
+  mergeBackfill,
   resetBackfillSchedule,
   selectBackfill,
 } from "./backfill.js";
@@ -40,66 +40,65 @@ describe("selectBackfill", () => {
     // The exact shape measured on a real device: 106 files, 112.5 MB, no state
     // entry at all. Live discovery cannot see them (past the window) and the
     // reattribute sweep skips them ("live ingest owns them" — it does not).
-    const out = selectBackfill([file("old", 5_000, 45)], { files: {} }, NOW);
+    const out = selectBackfill([file("old", 5_000, 45)], { files: {} });
     assert.equal(out.length, 1);
     assert.equal(out[0]?.path, "old");
   });
 
   it("picks up a partial that aged out mid-upload", () => {
-    const out = selectBackfill([file("old", 5_000, 45)], stateWith(entry("old", { letai: 1_000 })), NOW);
+    const out = selectBackfill([file("old", 5_000, 45)], stateWith(entry("old", { letai: 1_000 })));
     assert.equal(out.length, 1);
   });
 
   it("leaves a fully delivered old file alone", () => {
-    const out = selectBackfill([file("old", 5_000, 45)], stateWith(entry("old", { letai: 5_000 })), NOW);
+    const out = selectBackfill([file("old", 5_000, 45)], stateWith(entry("old", { letai: 5_000 })));
     assert.equal(out.length, 0);
   });
 
   it("stays eligible while ANY destination is still owed bytes", () => {
     // minOffset, not one store: a file complete on the primary but zero on a
     // second destination is not delivered.
-    const out = selectBackfill(
-      [file("old", 5_000, 45)],
-      stateWith(entry("old", { letai: 5_000, orgA: 0 })),
-      NOW,
-    );
+    const out = selectBackfill([file("old", 5_000, 45)],
+      stateWith(entry("old", { letai: 5_000, orgA: 0 })));
     assert.equal(out.length, 1);
   });
 
-  it("never touches files inside the live window, even undelivered ones", () => {
-    // The hot loop owns those; claiming them here would queue the same file
-    // twice in one pass.
-    const out = selectBackfill([file("fresh", 5_000, 2)], { files: {} }, NOW);
-    assert.equal(out.length, 0);
+  it("claims a RECENT undelivered file — the blind spot the age test created", () => {
+    // The regression this module now exists to prevent. A file appended minutes
+    // ago inside a project directory untouched for a year is invisible to the
+    // hot loop, which prunes by DIRECTORY mtime, and appending never bumps
+    // that. While selection mirrored the live window this file belonged to no
+    // sweep at all: owed forever, and reported as owed, because the status
+    // report scans unwindowed. Age is not a proxy for "someone else owns it".
+    const out = selectBackfill([file("fresh", 5_000, 0)], { files: {} });
+    assert.equal(out.length, 1, "owed-ness alone decides — never age");
   });
 
-  it("treats the window boundary as belonging to the live sweep", () => {
-    const exactly = selectBackfill(
-      [{ ...file("edge", 10, 0), mtimeMs: NOW - LIVE_WINDOW_MS }],
-      { files: {} },
-      NOW,
+  it("selects on owed-ness across the whole age range at once", () => {
+    // Selection takes no clock at all — the signature is the proof that no
+    // window can come back as an "optimisation", which is stronger than any
+    // assertion over sampled timestamps. This pins the consequence: age
+    // spreads across four hundred days and changes nothing.
+    const files = [file("today", 10, 0), file("ancient", 10, 400)];
+    assert.deepEqual(
+      selectBackfill(files, { files: {} }).map((f) => f.path),
+      ["today", "ancient"],
     );
-    assert.equal(exactly.length, 0, "exactly at the window is still live");
-    const past = selectBackfill(
-      [{ ...file("edge", 10, 0), mtimeMs: NOW - LIVE_WINDOW_MS - 1 }],
-      { files: {} },
-      NOW,
-    );
-    assert.equal(past.length, 1);
   });
 
   it("separates a mixed disk correctly", () => {
-    const out = selectBackfill(
-      [
+    const out = selectBackfill([
         file("fresh-undelivered", 100, 1),
         file("old-never-seen", 100, 60),
         file("old-partial", 100, 60),
         file("old-done", 100, 60),
       ],
-      stateWith(entry("old-partial", { letai: 40 }), entry("old-done", { letai: 100 })),
-      NOW,
-    );
-    assert.deepEqual(out.map((f) => f.path).sort(), ["old-never-seen", "old-partial"]);
+      stateWith(entry("old-partial", { letai: 40 }), entry("old-done", { letai: 100 })));
+    assert.deepEqual(out.map((f) => f.path).sort(), [
+      "fresh-undelivered",
+      "old-never-seen",
+      "old-partial",
+    ]);
   });
 });
 
@@ -131,7 +130,7 @@ describe("gateway-change coverage matrix", () => {
   const NEW = 2;  // days — inside it
 
   it("backfill owns >30d files with NO delivery record", () => {
-    const out = selectBackfill([file("old-never", 100, OLD)], { files: {} }, NOW);
+    const out = selectBackfill([file("old-never", 100, OLD)], { files: {} });
     assert.equal(out.length, 1);
   });
 
@@ -140,17 +139,55 @@ describe("gateway-change coverage matrix", () => {
     // stale-but-complete, so the file looks done. If the audit is windowed,
     // nothing reaches this file and its history never re-uploads.
     const state = stateWith(entry("old-looks-done", { letai: 100 }));
-    const out = selectBackfill([file("old-looks-done", 100, OLD)], state, NOW);
+    const out = selectBackfill([file("old-looks-done", 100, OLD)], state);
     assert.equal(out.length, 0, "backfill must not claim it — the audit verifies it against the server");
   });
 
-  it("backfill leaves everything inside the live window to the hot loop", () => {
+  it("backfill also claims inside-window files, and the merge — not age — dedupes", () => {
+    // Selection is deliberately overlapping now; mergeBackfill is what keeps
+    // the hot loop and the sweep from queueing one file twice.
     const state = stateWith(entry("fresh", { letai: 40 }));
-    assert.equal(selectBackfill([file("fresh", 100, NEW)], state, NOW).length, 0);
+    const picked = selectBackfill([file("fresh", 100, NEW)], state);
+    assert.equal(picked.length, 1, "owed is owed, whatever its age");
+    const live = [file("fresh", 100, NEW)];
+    assert.deepEqual(mergeBackfill(live, picked).added, [], "the pass already holds it");
   });
 
   it("a partial >30d file is still claimed by backfill", () => {
     const state = stateWith(entry("old-partial", { letai: 40 }));
-    assert.equal(selectBackfill([file("old-partial", 100, OLD)], state, NOW).length, 1);
+    assert.equal(selectBackfill([file("old-partial", 100, OLD)], state).length, 1);
+  });
+});
+
+// The merge is the whole duplicate-suppression story now that selection no
+// longer partitions by age. It used to be three inline lines inside tickOnce,
+// which is why none of this was covered.
+describe("mergeBackfill", () => {
+  it("drops sweep results the pass already holds", () => {
+    const live = [file("a", 10, 1), file("b", 10, 1)];
+    const { files, added } = mergeBackfill(live, [file("b", 10, 1), file("c", 10, 1)]);
+    assert.deepEqual(added.map((f) => f.path), ["c"]);
+    assert.deepEqual(files.map((f) => f.path), ["a", "b", "c"]);
+  });
+
+  it("collapses duplicates WITHIN the sweep result too", () => {
+    // Not hygiene. Downstream, one path twice in a pass reads as two devices
+    // contending for one session, and the contention path resets offsets — so
+    // a duplicate here would re-upload a healthy file from zero, every sweep.
+    const { files, added } = mergeBackfill([], [file("a", 10, 1), file("a", 10, 1)]);
+    assert.equal(added.length, 1);
+    assert.equal(files.length, 1);
+  });
+
+  it("returns the original array identity when nothing is added", () => {
+    const live = [file("a", 10, 1)];
+    const { files, added } = mergeBackfill(live, [file("a", 10, 1)]);
+    assert.equal(added.length, 0);
+    assert.equal(files, live, "no needless copy on the common path");
+  });
+
+  it("is a no-op on an empty sweep", () => {
+    const live = [file("a", 10, 1)];
+    assert.equal(mergeBackfill(live, []).files, live);
   });
 });

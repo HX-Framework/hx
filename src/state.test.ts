@@ -6,6 +6,7 @@ import {
   offsetFor,
   migrateFileState,
   reconcileDestinationOffsets,
+  pruneStrandedOffsetsFrom,
   type FileState,
   type HxState,
 } from "./state.js";
@@ -139,5 +140,65 @@ describe("migrateFileState", () => {
       blocker,
     });
     assert.deepEqual(out.blocker, blocker);
+  });
+});
+
+// The dead key has to leave state, or it is carried for the life of the entry.
+// reconcileDestinations only runs inside append-url, so it can repair a file
+// the daemon still uploads and never one that has left the disk.
+describe("pruneStrandedOffsetsFrom", () => {
+  const entry = (path: string, offsets: Record<string, number>): FileState =>
+    ({ path, family: "claude-cli", sessionId: path, offsets, lastMtimeMs: 0, lastUploadAtMs: 0 }) as FileState;
+  const registry: HxState["destinations"] = {
+    letai: { vaultOrgId: null, status: "ready", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+  };
+  const stateWith = (offsets: Record<string, number>, destinations = registry, extra?: Record<string, number>): HxState => {
+    const files: HxState["files"] = { "/gone": entry("/gone", offsets) };
+    if (extra) files["/here"] = entry("/here", extra);
+    return { files, destinations };
+  };
+
+  it("drops a phantom on a file that has left the disk", () => {
+    const state = stateWith({ letai: 1000, phantom: 0 });
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 1, files: 1 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000 });
+  });
+
+  it("leaves a file that is STILL ON DISK to append-url's reconcile", () => {
+    const state = stateWith({ letai: 1000, phantom: 0 });
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, () => true), { keys: 0, files: 0 });
+  });
+
+  it("never drops a key with bytes of its own", () => {
+    const state = stateWith({ letai: 1000, orgReal: 400 });
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 0, files: 0 });
+  });
+
+  it("never drops a key another file has written to", () => {
+    const state = stateWith({ letai: 1000, orgReal: 0 }, registry, { letai: 1000, orgReal: 500 });
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, (p) => p === "/here"), { keys: 0, files: 0 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgReal: 0 });
+  });
+
+  it("never drops the primary key", () => {
+    const state = stateWith({ letai: 0 });
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 0, files: 0 });
+  });
+
+  it("never drops a REGISTERED destination", () => {
+    const state = stateWith({ letai: 1000, orgHeld: 0 }, {
+      ...registry,
+      orgHeld: { vaultOrgId: "orgHeld", status: "held", orgName: null, orgSlug: null, lastSeenAt: null, observedAtMs: 0 },
+    });
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 0, files: 0 });
+  });
+
+  it("does nothing when no registry has ever been recorded", () => {
+    // Built without going through stateWith: passing `undefined` for a
+    // defaulted parameter selects the DEFAULT, so the helper would have handed
+    // this test a registry and it would have proved nothing.
+    const state: HxState = { files: { "/gone": entry("/gone", { letai: 1000, orgA: 0 }) } };
+    assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 0, files: 0 });
+    assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgA: 0 });
   });
 });
