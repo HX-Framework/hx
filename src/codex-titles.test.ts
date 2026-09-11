@@ -92,6 +92,21 @@ describe("readCodexTitle", () => {
     assert.equal(readCodexTitle(home, ""), null);
   });
 
+  it("reads a live WAL-mode DB read-only (codex's default; data still in -wal)", () => {
+    // Mimic codex actively holding the DB in WAL: writer stays OPEN and we do NOT
+    // checkpoint, so the row lives in state_5.sqlite-wal, not the main file. This
+    // is the exact case the reader must handle (SQLITE_OPEN_READONLY over WAL).
+    const writer = new Database(join(home, "state_5.sqlite"));
+    try {
+      writer.exec("PRAGMA journal_mode = WAL");
+      writer.run(`CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT)`);
+      writer.run(`INSERT INTO threads (id, title, name) VALUES ('s1', 'auto', 'renamed')`);
+      assert.deepEqual(readCodexTitle(home, "s1"), { title: "renamed", source: "user" });
+    } finally {
+      writer.close();
+    }
+  });
+
   it("re-reads after the DB changes (fingerprint invalidates the cache)", () => {
     makeDb(5, [{ id: "s1", title: "first" }]);
     assert.deepEqual(readCodexTitle(home, "s1"), { title: "first", source: "ai" });

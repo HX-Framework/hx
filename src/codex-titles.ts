@@ -56,13 +56,23 @@ function stateDbPath(codexHome: string): string | null {
   return best?.p ?? null;
 }
 
+// Fingerprint the DB *and* its -wal sidecar: SQLite defaults to WAL mode, where
+// a write lands in <db>-wal and the main file's mtime/size need not change until
+// a checkpoint — so a title update would otherwise only be seen on the TTL lapse.
+// Including -wal invalidates the cache the moment codex writes. (The TTL still
+// bounds staleness if a filesystem reports mtime coarsely.)
 function fingerprint(dbPath: string): string {
-  try {
-    const s = statSync(dbPath);
-    return `${s.size}:${Math.trunc(s.mtimeMs)}`;
-  } catch {
-    return "absent";
-  }
+  const part = (p: string): string => {
+    try {
+      const s = statSync(p);
+      return `${s.size}:${Math.trunc(s.mtimeMs)}`;
+    } catch {
+      return "-";
+    }
+  };
+  const db = part(dbPath);
+  if (db === "-") return "absent";
+  return `${db}|${part(`${dbPath}-wal`)}`;
 }
 
 /** codex's own name for one row: a user rename beats the auto title; both trimmed
