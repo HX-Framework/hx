@@ -81,6 +81,7 @@ import { ByteSemaphore, runPool } from "./upload-scheduler.js";
 import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
+import { runTitleSyncSweep } from "./title-sync.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
 import { buildLedger, everWrittenKeys, reportableOffset, type SyncLedger } from "./ledger.js";
 import {
@@ -2760,6 +2761,15 @@ export async function startWatch(
     await runReattributeSweep(cfg, scopeOf(cfg), log);
   } catch (err) {
     log(`[hx] attribution sweep error: ${(err as Error).message}`);
+  }
+  // One-shot codex title backfill (LETAIR-481) — no-ops when every codex file
+  // already carries the current TITLE_SYNC_VERSION stamp. Best-effort: a gateway
+  // that predates /sessions/retitle (or is down) leaves the stamps unwritten and
+  // the next start retries.
+  try {
+    await runTitleSyncSweep(cfg, scopeOf(cfg), log);
+  } catch (err) {
+    log(`[hx] title sweep error: ${(err as Error).message}`);
   }
   if (opts.oneShot) return { stop: () => {} };
   const timer = setInterval(() => void run(), FAST_POLL_MS);
