@@ -4,6 +4,7 @@ import {
   HxHttpError,
   requestAppendUrl,
   putChunk,
+  retitleSessions,
   vaultBlockerFromDestinations,
 } from "./uploader.js";
 import type { HxConfig } from "./config.js";
@@ -41,6 +42,50 @@ describe("requestAppendUrl with a fortress-direct target", () => {
     assert.equal(res.uploadUrl, "https://bucket/p");
     assert.equal(calls[0]?.url, "https://f.example/sessions/append-url");
     assert.equal(calls[0]?.auth, "Bearer captoken");
+  });
+});
+
+describe("retitleSessions (codex title backfill transport)", () => {
+  it("POSTs the items to /sessions/retitle with the bearer token and parses the results", async () => {
+    const calls: { url: string; auth?: string; body: unknown }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({
+        url: String(url),
+        auth: headers.authorization,
+        body: JSON.parse(String(init?.body ?? "{}")),
+      });
+      return new Response(
+        JSON.stringify({ ok: true, results: [{ family: "codex-cli", sessionId: "s1", status: "queued" }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const cfg: HxConfig = { gatewayBaseUrl: "https://f.example", accessToken: "captoken" };
+    const res = await retitleSessions(cfg, [
+      { family: "codex-cli", sessionId: "s1", title: "Fix the bug", titleSource: "ai", destinations: [null, "org-1"] },
+    ]);
+    assert.equal(res.results[0]?.status, "queued");
+    assert.equal(calls[0]?.url, "https://f.example/sessions/retitle");
+    assert.equal(calls[0]?.auth, "Bearer captoken");
+    assert.deepEqual((calls[0]?.body as { items: unknown[] }).items[0], {
+      family: "codex-cli",
+      sessionId: "s1",
+      title: "Fix the bug",
+      titleSource: "ai",
+      destinations: [null, "org-1"],
+    });
+  });
+
+  it("throws HxHttpError on a non-2xx (e.g. a gateway predating the route) — the sweep won't stamp", async () => {
+    globalThis.fetch = (async () => new Response("not found", { status: 404 })) as unknown as typeof fetch;
+    const cfg: HxConfig = { gatewayBaseUrl: "https://f.example", accessToken: "t" };
+    await assert.rejects(
+      retitleSessions(cfg, [
+        { family: "codex-cli", sessionId: "s1", title: "x", titleSource: "ai", destinations: [null] },
+      ]),
+      HxHttpError,
+    );
   });
 });
 

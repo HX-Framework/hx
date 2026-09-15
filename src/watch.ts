@@ -76,10 +76,12 @@ import {
   hasDirtyState,
 } from "./state.js";
 import { catalogFor } from "./catalog.js";
+import { readCodexTitle } from "./codex-titles.js";
 import { ByteSemaphore, runPool } from "./upload-scheduler.js";
 import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
+import { runTitleSyncSweep } from "./title-sync.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
 import { buildLedger, everWrittenKeys, reportableOffset, type SyncLedger } from "./ledger.js";
 import {
@@ -649,6 +651,10 @@ export async function ingestOne(
   const ccdByCli = await getCcdRecentsByCliId(Date.now()).catch(() => null);
   const ccdMeta = ccdByCli?.get(fState.sessionId) ?? null;
 
+  // Codex keeps its title in ~/.codex/state_*.sqlite (not the rollout), keyed by
+  // the session id — byte-independent, resolve once. Null for Claude sources.
+  const codexTitle = file.source === "codex" ? readCodexTitle(file.rootDir, fState.sessionId) : null;
+
   let anyProgress = false;
   let lastUnavailable: HxHttpError | null = null;
   let heldBlocker: SyncBlockerDetails | undefined;
@@ -759,10 +765,11 @@ export async function ingestOne(
         // the growth probe below can shrink the chunk, replacing text+summary,
         // so the derivation lives in a helper called after the PUT settles.
         const deriveTitleMeta = (): { title: string | undefined; titleSource: "user" | "ai" | "fallback" | undefined } => {
-          let title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
+          let title = ccdMeta?.title ?? summary.title ?? codexTitle?.title ?? head.title ?? undefined;
           let titleSource: "user" | "ai" | "fallback" | undefined;
           if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
           else if (summary.title) titleSource = summary.titleSource ?? undefined;
+          else if (codexTitle?.title) titleSource = codexTitle.source;
           else if (head.title) titleSource = "ai";
           // No user/AI title anywhere — synthesize a readable label so the session
           // shows something meaningful instead of a bare id downstream. Only on a
@@ -2754,6 +2761,15 @@ export async function startWatch(
     await runReattributeSweep(cfg, scopeOf(cfg), log);
   } catch (err) {
     log(`[hx] attribution sweep error: ${(err as Error).message}`);
+  }
+  // One-shot codex title backfill (LETAIR-481) — no-ops when every codex file
+  // already carries the current TITLE_SYNC_VERSION stamp. Best-effort: a gateway
+  // that predates /sessions/retitle (or is down) leaves the stamps unwritten and
+  // the next start retries.
+  try {
+    await runTitleSyncSweep(cfg, scopeOf(cfg), log);
+  } catch (err) {
+    log(`[hx] title sweep error: ${(err as Error).message}`);
   }
   if (opts.oneShot) return { stop: () => {} };
   const timer = setInterval(() => void run(), FAST_POLL_MS);

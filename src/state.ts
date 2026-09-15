@@ -114,6 +114,10 @@ export interface FileState {
    *  were captured while the workdir still existed, so they always win over a
    *  later re-walk (a REUSED scratch path can resolve to the wrong repo). */
   attributionVersion?: number;
+  /** TITLE_SYNC_VERSION stamp of the last codex title backfill that covered this
+   *  file (title-sync.ts, LETAIR-481). Absent/lower ⇒ the next sweep re-reads the
+   *  codex name and re-reports it; once stamped it is skipped on every start. */
+  titleSyncVersion?: number;
 }
 
 /** On-disk shape before per-destination fan-out carried a single `offset`. The
@@ -130,6 +134,7 @@ export interface LegacyFileState {
   repoSlug?: string | null;
   cwd?: string;
   attributionVersion?: number;
+  titleSyncVersion?: number;
   lastKnownSize?: number;
   consecutiveFailures?: number;
   nextAttemptAtMs?: number;
@@ -175,6 +180,7 @@ export function migrateFileState(s: LegacyFileState): FileState {
     ...(s.repoSlug !== undefined ? { repoSlug: s.repoSlug } : {}),
     ...(s.cwd !== undefined ? { cwd: s.cwd } : {}),
     ...(s.attributionVersion !== undefined ? { attributionVersion: s.attributionVersion } : {}),
+    ...(s.titleSyncVersion !== undefined ? { titleSyncVersion: s.titleSyncVersion } : {}),
     lastKnownSize: s.lastKnownSize,
     consecutiveFailures: s.consecutiveFailures,
     nextAttemptAtMs: s.nextAttemptAtMs,

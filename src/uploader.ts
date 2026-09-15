@@ -354,6 +354,41 @@ export async function reattributeSessions(
   return (await res.json()) as { ok: true; results: ReattributeResult[] };
 }
 
+/** One session in a title-backfill batch (LETAIR-481): the client's OWN name
+ *  plus the destinations the daemon actually uploaded this session's content to
+ *  (state.json offset keys → vaultOrgId, or null for the let.ai default fortress
+ *  — the AUTHORITATIVE content homes, so a reattributed session is not misrouted). */
+export interface RetitleItem {
+  family: Family;
+  sessionId: string;
+  title: string;
+  titleSource: "user" | "ai";
+  destinations: (string | null)[];
+}
+
+export interface RetitleResult {
+  family: string;
+  sessionId: string;
+  status: "queued" | "deleted";
+}
+
+// The codex title backfill's transport (title-sync.ts): a metadata-only refresh
+// of already-uploaded codex sessions whose title never crossed the wire — no
+// bytes move. A gateway that predates the route 404s; the sweep treats that as
+// "not yet, retry next start" (the version stamp isn't written).
+export async function retitleSessions(
+  cfg: HxConfig,
+  items: RetitleItem[],
+): Promise<{ ok: true; results: RetitleResult[] }> {
+  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/retitle`, {
+    method: "POST",
+    headers: authHeaders(cfg),
+    body: JSON.stringify({ items }),
+  });
+  if (!res.ok) await throwHttp(res, "retitle");
+  return (await res.json()) as { ok: true; results: RetitleResult[] };
+}
+
 // ── Child execution lanes (subagents + workflow agents) ────────────────────
 // Same 3-step chunked contract as the parent transcript, against dedicated
 // endpoints (an old gateway 404s these — child bytes must never compose into
