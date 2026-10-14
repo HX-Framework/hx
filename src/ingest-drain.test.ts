@@ -19,7 +19,8 @@ import {
   upsertFileState,
   type FileState,
 } from "./state.js";
-import { ingestOne, resetChunkGrowthForTests } from "./watch.js";
+import { SessionUpstreamUnavailable, ingestOne, resetChunkGrowthForTests } from "./watch.js";
+import { setCcdSessionsDirForTests } from "./ccd.js";
 import type { DiscoveredFile } from "./sources.js";
 
 const MB = 1024 * 1024;
@@ -29,6 +30,7 @@ let dir: string;
 afterEach(() => {
   globalThis.fetch = realFetch;
   setStateDirForTests(null);
+  setCcdSessionsDirForTests(null);
   resetStateCache("main");
   resetChunkGrowthForTests();
   try {
@@ -41,6 +43,8 @@ afterEach(() => {
 interface StubOptions {
   /** PUT bodies strictly larger than this fail with 413. */
   putMaxBytes?: number;
+  /** append-url answers 200 with ONLY held destinations (no ready store). */
+  heldOnly?: boolean;
 }
 
 interface StubLedger {
@@ -56,6 +60,21 @@ function stubGateway(opts: StubOptions = {}): StubLedger {
     const u = String(url);
     if (u.endsWith("/sessions/append-url")) {
       ledger.appendUrls += 1;
+      if (opts.heldOnly) {
+        return new Response(
+          JSON.stringify({
+            chunkId: `c${ledger.appendUrls}`,
+            uploadUrl: "https://blob.test/staging",
+            objectName: "o",
+            expiresAt: "2027-01-01T00:00:00Z",
+            vaultOrgId: "orgA",
+            destinations: [
+              { vaultOrgId: "orgA", status: "held", reason: "vault_offline", orgName: "Acme", orgSlug: "acme" },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
       return new Response(
         JSON.stringify({
           chunkId: `c${ledger.appendUrls}`,
@@ -98,6 +117,9 @@ const cfg: HxConfig = { gatewayBaseUrl: "https://gw.test", accessToken: "tok" };
 async function seedFile(totalBytes: number, lineLen = 1024): Promise<DiscoveredFile> {
   dir = mkdtempSync(join(tmpdir(), "hx-drain-"));
   setStateDirForTests(dir);
+  // Hermetic: ingestOne consults the CCD session store for titles; point it
+  // at an empty dir so the test never indexes the machine's real store.
+  setCcdSessionsDirForTests(join(dir, "no-ccd"));
   resetStateCache("main");
   const p = join(dir, "session.jsonl");
   const line = `${"x".repeat(lineLen - 1)}\n`;
@@ -290,5 +312,25 @@ describe("ingestOne drain", () => {
     assert.ok(ledger.putBodies.every((b) => b <= 256 * 1024), "override respected");
     const state = await loadState();
     assert.equal(state.files[f.path]!.offsets["letai"], 2 * MB);
+  });
+});
+
+describe("ingestOne with every destination held", () => {
+  it("takes the per-session hold instead of returning false (which re-pooled the file every tick)", async () => {
+    const f = await seedFile(2 * MB);
+    const ledger = stubGateway({ heldOnly: true });
+    await assert.rejects(
+      ingestOne(cfg, f, {}, silentLog),
+      (err: unknown) =>
+        err instanceof SessionUpstreamUnavailable &&
+        err.reason === "vault_offline" &&
+        err.status === 503 &&
+        err.blocker?.destinations[0]?.orgName === "Acme",
+    );
+    assert.equal(ledger.appendUrls, 1, "one plan request");
+    assert.equal(ledger.putBodies.length, 0, "nothing was PUT");
+    const state = await loadState();
+    assert.equal(state.files[f.path]!.offsets["orgA"], 0, "held destination recorded at zero");
+    assert.equal(state.destinations?.["orgA"]?.status, "held", "registry learned the hold");
   });
 });

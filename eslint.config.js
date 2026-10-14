@@ -27,6 +27,21 @@ export default tseslint.config(
           caughtErrorsIgnorePattern: "^_",
         },
       ],
+      // The shape behind the 2026-10-14 `hx watch` freeze: a single-flight
+      // slot holding the promise of an async IIFE whose own `finally` clears
+      // the slot. Flagged whenever such an IIFE is stored at all; see
+      // singleFlight in src/upload-scheduler.ts for the safe form.
+      "no-restricted-syntax": [
+        "error",
+        ...["AssignmentExpression", "VariableDeclarator"].map((parent) => ({
+          selector: `${parent} > CallExpression[callee.async=true]:has(TryStatement[finalizer])`,
+          message:
+            "Do not store the promise of an async IIFE that contains a try/finally. If the finally clears " +
+            "the variable the promise is stored in, a body that returns before its first await clears it " +
+            "BEFORE the assignment, and a settled promise stays in the slot forever. Clear the slot with " +
+            ".finally() on the promise instead (see singleFlight in src/upload-scheduler.ts).",
+        })),
+      ],
     },
   },
 );

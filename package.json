@@ -1,6 +1,6 @@
 {
   "name": "hx",
-  "version": "77.8.0",
+  "version": "77.9.0",
   "private": false,
   "license": "MIT",
   "type": "module",
@@ -27,6 +27,6 @@
     "typescript-eslint": "^8.63.0"
   },
   "overrides": {
-    "brace-expansion": "5.0.9"
+    "brace-expansion": "5.0.12"
   }
 }

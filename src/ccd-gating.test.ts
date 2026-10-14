@@ -1,17 +1,20 @@
-// CCD read gating (LETAIR-144 WS4): the 20 s mirror cycle must cost stats,
-// not scans, when nothing changed — and must still see every real change.
-// The proof of "no scan on unchanged fingerprint" swaps the .log's CONTENT
-// while keeping its size and mtime identical: a cache hit then returns the
-// OLD groups (content was never re-read), while any size/mtime movement
-// makes the new content visible.
+// CCD read gating (LETAIR-144 WS4, tightened in Request Pricing M13): the
+// 20 s mirror cycle must cost a handful of stats, not scans, when nothing
+// changed — and must still see every real change. The proof of "no scan on
+// unchanged fingerprint" swaps the .log's CONTENT while keeping its size and
+// mtime identical: a cache hit then returns the OLD groups (content was never
+// re-read), while any size/mtime movement makes the new content visible. The
+// session store side is the incremental index (ccd.ts): a rename-style write
+// is seen on the next refresh, an in-place rewrite by the next full stat
+// sweep (ccd-index.test.ts pins both).
 
 import { afterEach, describe, it } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildGroupMirror, setCcdLeveldbDirForTests } from "./ccd-prefs.js";
-import { readCcdRecentsCached, setCcdSessionsDirForTests } from "./ccd.js";
+import { CCD_FULL_STAT_INTERVAL_MS, CCD_REFRESH_TTL_MS, readCcdRecentsCached, setCcdSessionsDirForTests } from "./ccd.js";
 
 let root: string;
 
@@ -109,9 +112,11 @@ describe("buildGroupMirror fingerprint gate", () => {
         lastActivityAt: 2,
       }),
     );
-    // Session fingerprint stats FILES, so the rewrite is visible even though
-    // the org dir's mtime did not move. TTL is 10 s — pass a nowMs beyond it.
-    const blob = await buildGroupMirror(20_000);
+    // An in-place rewrite leaves the org dir's mtime alone, so the dir-mtime
+    // gate cannot see it; the full stat sweep does, once it is due.
+    const early = await buildGroupMirror(1000 + CCD_REFRESH_TTL_MS);
+    assert.deepEqual(early.groups[0]!.sessionIds, ["cli-1"], "not yet — dir unchanged, sweep not due");
+    const blob = await buildGroupMirror(1000 + CCD_FULL_STAT_INTERVAL_MS);
     assert.deepEqual(blob.groups[0]!.sessionIds, ["cli-2"]);
   });
 
@@ -133,21 +138,23 @@ describe("readCcdRecentsCached", () => {
     const [a, b] = await Promise.all([readCcdRecentsCached(50_000), readCcdRecentsCached(50_000)]);
     assert.equal(a, b, "single-flight: both callers got the same records array");
     assert.equal(a[0]!.cliSessionId, "cli-1");
-    const later = await readCcdRecentsCached(70_000); // TTL expired, store unchanged
-    assert.equal(later, a, "unchanged fingerprint kept the cached records identity");
+    const later = await readCcdRecentsCached(50_000 + CCD_REFRESH_TTL_MS); // TTL expired, store unchanged
+    assert.equal(later, a, "unchanged store kept the cached records identity");
   });
 });
 
-describe("mirror rebuild inside the records TTL", () => {
-  it("a rebuild triggered by a session-file change sees the NEW mapping even when the records cache is TTL-fresh", async () => {
+describe("mirror rebuild after a CCD session-file write", () => {
+  it("a rebuild after CCD rewrites a session file (by rename, as CCD does) sees the NEW mapping on the next refresh", async () => {
     const { sessions } = setup("Alpha");
-    // Prime the records cache (the ingest path does this constantly).
+    // Prime the index (the ingest path does this constantly).
     const primed = await readCcdRecentsCached(1_000);
     assert.equal(primed[0]!.cliSessionId, "cli-1");
 
-    // CCD rewrites the metadata 1s later — cliSessionId changes on disk.
+    // CCD rewrites the metadata — cliSessionId changes on disk. CCD writes a
+    // temp file and renames it over the old one, which bumps the org dir.
+    const target = join(sessions, "acct", "org", "local_aaa.json");
     writeFileSync(
-      join(sessions, "acct", "org", "local_aaa.json"),
+      `${target}.tmp`,
       JSON.stringify({
         sessionId: "local_aaa",
         cliSessionId: "cli-CHANGED",
@@ -157,15 +164,15 @@ describe("mirror rebuild inside the records TTL", () => {
         lastActivityAt: 2,
       }),
     );
+    renameSync(`${target}.tmp`, target);
 
-    // Mirror cycle 3s later — WITHIN the 10s records TTL of the prime. The
-    // session fingerprint moved, so the rebuild must NOT accept the stale
-    // TTL-cached records (it would otherwise cache the stale blob under the
-    // FRESH fingerprint — permanently wrong until the store changes again).
-    const blob = await buildGroupMirror(4_000);
-    assert.deepEqual(blob.groups[0]!.sessionIds, ["cli-CHANGED"], "fresh mapping despite TTL-fresh cache");
+    // The next mirror cycle past the refresh TTL sees it: the dir moved, so
+    // its files were statted and the moved one re-read. The cached blob is
+    // keyed by the index version, so it cannot be served stale.
+    const blob = await buildGroupMirror(1_000 + CCD_REFRESH_TTL_MS);
+    assert.deepEqual(blob.groups[0]!.sessionIds, ["cli-CHANGED"], "fresh mapping after the refresh");
 
-    const again = await buildGroupMirror(6_000);
+    const again = await buildGroupMirror(2_000 + CCD_REFRESH_TTL_MS);
     assert.deepEqual(again.groups[0]!.sessionIds, ["cli-CHANGED"], "and it stays correct");
   });
 });

@@ -78,3 +78,36 @@ export class ByteSemaphore {
     return this.used;
   }
 }
+
+/**
+ * Wrap an async job so that a call made while a previous call is still
+ * running joins that run instead of starting another. For the daemon's
+ * interval timers (mirror sync, heartbeat): setInterval fires on the clock no
+ * matter how long the last run took, so a run slowed by a loaded machine or a
+ * stalled peer must not stack a second, third, fourth copy of itself behind
+ * it — that is how a 20 s timer turned into back-to-back full store scans.
+ */
+export function singleFlight<T>(job: () => Promise<T>): () => Promise<T> {
+  let inFlight: Promise<T> | null = null;
+  return () => {
+    if (inFlight) return inFlight;
+    // The slot is cleared by .finally() on the promise, never by a `finally`
+    // inside the job. An async function runs synchronously up to its first
+    // await, so a job that returns before awaiting anything runs its own
+    // `finally` during the call, before the assignment below, and the
+    // assignment then stores a settled promise that nothing ever clears.
+    // That froze `hx watch` on 2026-10-14: the CCD records cache in ccd.ts
+    // (v77.5.0 to v77.8.0) cleared its slot that way, and the next caller with
+    // a changed fingerprint chained .then on the stuck promise and re-entered
+    // itself on every turn. That endless chain of microtasks starved every
+    // timer and grew memory until the process died. A .finally() callback is
+    // always queued as a microtask, so it runs after the assignment no matter
+    // how fast the job settles. The hand-rolled single-flights (ccd.ts,
+    // ccd-prefs.ts, ui/data.ts) follow the same rule, and eslint.config.js
+    // rejects the unsafe shape.
+    inFlight = job().finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
+  };
+}

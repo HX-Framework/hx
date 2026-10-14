@@ -3,7 +3,7 @@
 
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
-import { ByteSemaphore, runPool } from "./upload-scheduler.js";
+import { ByteSemaphore, runPool, singleFlight } from "./upload-scheduler.js";
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 1));
 
@@ -117,5 +117,40 @@ describe("ByteSemaphore", () => {
     r();
     r();
     assert.equal(sem.inUse(), 0);
+  });
+});
+
+describe("singleFlight", () => {
+  it("joins callers to the run in flight and runs again once it settled", async () => {
+    let runs = 0;
+    let release: () => void = () => {};
+    const job = singleFlight(async () => {
+      runs += 1;
+      await new Promise<void>((r) => {
+        release = r;
+      });
+      return runs;
+    });
+    const a = job();
+    const b = job();
+    const c = job();
+    assert.equal(runs, 1, "a timer firing three times started one run");
+    release();
+    assert.deepEqual(await Promise.all([a, b, c]), [1, 1, 1]);
+    const d = job();
+    assert.equal(runs, 2, "after settling, the next call runs again");
+    release();
+    assert.equal(await d, 2);
+  });
+
+  it("a rejection clears the slot so the next call retries", async () => {
+    let runs = 0;
+    const job = singleFlight(async () => {
+      runs += 1;
+      if (runs === 1) throw new Error("boom");
+      return "ok";
+    });
+    await assert.rejects(job(), /boom/);
+    assert.equal(await job(), "ok");
   });
 });

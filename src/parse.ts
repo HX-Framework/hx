@@ -10,9 +10,21 @@
 
 const MAX_BODY = 4000;
 
+/**
+ * Copy an excerpt out of its source string. JavaScriptCore implements
+ * slice/substring/trim as views that keep the WHOLE source string alive, so a
+ * 4 KB excerpt of a multi-megabyte pasted message would pin the megabytes for
+ * as long as the summary lives — and the drain loop keeps one summary per
+ * round for the whole pass. Round-tripping through bytes yields a string that
+ * owns its own storage.
+ */
+function detach(s: string): string {
+  return Buffer.from(s, "utf8").toString("utf8");
+}
+
 function bodyText(text: string): string {
   const t = text.trim();
-  return t.length > MAX_BODY ? `${t.slice(0, MAX_BODY)}\n\n…` : t;
+  return detach(t.length > MAX_BODY ? `${t.slice(0, MAX_BODY)}\n\n…` : t);
 }
 
 function extractText(
