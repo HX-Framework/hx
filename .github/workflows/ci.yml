@@ -85,3 +85,40 @@ jobs:
       # running eslint twice buys nothing.
       - name: Test
         run: bun test
+
+  # Runs the rendered systemd unit under a real systemd USER manager and checks
+  # that the background limits (Nice, IOSchedulingClass, CPUWeight, Memory*)
+  # actually apply in a user unit, where the cgroup ones depend on which
+  # controllers systemd delegates to the user manager. A separate job, like
+  # the Windows one, so the required check above keeps its name.
+  systemd-user:
+    name: systemd user unit (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # A hosted runner has no login session, so no user manager runs for the
+      # runner user. Lingering starts one; systemctl --user reaches it through
+      # $XDG_RUNTIME_DIR/systemd/private.
+      - name: Start a systemd user manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          runtime="/run/user/$(id -u)"
+          for _ in $(seq 1 50); do
+            [ -S "$runtime/systemd/private" ] && break
+            sleep 0.2
+          done
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          XDG_RUNTIME_DIR="$runtime" systemctl --user show-environment > /dev/null
+
+      - name: Test the unit under the user manager
+        env:
+          HX_TEST_SYSTEMD_USER: "1"
+        run: bun test src/daemon.systemd-user.test.ts src/daemon.test.ts
