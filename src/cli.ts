@@ -13,7 +13,15 @@ import {
 import { connect } from "./connect.js";
 import { backfillArtifacts, computeSyncReport, computeSyncSnapshot, startWatch, tickOnce } from "./watch.js";
 import { runReattributeSweep } from "./reattribute.js";
-import { getDaemonOps, tailLogs, teeStdioToLogs, type DaemonOps, type DaemonState } from "./daemon.js";
+import {
+  getDaemonOps,
+  reconcileServiceDefinition,
+  startLogRotation,
+  tailLogs,
+  teeStdioToLogs,
+  type DaemonOps,
+  type DaemonState,
+} from "./daemon.js";
 import { probeConnection, formatRate } from "./probe.js";
 import { fetchDeviceInventory } from "./uploader.js";
 import { runUpdate, type UpdateProgress, type UpdateResult } from "./update.js";
@@ -387,13 +395,28 @@ function stamped(base: (msg: string) => void): (msg: string) => void {
   };
 }
 
+// How long a daemon that just asked its service manager to reload it waits for
+// the restart before carrying on with the old definition.
+const SERVICE_RELOAD_WAIT_MS = 20_000;
+
 async function cmdWatch(): Promise<void> {
   // Windows' service manager does not redirect our output anywhere, and the
   // windowless service build has no console at all — so the daemon writes its
   // own log or `hx logs` shows nothing. No-op on macOS/Linux, where launchd and
   // systemd already do it.
   teeStdioToLogs();
+  // Keep stdout.log / stderr.log bounded. Only acts in a process that writes
+  // them — the background service — never in a foreground `hx watch`.
+  startLogRotation(stamped(log));
   const cfg = await ensureConfig();
+  // When launchd / systemd started us, bring the installed service definition
+  // up to this version: `hx update` restarts the service with the OLD binary's
+  // template. If it changed, the service manager is about to restart us with
+  // the new definition — wait for that rather than start a pass it would cut
+  // short, and carry on if it never comes.
+  if ((await reconcileServiceDefinition(stamped(log))) === "reloading") {
+    await new Promise((r) => setTimeout(r, SERVICE_RELOAD_WAIT_MS));
+  }
   // --local: regular behavior untouched, PLUS a second fully independent lane
   // mirroring the same files to the local dev gateway — own token
   // (config.local.json), own offsets (state.local.json), own backoff. Both

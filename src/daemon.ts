@@ -11,12 +11,33 @@
 // node for tsx engineer runs). `hx update` writes a new binary at the
 // SAME path and asks the service manager to restart so the new binary
 // takes over.
+//
+// Both definitions also mark hx as a background process (lower CPU and I/O
+// priority, slower respawn, and on Linux a memory ceiling) — see
+// "Background-process limits" below. The daemon keeps the installed
+// definition current itself (reconcileServiceDefinition) and rotates its own
+// log files (startLogRotation).
 
 import { homedir, platform, userInfo } from "node:os";
-import { join, dirname, win32 as winPath } from "node:path";
+import { basename, join, dirname, win32 as winPath } from "node:path";
 import { writeFile, mkdir, unlink, readFile, open } from "node:fs/promises";
-import { existsSync, readFileSync, createWriteStream, mkdirSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  truncateSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { HX_DIR } from "./hx-home.js";
 
 export { HX_DIR };
@@ -28,6 +49,68 @@ const LAUNCHD_PLIST = join(homedir(), "Library", "LaunchAgents", `${LAUNCHD_LABE
 
 const SYSTEMD_UNIT_NAME = "hx-vision.service";
 const SYSTEMD_UNIT_PATH = join(homedir(), ".config", "systemd", "user", SYSTEMD_UNIT_NAME);
+
+/** Where the service manager sends the daemon's stdout and stderr. */
+export interface LogPaths {
+  stdout: string;
+  stderr: string;
+}
+
+const DAEMON_LOGS: LogPaths = { stdout: STDOUT_LOG, stderr: STDERR_LOG };
+
+// ─────────────────────── Background-process limits ───────────────────────
+//
+// hx uploads in the background; nothing it does is more urgent than the app
+// the user is working in. On 2026-10-14 a runaway `hx watch` (an endless
+// promise loop, fixed separately) reached a 122 GB memory footprint and filled
+// swap while running at normal priority, and launchd restarted it 10 s after
+// every crash. These limits make the service yield to foreground work even
+// when hx itself misbehaves. All three backends get the same intent:
+//
+//   • lower CPU priority: launchd ProcessType=Background + Nice, systemd Nice +
+//     CPUWeight, Task Scheduler priority 7 (below normal);
+//   • lower disk I/O priority: launchd LowPriorityBackgroundIO (and the
+//     Background class itself), systemd IOSchedulingClass=idle;
+//   • at most one respawn a minute: launchd ThrottleInterval, systemd
+//     RestartSec (Task Scheduler's 5-minute supervision trigger already is);
+//   • a memory ceiling where the platform has one: systemd MemoryHigh /
+//     MemoryMax / MemorySwapMax. launchd has no working per-job memory limit
+//     on macOS, and Task Scheduler has none.
+
+/** nice(3) value for the daemon on macOS and Linux; apps run at 0. */
+const SERVICE_NICE = 10;
+
+/**
+ * Seconds between two spawns of the daemon by its service manager. Every start
+ * re-runs the startup catch-up pass, so the old 5–10 s respawn turned a crash
+ * loop into hundreds of full passes an hour.
+ */
+const RESPAWN_DELAY_SEC = 60;
+
+/**
+ * systemd: give up after this many starts within START_LIMIT_INTERVAL_SEC.
+ * With RESPAWN_DELAY_SEC between automatic restarts this only trips when the
+ * daemon dies within about a minute of starting, five times running — a
+ * crash at startup, not an occasional crash. `hx start` / `hx restart` /
+ * `hx update` clear the counter (reset-failed) before they start the unit.
+ */
+const START_LIMIT_BURST = 5;
+const START_LIMIT_INTERVAL_SEC = 600;
+
+/**
+ * systemd memory ceiling. A healthy daemon on the heaviest device measured
+ * (2026-10-14: 35k Claude Desktop session files, 16 GB of transcripts) held
+ * 0.47–0.58 GB; the macOS-only Claude Desktop store re-read on `main` pushes
+ * that to 2–3.4 GB, and Linux has no Claude Desktop. MemoryHigh starts kernel
+ * reclaim and allocation throttling at about twice the healthy footprint;
+ * MemoryMax OOM-kills the unit (and Restart= brings it back) well before it
+ * can take the machine down. MemorySwapMax keeps the cap real: without it the
+ * kernel would page the overflow out to swap, which is how the 2026-10-14
+ * runaway filled 27.5 GB of swap.
+ */
+const MEMORY_HIGH = "1G";
+const MEMORY_MAX = "2G";
+const MEMORY_SWAP_MAX = "512M";
 
 export interface DaemonState {
   /** Service manager has the unit loaded (regardless of process state). */
@@ -137,7 +220,7 @@ const TRANSIENT_BOOTSTRAP =
   /Bootstrap failed: (5|37|125)\b|Input\/output error|Operation (already|now) in progress/i;
 
 function bootstrapWithRetry(target: string, plistPath: string): void {
-  const backoffMs = [150, 300, 600, 1000];
+  const backoffMs = [150, 300, 600, 1000, 2000];
   let lastDetail = "";
   for (let attempt = 0; attempt <= backoffMs.length; attempt++) {
     const r = spawnSync("launchctl", ["bootstrap", target, plistPath], { stdio: "pipe" });
@@ -149,44 +232,64 @@ function bootstrapWithRetry(target: string, plistPath: string): void {
   throw new Error(`launchctl bootstrap ${target} ${plistPath} failed: ${lastDetail}`);
 }
 
+/**
+ * Unload the job (if loaded) and load it again from the plist on disk. This is
+ * the only way to make launchd pick up a CHANGED plist: launchd reads the file
+ * when it loads the job, and `kickstart` respawns the definition it already
+ * holds. It is also never delayed by ThrottleInterval, because the bootstrap
+ * creates a fresh job.
+ */
+function reloadLaunchdJob(target: string): void {
+  // bootout is the modern "unload"; tolerate "not loaded" so this is idempotent.
+  spawnSync("launchctl", ["bootout", `${target}/${LAUNCHD_LABEL}`], { stdio: "ignore" });
+  // Let launchd finish reaping the old job before bootstrapping the new one,
+  // and retry the bootstrap through the transient teardown race.
+  waitUntilUnloaded();
+  // Enable BEFORE bootstrap: `hx stop` disables the service (so a relogin
+  // can't resurrect it), and bootstrapping a disabled service fails with
+  // "Bootstrap failed: 119". Enabling an already-enabled service is a no-op.
+  runOrThrow("launchctl", ["enable", `${target}/${LAUNCHD_LABEL}`]);
+  bootstrapWithRetry(target, LAUNCHD_PLIST);
+}
+
+/**
+ * Write `content` to `path` unless the file already holds exactly that.
+ * Resolves with whether the file changed. A plain write, not a rename, so a
+ * definition the user keeps as a symlink stays a symlink.
+ */
+async function writeIfChanged(path: string, content: string): Promise<boolean> {
+  const current = await readFile(path, "utf8").catch(() => null);
+  if (current === content) return false;
+  await writeFile(path, content);
+  return true;
+}
+
 function macOps(): DaemonOps {
   return {
     managerName: "launchd",
     async install({ binPath }) {
       await mkdir(dirname(LAUNCHD_PLIST), { recursive: true });
       await mkdir(HX_DIR, { recursive: true });
-      const plist = renderPlist(binPath);
-      await writeFile(LAUNCHD_PLIST, plist);
-      const target = macTarget();
-      // bootout is the modern "unload"; tolerate "not loaded" so install is idempotent.
-      spawnSync("launchctl", ["bootout", `${target}/${LAUNCHD_LABEL}`], { stdio: "ignore" });
-      // Let launchd finish reaping the old job before bootstrapping the new one,
-      // and retry the bootstrap through the transient teardown race.
-      waitUntilUnloaded();
-      // Enable BEFORE bootstrap: `hx stop` disables the service (so a relogin
-      // can't resurrect it), and bootstrapping a disabled service fails with
-      // "Bootstrap failed: 119". Enabling an already-enabled service is a no-op.
-      runOrThrow("launchctl", ["enable", `${target}/${LAUNCHD_LABEL}`]);
-      bootstrapWithRetry(target, LAUNCHD_PLIST);
+      await writeFile(LAUNCHD_PLIST, renderPlist(binPath));
+      reloadLaunchdJob(macTarget());
     },
     async restart({ binPath }) {
       // Refresh the on-disk plist so a changed binary path is captured.
       await mkdir(dirname(LAUNCHD_PLIST), { recursive: true });
       await mkdir(HX_DIR, { recursive: true });
-      await writeFile(LAUNCHD_PLIST, renderPlist(binPath));
+      const changed = await writeIfChanged(LAUNCHD_PLIST, renderPlist(binPath));
       const target = macTarget();
-      const label = `${target}/${LAUNCHD_LABEL}`;
-      if (macState().loaded) {
+      if (macState().loaded && !changed) {
         // In-place restart: kill the running instance and respawn it from the
         // same plist, re-exec'ing the binary at its (now atomically-swapped)
         // path. This sidesteps the bootout→bootstrap teardown race entirely.
-        runOrThrow("launchctl", ["kickstart", "-k", label]);
+        // launchd holds a kickstart until ThrottleInterval has passed since the
+        // last spawn, so a daemon started less than a minute ago comes back up
+        // to a minute late; one that has been running longer restarts at once.
+        runOrThrow("launchctl", ["kickstart", "-k", `${target}/${LAUNCHD_LABEL}`]);
       } else {
-        // Not currently loaded — bring it up from scratch. Enable first: the
-        // service may have been disabled by `hx stop`, and bootstrapping a
-        // disabled service fails.
-        runOrThrow("launchctl", ["enable", label]);
-        bootstrapWithRetry(target, LAUNCHD_PLIST);
+        // Not loaded, or the plist changed and launchd must read it again.
+        reloadLaunchdJob(target);
       }
     },
     async uninstall() {
@@ -280,22 +383,38 @@ function linuxState(): DaemonState {
   return { loaded, pid: pid > 0 ? pid : null };
 }
 
+/**
+ * Clear the unit's failed state, which also zeroes its start-rate counter.
+ * Once the unit has hit StartLimitBurst, systemd refuses every `start` ("start
+ * request repeated too quickly") until this runs, and an explicit `hx start`,
+ * `hx restart` or `hx update` must always be able to bring hx back. Fails
+ * harmlessly when the unit is not loaded yet.
+ */
+function clearStartLimit(): void {
+  spawnSync("systemctl", ["--user", "reset-failed", SYSTEMD_UNIT_NAME], { stdio: "ignore" });
+}
+
 function systemdOps(): DaemonOps {
   return {
     managerName: "systemd (user)",
     async install({ binPath }) {
       await mkdir(dirname(SYSTEMD_UNIT_PATH), { recursive: true });
       await mkdir(HX_DIR, { recursive: true });
-      const unit = renderSystemdUnit(binPath);
-      await writeFile(SYSTEMD_UNIT_PATH, unit);
+      const changed = await writeIfChanged(SYSTEMD_UNIT_PATH, renderSystemdUnit(binPath));
       runOrThrow("systemctl", ["--user", "daemon-reload"]);
-      runOrThrow("systemctl", ["--user", "enable", "--now", SYSTEMD_UNIT_NAME]);
+      clearStartLimit();
+      runOrThrow("systemctl", ["--user", "enable", SYSTEMD_UNIT_NAME]);
+      // `start` leaves an already-running unit alone, so a changed definition
+      // (new limits) would not apply until the next restart. `restart` starts
+      // a stopped unit too.
+      runOrThrow("systemctl", ["--user", changed ? "restart" : "start", SYSTEMD_UNIT_NAME]);
     },
     async restart({ binPath }) {
       await mkdir(dirname(SYSTEMD_UNIT_PATH), { recursive: true });
       await mkdir(HX_DIR, { recursive: true });
       await writeFile(SYSTEMD_UNIT_PATH, renderSystemdUnit(binPath));
       runOrThrow("systemctl", ["--user", "daemon-reload"]);
+      clearStartLimit();
       // `restart` re-execs ExecStart (the swapped binary) when running, and
       // starts the unit when it was stopped — either way we end up running.
       runOrThrow("systemctl", ["--user", "restart", SYSTEMD_UNIT_NAME]);
@@ -662,6 +781,13 @@ function windowsUserId(): string {
  *
  * The battery settings matter on laptops, which is most of the fleet: the
  * defaults refuse to start (and stop a running task) on battery power.
+ *
+ * Priority 7 is the background-process setting: the scheduler starts the
+ * process in BELOW_NORMAL_PRIORITY_CLASS. Microsoft's TaskSettings.Priority
+ * docs: 0 realtime, 1 high, 2–3 above normal, 4–6 normal ("interactive
+ * tasks"), 7–8 below normal ("background tasks"), 9–10 idle. 7 is also the
+ * scheduler's default, but it is spelled out so the intent survives anyone
+ * editing the XML.
  */
 export function renderTaskXml(binPath: string, userId: string): string {
   return `<?xml version="1.0" encoding="UTF-16"?>
@@ -927,8 +1053,40 @@ function unsupportedOps(
 }
 
 // ─────────────────────────────── Templates ────────────────────────────────
+//
+// hx owns these files: install(), restart() and the daemon's own
+// reconcileServiceDefinition() rewrite them whole, so the first line of each
+// says so. Changing a template changes every installed definition the next
+// time an updated daemon starts — keep the output deterministic.
 
-function renderPlist(binPath: string): string {
+const MANAGED_NOTE =
+  "Managed by hx. hx start, hx update and the hx daemon rewrite this file, so local edits do not last.";
+
+/**
+ * The LaunchAgent plist. Measured on macOS 26.4 with a probe job: without the
+ * background keys launchd spawns the job as `spawn type = daemon (3)` at nice 0
+ * and scheduler priority 20; with them, as `spawn type = background (5)` at
+ * nice 10 and priority 4, the darwin-background band.
+ *
+ *   • ProcessType=Background — launchd puts the process in the
+ *     darwin-background band (setpriority(2), PRIO_DARWIN_BG): the lowest CPU
+ *     scheduling priority, disk I/O throttled like a setiopolicy_np(3)
+ *     throttleable policy, and network I/O throttled on sockets it opens.
+ *     While the machine is idle hx runs as before; under contention it waits.
+ *   • LowPriorityBackgroundIO — the kernel treats the job's filesystem I/O as
+ *     low priority while it is in that band (`launchctl print` lists it as
+ *     "low priority background i/o").
+ *   • Nice=10 — ordinary nice(3). Redundant while ProcessType holds, and still
+ *     right if a later macOS changes what Background means.
+ *   • ThrottleInterval=60 — launchd spawns the job at most once a minute
+ *     (default: every 10 s). A job that ran longer than that is respawned at
+ *     once, so this only slows a crash loop. It also holds `kickstart -k` back
+ *     until a minute has passed since the last spawn (see restart()).
+ *
+ * The log paths are a parameter only so tests can render the file without the
+ * caller's home directory in it.
+ */
+export function renderPlist(binPath: string, logs: LogPaths = DAEMON_LOGS): string {
   // The daemon runs `hx watch`, which reads the gateway + token from
   // ~/.let/hx/config.json — so no HX_GATEWAY_URL is injected into the service
   // environment. That's deliberate: a stale env var must never be able to
@@ -942,6 +1100,7 @@ function renderPlist(binPath: string): string {
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- ${MANAGED_NOTE} -->
 <plist version="1.0">
   <dict>
     <key>Label</key><string>${LAUNCHD_LABEL}</string>
@@ -955,8 +1114,12 @@ function renderPlist(binPath: string): string {
     <dict>
       <key>SuccessfulExit</key><false/>
     </dict>
-    <key>StandardOutPath</key><string>${escapeXml(STDOUT_LOG)}</string>
-    <key>StandardErrorPath</key><string>${escapeXml(STDERR_LOG)}</string>
+    <key>ThrottleInterval</key><integer>${RESPAWN_DELAY_SEC}</integer>
+    <key>ProcessType</key><string>Background</string>
+    <key>LowPriorityBackgroundIO</key><true/>
+    <key>Nice</key><integer>${SERVICE_NICE}</integer>
+    <key>StandardOutPath</key><string>${escapeXml(logs.stdout)}</string>
+    <key>StandardErrorPath</key><string>${escapeXml(logs.stderr)}</string>
     <key>EnvironmentVariables</key>
     <dict>
 ${envBlock}
@@ -966,24 +1129,263 @@ ${envBlock}
 `;
 }
 
-function renderSystemdUnit(binPath: string): string {
+/**
+ * The systemd --user unit. What each setting needs to take effect in a USER
+ * unit (systemd's user@.service delegates the memory and pids controllers to
+ * the user manager, and cpu as well since systemd 252):
+ *
+ *   • Nice=10, IOSchedulingClass=idle — applied by the user manager to the
+ *     process it forks (setpriority(2), ioprio_set(2)). Lowering your own
+ *     priority needs no privilege, so these work in every user unit, cgroup v1
+ *     or v2. The idle I/O class only matters under an I/O scheduler that
+ *     honours I/O priorities (BFQ); with mq-deadline or none it is accepted and
+ *     has no effect.
+ *   • CPUWeight=20 — cgroup v2 `cpu.weight` (default 100): under contention hx
+ *     gets a fifth of the CPU share of a default-weighted sibling. Needs the cpu
+ *     controller delegated (systemd 252+, or a Delegate= drop-in for
+ *     user@.service on older releases). Nice covers the case where it is not:
+ *     nice only ranks processes that share a cpu cgroup, and without the cpu
+ *     controller they all do.
+ *   • MemoryHigh / MemoryMax / MemorySwapMax — cgroup v2 `memory.high`,
+ *     `memory.max`, `memory.swap.max`. Need the memory controller, which user
+ *     managers get by default on the unified (v2) hierarchy. On the legacy v1
+ *     hierarchy no controller is delegated to a user manager, so these do
+ *     nothing there.
+ *   • Restart/RestartSec/StartLimit* — the manager's own bookkeeping; work
+ *     everywhere. StartLimit* belongs in [Unit] (systemd 230+).
+ *
+ * systemd writes cgroup attributes only for controllers available to the
+ * manager; a setting whose controller is missing is left unapplied and the
+ * unit still starts.
+ *
+ * The log paths are a parameter only so tests can render the file without the
+ * caller's home directory in it.
+ */
+export function renderSystemdUnit(binPath: string, logs: LogPaths = DAEMON_LOGS): string {
   // No HX_GATEWAY_URL in the unit: `hx watch` reads the gateway + token from
   // ~/.let/hx/config.json, and a stale env var must never override config.
-  return `[Unit]
+  return `# ${MANAGED_NOTE}
+# To override a setting, use a drop-in: systemctl --user edit ${SYSTEMD_UNIT_NAME}
+[Unit]
 Description=hx-vision session mirror
 After=network-online.target
+StartLimitIntervalSec=${START_LIMIT_INTERVAL_SEC}
+StartLimitBurst=${START_LIMIT_BURST}
 
 [Service]
 Type=simple
 ExecStart=${binPath} watch
 Restart=always
-RestartSec=5
-StandardOutput=append:${STDOUT_LOG}
-StandardError=append:${STDERR_LOG}
+RestartSec=${RESPAWN_DELAY_SEC}
+Nice=${SERVICE_NICE}
+IOSchedulingClass=idle
+CPUWeight=20
+MemoryHigh=${MEMORY_HIGH}
+MemoryMax=${MEMORY_MAX}
+MemorySwapMax=${MEMORY_SWAP_MAX}
+StandardOutput=append:${logs.stdout}
+StandardError=append:${logs.stderr}
 
 [Install]
 WantedBy=default.target
 `;
+}
+
+// ─────────────── Keeping the installed definition current ───────────────
+//
+// install() and restart() write the definition from the template of the hx
+// binary that RUNS them. `hx update` is run by the OLD binary: it swaps the new
+// binary in at the same path and then restarts the service with the OLD
+// template. A device that only ever updates would therefore keep the
+// definition it was first installed with — without any of the limits above —
+// until someone ran `hx start` by hand.
+//
+// So the daemon checks for itself. When its service manager starts it, it
+// renders the definition with its own template; if the installed file differs,
+// it rewrites the file and has the manager load it. Guard rails:
+//   • only in the process the service manager started — a foreground
+//     `hx watch` never touches the service;
+//   • only when the definition runs this very binary — a definition pointed
+//     at another binary is left alone;
+//   • at most one reload per distinct definition per hour, so a file that
+//     something keeps reverting cannot become a restart loop.
+
+export type ServiceKind = "launchd" | "systemd";
+
+/** The service manager that started this process, when it started it as hx's service. */
+export function serviceManagerOf(
+  env: NodeJS.ProcessEnv = process.env,
+  plat: string = platform(),
+  readCgroup: () => string = () => readFileSync("/proc/self/cgroup", "utf8"),
+): ServiceKind | null {
+  // launchd sets XPC_SERVICE_NAME to the job's label for every process it
+  // spawns (verified with a probe job on macOS 26.4).
+  if (plat === "darwin") return env.XPC_SERVICE_NAME === LAUNCHD_LABEL ? "launchd" : null;
+  if (plat === "linux") {
+    // systemd runs each unit in a cgroup named after it, e.g.
+    // 0::/user.slice/user-1000.slice/user@1000.service/app.slice/hx-vision.service
+    try {
+      const inUnit = readCgroup()
+        .split("\n")
+        .some((line) => line.trimEnd().endsWith(`/${SYSTEMD_UNIT_NAME}`));
+      return inUnit ? "systemd" : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** The binary an installed definition runs, as written in it, or null. */
+export function definitionBinPath(kind: ServiceKind, content: string): string | null {
+  if (kind === "launchd") {
+    const m = content.match(/<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>/);
+    return m ? unescapeXml(m[1]) : null;
+  }
+  const m = content.match(/^ExecStart=(.+) watch$/m);
+  return m ? m[1] : null;
+}
+
+export type DefinitionPlan =
+  | { action: "current" }
+  | { action: "rewrite"; next: string }
+  | { action: "skip"; reason: string };
+
+/**
+ * Decide what to do with an installed definition, given the binary this
+ * process runs. `sameFile` says whether two paths name the same file; the
+ * caller follows symlinks, tests pass a stub.
+ */
+export function planDefinitionUpdate(
+  kind: ServiceKind,
+  installed: string,
+  runningBin: string,
+  sameFile: (a: string, b: string) => boolean,
+  logs: LogPaths = DAEMON_LOGS,
+): DefinitionPlan {
+  const bin = definitionBinPath(kind, installed);
+  if (bin === null) return { action: "skip", reason: "no binary path found in it" };
+  if (!sameFile(bin, runningBin)) {
+    return { action: "skip", reason: `it runs ${bin}, not this binary (${runningBin})` };
+  }
+  // Render with the path exactly as the definition spells it, so this only
+  // ever changes the template, never which binary the service runs.
+  const next = kind === "launchd" ? renderPlist(bin, logs) : renderSystemdUnit(bin, logs);
+  return next === installed ? { action: "current" } : { action: "rewrite", next };
+}
+
+const RELOAD_MARKER_PATH = join(HX_DIR, "service-reload.json");
+const RELOAD_RETRY_MS = 60 * 60_000;
+
+/**
+ * True when the marker records a reload to exactly `next` less than an hour
+ * before `now`. A marker from the future (clock change) does not count.
+ */
+export function reloadedRecently(marker: string | null, next: string, now: number): boolean {
+  if (!marker) return false;
+  try {
+    const m = JSON.parse(marker) as { sha256?: unknown; at?: unknown };
+    return (
+      m.sha256 === sha256Hex(next) &&
+      typeof m.at === "number" &&
+      now >= m.at &&
+      now - m.at < RELOAD_RETRY_MS
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Bring the installed service definition up to this binary's template and have
+ * the service manager load it. Called by `hx watch` before the watch loop
+ * starts. Resolves "reloading" when the service manager is about to stop this
+ * process and start the new definition, so the caller can hold off on work it
+ * would have to abandon; anything else means carry on.
+ */
+export async function reconcileServiceDefinition(
+  log: (msg: string) => void,
+): Promise<"current" | "reloading" | "skipped"> {
+  const kind = serviceManagerOf();
+  if (kind === null) return "skipped";
+  const path = kind === "launchd" ? LAUNCHD_PLIST : SYSTEMD_UNIT_PATH;
+  const installed = await readFile(path, "utf8").catch(() => null);
+  if (installed === null) return "skipped"; // removed under us: uninstall wins
+  const plan = planDefinitionUpdate(kind, installed, process.execPath, sameFile);
+  if (plan.action === "current") return "current";
+  if (plan.action === "skip") {
+    log(`[hx] left the service definition ${path} as it is: ${plan.reason}`);
+    return "skipped";
+  }
+  const marker = await readFile(RELOAD_MARKER_PATH, "utf8").catch(() => null);
+  if (reloadedRecently(marker, plan.next, Date.now())) {
+    log(`[hx] the service definition ${path} changed back after a reload less than an hour ago; not reloading again yet`);
+    return "skipped";
+  }
+  try {
+    await writeFile(path, plan.next);
+    await writeFile(
+      RELOAD_MARKER_PATH,
+      JSON.stringify({ sha256: sha256Hex(plan.next), at: Date.now() }),
+      { mode: 0o600 },
+    );
+    log(`[hx] updated the service definition ${path} to this version; reloading the service`);
+    if (kind === "launchd") reloadLaunchdFromJob();
+    else reloadSystemdFromUnit();
+    return "reloading";
+  } catch (err) {
+    log(`[hx] could not update the service definition ${path}: ${(err as Error).message}`);
+    return "skipped";
+  }
+}
+
+/**
+ * Reload the LaunchAgent from inside its own job. `bootout` stops the job's
+ * process, so the job cannot unload and reload itself; a helper in its own
+ * session does it. spawn({ detached: true }) calls setsid(2), and launchd's
+ * cleanup of a stopped job kills only the job's process group (see
+ * AbandonProcessGroup in launchd.plist(5)), so the helper outlives the bootout.
+ * Verified with a probe job on macOS 26.4. The helper is `hx restart` from this
+ * same binary — it writes the plist from its own path, then bootout, wait for
+ * the unload, enable, bootstrap with retries: the path `hx start` has always
+ * taken — and its output goes to the daemon's own log descriptors.
+ */
+function reloadLaunchdFromJob(): void {
+  const child = spawn(process.execPath, ["restart"], {
+    detached: true,
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  child.unref();
+}
+
+/**
+ * Reload the systemd unit from inside it. The manager re-reads the file, then
+ * performs the restart itself: it stops this process (SIGTERM) and starts the
+ * new definition. --no-block returns once the job is queued. systemctl runs in
+ * this unit's cgroup, so the stop can reach it before it exits; a death by
+ * signal is therefore not a failure.
+ */
+function reloadSystemdFromUnit(): void {
+  runOrThrow("systemctl", ["--user", "daemon-reload"]);
+  const r = spawnSync("systemctl", ["--user", "--no-block", "restart", SYSTEMD_UNIT_NAME], {
+    stdio: "pipe",
+  });
+  if (r.error || (r.status !== 0 && r.signal === null)) {
+    throw new Error(`systemctl --user --no-block restart ${SYSTEMD_UNIT_NAME} failed: ${failureDetail(r)}`);
+  }
+}
+
+/** Same file on disk, following symlinks; falls back to comparing the paths. */
+function sameFile(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return a === b;
+  }
+}
+
+function sha256Hex(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
 }
 
 function escapeXml(s: string): string {
@@ -992,6 +1394,15 @@ function escapeXml(s: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function unescapeXml(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 // Turn a spawnSync result into a human-readable failure reason. When the
@@ -1025,6 +1436,11 @@ function runOrThrow(cmd: string, args: string[]): void {
  * The file write comes first and the real stream second, both inside a try — the
  * windowless build's stdout is not a valid handle, and a throw there would take
  * the mirror down over a log line.
+ *
+ * The file writes are synchronous, on a descriptor this module owns
+ * (ownLogFds): a line is on disk before the next one is printed, a crash loses
+ * nothing that was already logged, and log rotation can close and reopen the
+ * file between two writes (see rotateOwnLog).
  */
 export function teeStdioToLogs(): void {
   if (platform() !== "win32") return;
@@ -1033,17 +1449,10 @@ export function teeStdioToLogs(): void {
     [process.stdout, STDOUT_LOG],
     [process.stderr, STDERR_LOG],
   ] as const) {
-    const file = createWriteStream(target, { flags: "a" });
-    file.on("error", () => {
-      /* a log we cannot write must never crash the mirror */
-    });
+    if (!holdLogFile(target)) continue; // a log we cannot open must never stop the mirror
     const original = stream.write.bind(stream);
     stream.write = ((chunk: unknown, ...rest: unknown[]): boolean => {
-      try {
-        file.write(chunk as string | Uint8Array);
-      } catch {
-        /* see above */
-      }
+      writeHeldLog(target, chunk);
       try {
         return (original as (c: unknown, ...r: unknown[]) => boolean)(chunk, ...rest);
       } catch {
@@ -1055,7 +1464,314 @@ export function teeStdioToLogs(): void {
   }
 }
 
+// ───────────────────────────── Log rotation ─────────────────────────────
+//
+// stdout.log and stderr.log used to grow forever: one laptop's stdout.log had
+// reached 424 MB (2.2 million lines) by 2026-10-14. The daemon now keeps each
+// under LOG_MAX_BYTES and keeps LOG_KEEP older copies (<log>.1, <log>.2), so a
+// log takes at most about (LOG_KEEP + 1) × LOG_MAX_BYTES of disk.
+//
+// On macOS and Linux the service manager, not hx, opens the log: launchd's
+// StandardOutPath / StandardErrorPath, systemd's `append:` and the container
+// hook's `>>` all open it O_APPEND (lsof shows launchd's as "AP") and hold that
+// descriptor for the life of the process. Renaming the file would send every
+// later write to the renamed copy, so rotation copies and then truncates in
+// place: the tail goes to <log>.1, older copies shift up, and the live file is
+// cut to zero. Because the writer's descriptor is O_APPEND, its next write
+// lands at the new end — offset 0 — leaving no hole. A line another process
+// writes between the copy and the truncate is lost; none of the daemon's own
+// lines can be, because rotation runs synchronously on the JavaScript thread
+// that logs them.
+//
+// On Windows hx writes the files itself (teeStdioToLogs) and closes its own
+// descriptor around the rotation instead.
+//
+// Only a process that writes a log rotates it. The daemon checks at startup
+// (which also trims a log that grew large before rotation existed), once a
+// minute, and after every LOG_CHECK_BYTES of its own output — so even a loop
+// that starves the timers cannot fill the disk with log lines.
+
+export const LOG_MAX_BYTES = 20 * 1024 * 1024;
+export const LOG_KEEP = 2;
+const LOG_CHECK_INTERVAL_MS = 60_000;
+const LOG_CHECK_BYTES = 1024 * 1024;
+const LOG_COPY_CHUNK = 1024 * 1024;
+
+/** Log files this process writes itself (the Windows tee): path → descriptor. */
+const ownLogFds = new Map<string, number>();
+
+/**
+ * Open `path` for appending and keep the descriptor, so this process writes the
+ * log itself (writeHeldLog) and rotation can close and reopen it. Returns
+ * whether the file could be opened.
+ */
+export function holdLogFile(path: string): boolean {
+  if (ownLogFds.has(path)) return true;
+  try {
+    ownLogFds.set(path, openSync(path, "a"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Append to a log opened with holdLogFile. Never throws. */
+export function writeHeldLog(path: string, chunk: unknown): void {
+  const fd = ownLogFds.get(path);
+  if (fd === undefined) return;
+  try {
+    if (typeof chunk === "string") writeSync(fd, chunk);
+    else if (chunk instanceof Uint8Array) writeSync(fd, chunk);
+  } catch {
+    /* a log we cannot write must never crash the mirror */
+  }
+}
+
+/** Close a log opened with holdLogFile. */
+export function releaseLogFile(path: string): void {
+  const fd = ownLogFds.get(path);
+  ownLogFds.delete(path);
+  if (fd === undefined) return;
+  try {
+    closeSync(fd);
+  } catch {
+    /* already closed */
+  }
+}
+
+/** `<log>.1`, `<log>.2`, … */
+export function rotatedLogPath(path: string, generation: number): string {
+  return `${path}.${generation}`;
+}
+
+/**
+ * Rotate one log in place when it is larger than `maxBytes`: copy its last
+ * `maxBytes` (from the start of a line) to `<log>.1`, shift older copies up
+ * to `<log>.<keep>`, and truncate the live file to zero. Returns whether it
+ * rotated. Never throws: a log that cannot be rotated is left as it is.
+ */
+export function rotateLogFile(path: string, maxBytes = LOG_MAX_BYTES, keep = LOG_KEEP): boolean {
+  if (fileSize(path) <= maxBytes) return false;
+  const tmp = `${rotatedLogPath(path, 1)}.tmp`;
+  try {
+    if (keep > 0) copyLogTail(path, tmp, maxBytes);
+    truncateSync(path, 0);
+  } catch {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* nothing was copied */
+    }
+    return false;
+  }
+  if (keep > 0) {
+    try {
+      for (let g = keep; g > 1; g--) {
+        try {
+          renameSync(rotatedLogPath(path, g - 1), rotatedLogPath(path, g));
+        } catch {
+          /* that generation does not exist yet */
+        }
+      }
+      renameSync(tmp, rotatedLogPath(path, 1));
+    } catch {
+      // The live file is already cut. Losing the copy loses old lines, never
+      // the ability to log, so give up quietly.
+    }
+  }
+  return true;
+}
+
+/**
+ * Copy the last `maxBytes` of `src` to `dst`, starting at a line boundary. The
+ * second pass picks up anything appended during the first, so the truncate
+ * that follows loses as little as possible. Copies in 1 MiB chunks: rotating a
+ * 424 MB log must not need 424 MB of memory.
+ */
+function copyLogTail(src: string, dst: string, maxBytes: number): void {
+  const inFd = openSync(src, "r");
+  try {
+    const outFd = openSync(dst, "w", 0o600);
+    try {
+      let end = fstatSync(inFd).size;
+      let pos = lineStartAtOrAfter(inFd, Math.max(0, end - maxBytes));
+      const buf = Buffer.allocUnsafe(LOG_COPY_CHUNK);
+      for (let pass = 0; pass < 2 && pos < end; pass++) {
+        while (pos < end) {
+          const n = readSync(inFd, buf, 0, Math.min(buf.length, end - pos), pos);
+          if (n <= 0) break;
+          writeSync(outFd, buf, 0, n);
+          pos += n;
+        }
+        end = fstatSync(inFd).size;
+      }
+    } finally {
+      closeSync(outFd);
+    }
+  } finally {
+    closeSync(inFd);
+  }
+}
+
+/**
+ * The offset of the first line that starts at or after `offset`. Looks at most
+ * 64 KiB ahead; a line longer than that is cut where `offset` falls.
+ */
+function lineStartAtOrAfter(fd: number, offset: number): number {
+  if (offset === 0) return 0;
+  const buf = Buffer.alloc(64 * 1024);
+  const n = readSync(fd, buf, 0, buf.length, offset - 1);
+  const nl = buf.subarray(0, n).indexOf(0x0a);
+  return nl === -1 ? offset : offset + nl;
+}
+
+/** Is descriptor `fd` open on the regular file at `path` (same device and inode)? */
+export function fdWritesFile(fd: number, path: string): boolean {
+  try {
+    const held = fstatSync(fd);
+    const onDisk = statSync(path);
+    return held.isFile() && held.dev === onDisk.dev && held.ino === onDisk.ino;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The daemon logs this process writes: the files its stdout / stderr point at
+ * (launchd, systemd, the container hook), or the ones the Windows tee holds.
+ * A foreground `hx watch` in a terminal writes neither.
+ */
+function logsThisProcessWrites(): string[] {
+  return [STDOUT_LOG, STDERR_LOG].filter(
+    (path) => ownLogFds.has(path) || fdWritesFile(1, path) || fdWritesFile(2, path),
+  );
+}
+
+/**
+ * rotateLogFile, plus: when this process holds the log itself (holdLogFile),
+ * close the descriptor first, so no write goes through a handle whose idea of
+ * the file predates the truncate, and reopen it at the new end afterwards.
+ */
+export function rotateOwnLog(path: string, maxBytes = LOG_MAX_BYTES, keep = LOG_KEEP): boolean {
+  if (!ownLogFds.has(path)) return rotateLogFile(path, maxBytes, keep);
+  if (fileSize(path) <= maxBytes) return false;
+  releaseLogFile(path);
+  try {
+    return rotateLogFile(path, maxBytes, keep);
+  } finally {
+    // If this fails the next lines have nowhere to go; the console copy still happens.
+    holdLogFile(path);
+  }
+}
+
+/** Size of the file at `path`, or 0 when it cannot be read. */
+function fileSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
+
+function byteLength(chunk: unknown): number {
+  if (typeof chunk === "string") return Buffer.byteLength(chunk);
+  if (chunk instanceof Uint8Array) return chunk.byteLength;
+  return 0;
+}
+
+let logRotationStarted = false;
+
+/**
+ * Keep the daemon logs this process writes under LOG_MAX_BYTES: rotate now,
+ * once a minute, and after every LOG_CHECK_BYTES written through
+ * process.stdout / process.stderr. Does nothing in a process that writes
+ * neither log. `log` reports each rotation (it writes to the fresh file, so
+ * its first line says what happened). Call after teeStdioToLogs.
+ */
+export function startLogRotation(log: (msg: string) => void): void {
+  if (logRotationStarted) return;
+  logRotationStarted = true;
+  if (logsThisProcessWrites().length === 0) return;
+  const mb = Math.round(LOG_MAX_BYTES / (1024 * 1024));
+  const check = (): void => {
+    try {
+      for (const path of logsThisProcessWrites()) {
+        if (rotateOwnLog(path)) {
+          const name = basename(path);
+          log(`[hx] rotated ${name} (over ${mb} MB); earlier lines are in ${name}.1`);
+        }
+      }
+    } catch {
+      /* rotation must never take the mirror down */
+    }
+  };
+  check();
+  setInterval(check, LOG_CHECK_INTERVAL_MS).unref();
+  let written = 0;
+  for (const stream of [process.stdout, process.stderr]) {
+    const original = stream.write.bind(stream);
+    stream.write = ((chunk: unknown, ...rest: unknown[]): boolean => {
+      const ok = (original as (c: unknown, ...r: unknown[]) => boolean)(chunk, ...rest);
+      written += byteLength(chunk);
+      if (written >= LOG_CHECK_BYTES) {
+        written = 0; // before check(): its own log line comes back through here
+        check();
+      }
+      return ok;
+    }) as typeof stream.write;
+  }
+}
+
 // ─────────────────────────────── tail logs ────────────────────────────────
+
+/**
+ * The last `count` lines of a daemon log, continuing into `<log>.1` when the
+ * live file was rotated recently and holds fewer. Reads at most about
+ * `maxBytes` (1 MiB, or 512 bytes per requested line if that is more) from the
+ * end of each file, so a log that grew huge before rotation existed costs a
+ * bounded read rather than the whole file in memory. `size` is the live file's
+ * length: where a follower should continue from.
+ */
+export async function recentLogLines(
+  path: string,
+  count: number,
+  maxBytes = Math.max(1024 * 1024, count * 512),
+): Promise<{ lines: string[]; size: number }> {
+  const live = await lastLinesOf(path, count, maxBytes);
+  if (live.lines.length >= count) return live;
+  const older = await lastLinesOf(rotatedLogPath(path, 1), count - live.lines.length, maxBytes);
+  return { lines: [...older.lines, ...live.lines], size: live.size };
+}
+
+async function lastLinesOf(
+  path: string,
+  count: number,
+  maxBytes: number,
+): Promise<{ lines: string[]; size: number }> {
+  let fh;
+  try {
+    fh = await open(path, "r");
+  } catch {
+    return { lines: [], size: 0 };
+  }
+  try {
+    const { size } = await fh.stat();
+    if (count <= 0) return { lines: [], size };
+    const start = Math.max(0, size - maxBytes);
+    // Read from one byte early: the first segment is then the rest of a line
+    // that began before `start`, or empty when `start` begins a line. Either
+    // way it is not a whole line, so it is dropped.
+    const from = start > 0 ? start - 1 : 0;
+    const buf = Buffer.alloc(size - from);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, from);
+    const lines = buf.subarray(0, bytesRead).toString("utf8").split("\n");
+    if (start > 0) lines.shift();
+    if (lines[lines.length - 1] === "") lines.pop();
+    return { lines: lines.slice(-count), size };
+  } finally {
+    await fh.close();
+  }
+}
 
 /**
  * Follow the daemon's stdout + stderr logs: print the last `linesBack` lines of
@@ -1078,15 +1794,13 @@ export async function tailLogs(linesBack = 50): Promise<void> {
     await writeFile(p, "", { flag: "a" });
   }
 
-  // Seed from the tail of each file, then follow from its current end.
+  // Seed from the tail of each file (continuing into <log>.1 right after a
+  // rotation), then follow from the live file's current end.
   const offsets = new Map<string, number>();
   for (const p of files) {
-    const buf = await readFile(p).catch(() => Buffer.alloc(0));
-    offsets.set(p, buf.length);
-    const lines = buf.toString("utf8").split("\n");
-    if (lines[lines.length - 1] === "") lines.pop();
-    const recent = lines.slice(-linesBack);
-    if (recent.length > 0) process.stdout.write(`${recent.join("\n")}\n`);
+    const { lines, size } = await recentLogLines(p, linesBack);
+    offsets.set(p, size);
+    if (lines.length > 0) process.stdout.write(`${lines.join("\n")}\n`);
   }
 
   let stopped = false;
