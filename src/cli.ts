@@ -24,6 +24,7 @@ import {
   type DaemonOps,
   type DaemonState,
 } from "./daemon.js";
+import { beginWatchRun, describeWatchRun, hookWatchRunToProcess } from "./crash-loop.js";
 import { resolveWatchdogLimits, startWatchdogThread } from "./watchdog.js";
 import { probeConnection, formatRate } from "./probe.js";
 import { fetchDeviceInventory } from "./uploader.js";
@@ -449,17 +450,25 @@ async function cmdWatch(): Promise<void> {
   }
 }
 
-// What the long-running loop sets up before its first pass: the freeze and
-// memory watchdog on its own thread (watchdog.ts). One-shot runs do without
-// it: a person is watching them, and Ctrl-C ends them (they install no SIGINT
-// handler).
+// What the long-running loop sets up before its first pass: the run marker and
+// the crash-loop backoff (crash-loop.ts), then the freeze and memory watchdog
+// on its own thread (watchdog.ts). One-shot runs get neither: a person is
+// watching them, and Ctrl-C ends them (they install no SIGINT handler).
 async function prepareLongRunningWatch(out: (msg: string) => void): Promise<void> {
+  // Before startWatch, so its SIGINT/SIGTERM listeners run ahead of the ones
+  // startWatch and cmdWatch add (see hookWatchRunToProcess).
+  const run = beginWatchRun();
+  hookWatchRunToProcess(run);
   startWatchdogThread({
     limits: resolveWatchdogLimits(await readSettings()),
     logPath: STDERR_LOG,
+    marker: run.marker,
     reloadLimits: async () => resolveWatchdogLimits(await readSettings()),
     onError: (message) => out(`[hx] watchdog thread failed (${message}); running without it`),
   });
+  const line = describeWatchRun(run);
+  if (line) out(line);
+  if (run.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, run.delayMs));
 }
 
 async function cmdTick(): Promise<void> {

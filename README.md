@@ -53,6 +53,9 @@ controller is missing, the setting does nothing and the unit still starts.
 matters with an I/O scheduler that supports priorities, such as BFQ. After the
 unit gives up, `hx start` (or `hx restart`, or `hx update`) brings it back.
 
+**Crash loops.** On every platform hx also spaces out its own restarts when it
+keeps ending abnormally; see [Crash-loop backoff](#crash-loop-backoff).
+
 **Stopping.** A stop sends SIGTERM first. A daemon whose event loop is frozen
 never runs its SIGTERM handler, so launchd and systemd send SIGKILL 5 seconds
 later. `hx stop` and `hx restart` also send it themselves if the daemon is
@@ -215,6 +218,8 @@ The daemon keeps these files in `~/.let/hx/`:
 - `state.json` — per-file byte offset, so a restart doesn't re-upload.
 - `stdout.log`, `stderr.log` — the daemon's output, rotated at 20 MB into
   `.1` and `.2` (see [The background service](#the-background-service)).
+- `watch-run.json`, `watch-exits.json` — the running daemon, and the recent
+  runs that ended abnormally (see [Crash-loop backoff](#crash-loop-backoff)).
 
 ## What it watches
 
@@ -302,7 +307,8 @@ kills the daemon with SIGKILL when:
 
 SIGKILL because nothing else ends a frozen daemon: its SIGTERM and SIGINT
 handlers are JavaScript, and they never run while the loop is stuck. The
-service manager then starts a fresh daemon.
+service manager then starts a fresh daemon, subject to the
+[crash-loop backoff](#crash-loop-backoff).
 
 Both limits live in `~/.let/hx/settings.json`, re-read every 30 seconds:
 
@@ -324,6 +330,36 @@ A kill writes one line to `~/.let/hx/stderr.log`:
 2026-10-14 17:42:03 [hx] watchdog: killing pid 4242 with SIGKILL: the event loop has not run for 60 s (freeze limit 60 s); rss 412 MB
 2026-10-14 17:42:03 [hx] watchdog: killing pid 4242 with SIGKILL: rss 1540 MB is over the memory limit of 1536 MB; the event loop last ran 0 s ago
 ```
+
+The next daemon then logs the reason to `~/.let/hx/stdout.log`, which is what
+`hx logs` and the web UI show:
+
+```
+2026-10-14 17:42:13 [hx] warning: the previous run (pid 4242) ended abnormally: killed by the watchdog: the event loop has not run for 60 s (freeze limit 60 s); 1 abnormal exit in the last 30 min
+```
+
+### Crash-loop backoff
+
+An abnormal exit is a daemon run that ended without being told to stop: a
+watchdog kill, a non-zero exit (the progress watchdog's 70 included), a crash,
+or any signal other than the SIGTERM or SIGINT of a stop. Each run records
+itself in `~/.let/hx/watch-run.json`, and the abnormal exits are kept in
+`~/.let/hx/watch-exits.json`. When there were 3 or more in the last 30 minutes,
+the next start waits before its first pass, 1 minute at first and doubling
+with each further abnormal exit, up to 30 minutes, and logs one line:
+
+```
+2026-10-14 17:50:01 [hx] crash loop: 4 abnormal exits in the last 30 min (previous run: killed by the watchdog: rss 1540 MB is over the memory limit of 1536 MB); backing off 2 min before the first pass
+```
+
+Time spent waiting does not count toward the 30 minutes, so a daemon that
+keeps failing stays at one start per half hour until it runs for 30 minutes
+without an abnormal exit. While it waits the daemon makes no gateway calls,
+so the device reads as offline.
+
+A start you ask for begins at once: `hx start`, `hx restart`, `hx update`,
+`hx connect`, `hx retry`, and the web UI's daemon controls clear the history
+first.
 
 ## Develop
 

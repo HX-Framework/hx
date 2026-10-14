@@ -39,6 +39,7 @@ import {
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { HX_DIR } from "./hx-home.js";
+import { clearCrashHistory } from "./crash-loop.js";
 
 export { HX_DIR };
 export const STDOUT_LOG = join(HX_DIR, "stdout.log");
@@ -180,6 +181,31 @@ export interface InstallOpts {
 }
 
 export function getDaemonOps(): DaemonOps {
+  const ops = platformOps();
+  // Every caller of install/restart/start is a person asking for a start: hx
+  // start / restart / update / connect / retry, or the UI's buttons. Something
+  // changed, so the daemon they start must begin its first pass at once
+  // instead of serving out a crash-loop backoff (crash-loop.ts) earned before
+  // the change. The service managers' own restarts never come through here;
+  // reconcileServiceDefinition's reload does, at most once an hour.
+  return {
+    ...ops,
+    install(opts) {
+      clearCrashHistory();
+      return ops.install(opts);
+    },
+    restart(opts) {
+      clearCrashHistory();
+      return ops.restart(opts);
+    },
+    start() {
+      clearCrashHistory();
+      return ops.start();
+    },
+  };
+}
+
+function platformOps(): DaemonOps {
   switch (platform()) {
     case "darwin":
       return macOps();
