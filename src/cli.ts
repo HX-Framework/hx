@@ -17,12 +17,14 @@ import {
   getDaemonOps,
   reconcileServiceDefinition,
   startLogRotation,
+  STDERR_LOG,
   STOP_GRACE_SECONDS,
   tailLogs,
   teeStdioToLogs,
   type DaemonOps,
   type DaemonState,
 } from "./daemon.js";
+import { resolveWatchdogLimits, startWatchdogThread } from "./watchdog.js";
 import { probeConnection, formatRate } from "./probe.js";
 import { fetchDeviceInventory } from "./uploader.js";
 import { runUpdate, type UpdateProgress, type UpdateResult } from "./update.js";
@@ -426,6 +428,7 @@ async function cmdWatch(): Promise<void> {
   const localCfg = hasFlag("local") ? await ensureLocalConfig() : null;
   const oneShot = process.argv.includes("--once") || process.argv.includes("-1");
   const only = flag("only");
+  if (!oneShot) await prepareLongRunningWatch(stamped(log));
   const [main, local] = await Promise.all([
     startWatch(cfg, { oneShot, only }, stamped(log)),
     localCfg ? startWatch(localCfg, { oneShot, only }, stamped(localLog)) : null,
@@ -444,6 +447,19 @@ async function cmdWatch(): Promise<void> {
       );
     });
   }
+}
+
+// What the long-running loop sets up before its first pass: the freeze and
+// memory watchdog on its own thread (watchdog.ts). One-shot runs do without
+// it: a person is watching them, and Ctrl-C ends them (they install no SIGINT
+// handler).
+async function prepareLongRunningWatch(out: (msg: string) => void): Promise<void> {
+  startWatchdogThread({
+    limits: resolveWatchdogLimits(await readSettings()),
+    logPath: STDERR_LOG,
+    reloadLimits: async () => resolveWatchdogLimits(await readSettings()),
+    onError: (message) => out(`[hx] watchdog thread failed (${message}); running without it`),
+  });
 }
 
 async function cmdTick(): Promise<void> {

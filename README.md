@@ -42,7 +42,7 @@ are working in, even when hx itself misbehaves:
 | CPU | `ProcessType` `Background`, `Nice` 10 | `Nice=10`, `CPUWeight=20` | priority 7 (below normal) |
 | Disk I/O | throttled: the `Background` class plus `LowPriorityBackgroundIO` | `IOSchedulingClass=idle` | not set |
 | Restart after a crash | at most once a minute (`ThrottleInterval` 60) | after 60 s (`RestartSec=60`); gives up after 5 starts in 10 minutes | within 5 minutes, by the repeating trigger |
-| Memory | no limit available | `MemoryHigh=1G`, `MemoryMax=2G`, `MemorySwapMax=512M` | no limit available |
+| Memory | none from launchd; hx's [watchdog](#freeze-and-memory-watchdog) kills it above 1536 MB of RSS | `MemoryHigh=1G`, `MemoryMax=2G`, `MemorySwapMax=512M`, and the watchdog | none from Task Scheduler; the watchdog |
 | Stop | SIGKILL 5 s after SIGTERM (`ExitTimeOut` 5) | SIGKILL 5 s after SIGTERM (`TimeoutStopSec=5`) | immediate (`taskkill /F`) |
 
 On Linux, `CPUWeight` and the memory limits are cgroup v2 settings. They only
@@ -285,6 +285,45 @@ Scheduler, or the container shell hook) starts a fresh process. The limit is
 `0` disables it; positive values below 2 are raised to 2. For a foreground
 `hx watch` the `HX_WATCHDOG_MINUTES` environment variable overrides the
 setting.
+
+The progress watchdog runs on the daemon's event loop, so it cannot fire when
+that loop is frozen. The freeze and memory watchdog below covers that case.
+
+### Freeze and memory watchdog
+
+A second watchdog runs on its own thread, so it keeps working when the
+daemon's event loop does not. The main thread adds 1 to a counter once a
+second; the watchdog thread reads it, and the process RSS, every 250 ms. It
+kills the daemon with SIGKILL when:
+
+- the counter has not moved for `freezeSeconds` (default 60): the event loop
+  is frozen, or
+- the RSS is above `memoryCeilingMb` (default 1536).
+
+SIGKILL because nothing else ends a frozen daemon: its SIGTERM and SIGINT
+handlers are JavaScript, and they never run while the loop is stuck. The
+service manager then starts a fresh daemon.
+
+Both limits live in `~/.let/hx/settings.json`, re-read every 30 seconds:
+
+```json
+{ "tuning": { "freezeSeconds": 60, "memoryCeilingMb": 1536 } }
+```
+
+`0` turns a check off. Positive values below 10 seconds and 512 MB are raised
+to those floors. The memory default is about 1.6 times the highest RSS
+measured for a healthy daemon: 935 MB while re-uploading a 319 MB transcript
+from zero, on a machine with 35,000 Claude Desktop sessions and 19 GB of
+transcripts, where a caught-up daemon levels off at about 920 MB. RSS counts
+shared and file-backed pages too, so it reads higher than the memory
+footprint Activity Monitor shows (577 to 670 MB in the same runs).
+
+A kill writes one line to `~/.let/hx/stderr.log`:
+
+```
+2026-10-14 17:42:03 [hx] watchdog: killing pid 4242 with SIGKILL: the event loop has not run for 60 s (freeze limit 60 s); rss 412 MB
+2026-10-14 17:42:03 [hx] watchdog: killing pid 4242 with SIGKILL: rss 1540 MB is over the memory limit of 1536 MB; the event loop last ran 0 s ago
+```
 
 ## Develop
 
