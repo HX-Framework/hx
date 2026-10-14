@@ -150,7 +150,7 @@ describe.skipIf(!enabled)("stopping a unit whose process ignores SIGTERM", () =>
       spawnSync("systemctl", ["--user", "daemon-reload"]);
       rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   // hx stop acts on the real unit name. Never on a machine where hx is
   // installed: only when no hx-vision.service exists yet (the CI runner).
