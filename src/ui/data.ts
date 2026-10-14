@@ -89,22 +89,22 @@ async function cachedDiscovery(
   if (cache && cache.rootsSig === sig && Date.now() - cache.atMs < ttl) return cache;
   const inFlight = unwindowed ? unwindowedInFlight : windowedInFlight;
   if (inFlight) return inFlight;
+  // The slot is cleared by .finally() on the promise, never inside the async
+  // function: see singleFlight in upload-scheduler.ts for why.
   const load = (async (): Promise<DiscoveryCache> => {
-    try {
-      const opts = unwindowed ? { maxAgeMs: Infinity } : {};
-      const [claude, codex] = await Promise.all([
-        discoverClaudeFiles(roots.claude, opts),
-        discoverCodexFiles(roots.codex, opts),
-      ]);
-      const fresh: DiscoveryCache = { atMs: Date.now(), rootsSig: sig, claude, codex };
-      if (unwindowed) unwindowedCache = fresh;
-      else windowedCache = fresh;
-      return fresh;
-    } finally {
-      if (unwindowed) unwindowedInFlight = null;
-      else windowedInFlight = null;
-    }
-  })();
+    const opts = unwindowed ? { maxAgeMs: Infinity } : {};
+    const [claude, codex] = await Promise.all([
+      discoverClaudeFiles(roots.claude, opts),
+      discoverCodexFiles(roots.codex, opts),
+    ]);
+    const fresh: DiscoveryCache = { atMs: Date.now(), rootsSig: sig, claude, codex };
+    if (unwindowed) unwindowedCache = fresh;
+    else windowedCache = fresh;
+    return fresh;
+  })().finally(() => {
+    if (unwindowed) unwindowedInFlight = null;
+    else windowedInFlight = null;
+  });
   if (unwindowed) unwindowedInFlight = load;
   else windowedInFlight = load;
   return load;

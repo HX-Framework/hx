@@ -77,7 +77,7 @@ import {
 } from "./state.js";
 import { catalogFor } from "./catalog.js";
 import { readCodexTitle } from "./codex-titles.js";
-import { ByteSemaphore, runPool } from "./upload-scheduler.js";
+import { ByteSemaphore, runPool, singleFlight } from "./upload-scheduler.js";
 import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
@@ -1000,9 +1000,22 @@ export async function ingestOne(
 
   // Nothing landed: if every destination we tried was unavailable, surface it so
   // this file gets skipped (per-session) or the pass pauses (cloud-wide), per
-  // classifyUpstreamError. Otherwise there were simply no new committable bytes.
+  // classifyUpstreamError. A plan whose destinations were ALL held is the same
+  // story told with a 200: the file must take the per-session hold (and its
+  // backoff) rather than return false, which pooled it again on the very next
+  // tick — a stat, a head read and an append-url round trip per file per
+  // 1.5 s for as long as the store stayed down. Otherwise there were simply
+  // no new committable bytes.
   if (!anyProgress) {
     if (lastUnavailable) throw classifyUpstreamError(lastUnavailable, route.fortress) ?? lastUnavailable;
+    if (heldBlocker) {
+      const err = new HxHttpError(
+        503,
+        `append-url planned no upload: every destination is held (${heldBlocker.reason})`,
+        heldBlocker,
+      );
+      throw new SessionUpstreamUnavailable(heldBlocker.reason, 503, err, heldBlocker);
+    }
     return false;
   }
 
@@ -2542,11 +2555,89 @@ export function formatPerfLine(perf: PerfCounters): string {
   return `[hx] perf: passes=${perf.passes} passMs p50=${at(0.5)} p95=${at(0.95)} max=${Math.round(sorted[sorted.length - 1] ?? 0)} uploads=${perf.uploads} stateFlushes=${perf.flushes}`;
 }
 
+// ── Progress watchdog ───────────────────────────────────────────────────────
+//
+// The observed stall (Request Pricing M13): a pass whose network calls never
+// returned sat as "busy" for 4 to 29 hours — the poll timer skipped every tick
+// on the busy flag, nothing was uploaded, nothing was logged, and the daemon
+// burned a core on its remaining timers until a human restarted it. The calls
+// now carry deadlines, so that exact shape should no longer occur; this is the
+// backstop for whatever shape comes next. The rule is deliberately narrow so a
+// vault outage can never trip it: a pass has been RUNNING for longer than the
+// limit AND the loop has written NO log line for that long. A healthy pass
+// logs every committed chunk; a pass with nothing to send returns; a backoff
+// logs its own line at least every five minutes. Only a pass that is stuck
+// satisfies both. The daemon then exits non-zero so the service manager
+// (launchd KeepAlive, systemd Restart=always, the Task Scheduler repeat
+// trigger, the container hook's loop) starts a fresh process.
+//
+// Configurable: settings.json `tuning.watchdogMinutes` (re-read every tick,
+// so it reaches an installed daemon without a restart), or HX_WATCHDOG_MINUTES
+// in the process environment for dev shells. 0 disables; anything positive is
+// floored at WATCHDOG_MIN_MINUTES so a typo cannot restart-loop the daemon.
+export const WATCHDOG_DEFAULT_MINUTES = 10;
+export const WATCHDOG_MIN_MINUTES = 2;
+const WATCHDOG_CHECK_MS = 30_000;
+/** sysexits EX_SOFTWARE — distinct from the CLI's usage (64) and
+ *  not-connected (2) exits, so a log reader can tell a watchdog restart. */
+export const WATCHDOG_EXIT_CODE = 70;
+
+/** The configured watchdog limit in ms, or 0 when disabled. */
+export function resolveWatchdogMs(
+  settings: HxSettings,
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const fromEnv = env["HX_WATCHDOG_MINUTES"];
+  const raw =
+    fromEnv !== undefined && fromEnv.trim() !== ""
+      ? Number(fromEnv)
+      : tuningValue(settings, "watchdogMinutes");
+  const minutes = typeof raw === "number" && Number.isFinite(raw) ? raw : WATCHDOG_DEFAULT_MINUTES;
+  if (minutes <= 0) return 0;
+  return Math.max(WATCHDOG_MIN_MINUTES, minutes) * 60_000;
+}
+
+export interface WatchdogInput {
+  passBusy: boolean;
+  passStartedAtMs: number;
+  lastLogAtMs: number;
+  nowMs: number;
+  limitMs: number;
+}
+
+/** Pure decision: stuck ⇔ a pass has been busy for ≥ limit with no log line
+ *  for ≥ limit. Exported for the tests; the timer below applies it. */
+export function watchdogVerdict(i: WatchdogInput): {
+  stuck: boolean;
+  busyForMs: number;
+  quietForMs: number;
+} {
+  const busyForMs = i.passBusy ? i.nowMs - i.passStartedAtMs : 0;
+  const quietForMs = i.nowMs - i.lastLogAtMs;
+  const stuck = i.limitMs > 0 && i.passBusy && busyForMs >= i.limitMs && quietForMs >= i.limitMs;
+  return { stuck, busyForMs, quietForMs };
+}
+
+let watchdogExit: (code: number) => void = (code) => process.exit(code);
+
+/** Test seam — intercept the exit the watchdog would perform. */
+export function setWatchdogExitForTests(fn: ((code: number) => void) | null): void {
+  watchdogExit = fn ?? ((code) => process.exit(code));
+}
+
 export async function startWatch(
   cfg: HxConfig,
   opts: WatchOptions,
-  log: (msg: string) => void,
+  baseLog: (msg: string) => void,
 ): Promise<{ stop: () => void }> {
+  // Every line this loop writes also stamps the watchdog's liveness clock —
+  // see the watchdog timer below. Everything inside startWatch logs through
+  // this wrapper, so a committed chunk, an error, a backoff notice all count.
+  let lastLogAtMs = Date.now();
+  const log = (msg: string): void => {
+    lastLogAtMs = Date.now();
+    baseLog(msg);
+  };
   const describeRoots = (r: ResolvedRoots): string =>
     [...r.claude, ...r.codex]
       .map((d) => `${collapseHome(d.configDir)}${d.origin === "default" ? "" : ` [${d.origin}]`}`)
@@ -2653,6 +2744,9 @@ export async function startWatch(
   // flight as divergence. A skipped tick is re-covered 1.5s later; a skipped
   // audit by its next interval.
   let passBusy = false;
+  // When the current pass (or audit) took the mutex — the watchdog's clock.
+  let passStartedAtMs = 0;
+  let watchdogLimitMs = resolveWatchdogMs(await readSettings());
 
   // Perf self-observability: per-pass duration + activity counters, folded
   // into ONE hourly info line (formatPerfLine — classifier-safe by test).
@@ -2672,6 +2766,7 @@ export async function startWatch(
     // passBusy false, start, and then overlap the pass we're about to run —
     // exactly the in-flight-chunk-reads-as-divergence race the flag prevents.
     passBusy = true;
+    passStartedAtMs = Date.now();
     // Every tick observes the filesystem's root set FRESH, by construction —
     // an off-slot timer (mirror, audit) must not leave the sub-tick roots
     // memo warm across a tick boundary and delay a root-set change past the
@@ -2680,6 +2775,7 @@ export async function startWatch(
     const passStartMs = Date.now();
     try {
       const settings = await readSettings();
+      watchdogLimitMs = resolveWatchdogMs(settings);
       // Stamping is observation, not an upload: it must track Watched
       // Locations edits even while sync is paused or uploads are backing
       // off, or the UI's roots list (and hx status) silently freezes in
@@ -2740,6 +2836,7 @@ export async function startWatch(
   const audit = async (): Promise<void> => {
     if (passBusy) return; // a pass is mid-flight; the next interval retries
     passBusy = true;
+    passStartedAtMs = Date.now();
     try {
       await auditCanonicals(cfg, opts, log);
     } catch (err) {
@@ -2773,11 +2870,17 @@ export async function startWatch(
   }
   if (opts.oneShot) return { stop: () => {} };
   const timer = setInterval(() => void run(), FAST_POLL_MS);
-  const hbTimer = setInterval(() => void beat(), HEARTBEAT_MS);
-  const mirrorTimer = setInterval(() => {
-    void syncGroupMirror(cfg, log);
-    void syncTeamMirror(cfg, log);
-  }, MIRROR_SYNC_MS);
+  // Single-flight on the clock timers: setInterval fires whether or not the
+  // last run finished, and a run slowed by a loaded machine or a stalled peer
+  // used to stack copies of itself — a 20 s mirror timer became back-to-back
+  // scans of the CCD store, each adding its own allocation burst.
+  const beatOnce = singleFlight(beat);
+  const mirrorOnce = singleFlight(async () => {
+    await syncGroupMirror(cfg, log);
+    await syncTeamMirror(cfg, log);
+  });
+  const hbTimer = setInterval(() => void beatOnce(), HEARTBEAT_MS);
+  const mirrorTimer = setInterval(() => void mirrorOnce(), MIRROR_SYNC_MS);
   const auditTimer = setInterval(() => void audit(), VERIFY_INTERVAL_MS);
   // Coalesced-persistence safety net: bounds how long dirty bookkeeping can
   // sit unflushed between passes (M2's ≤5 s), and the only flush that covers
@@ -2813,6 +2916,30 @@ export async function startWatch(
     perf.uploads = 0;
     perf.flushes = 0;
   }, PERF_LOG_MS);
+  // The progress watchdog (see resolveWatchdogMs / watchdogVerdict above).
+  const watchdogTimer = setInterval(() => {
+    const v = watchdogVerdict({
+      passBusy,
+      passStartedAtMs,
+      lastLogAtMs,
+      nowMs: Date.now(),
+      limitMs: watchdogLimitMs,
+    });
+    if (!v.stuck) return;
+    clearInterval(watchdogTimer);
+    log(
+      `[hx] watchdog: a pass has been running for ${Math.round(v.busyForMs / 60_000)} min with no log line for ${Math.round(v.quietForMs / 60_000)} min (limit ${Math.round(watchdogLimitMs / 60_000)} min); exiting ${WATCHDOG_EXIT_CODE} so the service manager restarts the daemon`,
+    );
+    // Best-effort parting flush, bounded: a hung disk must not keep a hung
+    // daemon alive past this point.
+    const bail = setTimeout(() => watchdogExit(WATCHDOG_EXIT_CODE), 5_000);
+    flushStateIfDirty(scope)
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(bail);
+        watchdogExit(WATCHDOG_EXIT_CODE);
+      });
+  }, WATCHDOG_CHECK_MS);
   return {
     stop: () => {
       clearInterval(timer);
@@ -2821,6 +2948,7 @@ export async function startWatch(
       clearInterval(auditTimer);
       clearInterval(flushTimer);
       clearInterval(perfTimer);
+      clearInterval(watchdogTimer);
       // Best-effort parting flush, then back to flush-through mode. Swallow —
       // a rejection here would be unhandled, and stop() has no retry loop.
       flushStateIfDirty(scope).catch(() => {});

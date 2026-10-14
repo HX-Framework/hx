@@ -256,6 +256,28 @@ For each change, the chunk between `state.offset` and EOF (trimmed at the last
 3. `POST /api/sessions/commit` — the gateway composes staging into the canonical object and updates the `sessions` row.
 4. Bump `state.offset`.
 
+Every gateway and storage call runs under a deadline (60 s for the small
+JSON calls, 60 s plus one second per 64 KiB for a chunk PUT), so a peer that
+accepts a connection and never answers surfaces as a retryable error instead
+of pinning an upload worker.
+
+### Progress watchdog
+
+The daemon also watches itself: if an upload pass has been running for longer
+than the watchdog limit and the daemon has written no log line in that time,
+it exits with code 70 so the service manager (launchd, systemd, Task
+Scheduler, or the container shell hook) starts a fresh process. The limit is
+10 minutes by default and can be changed without a restart through
+`~/.let/hx/settings.json`:
+
+```json
+{ "tuning": { "watchdogMinutes": 15 } }
+```
+
+`0` disables it; positive values below 2 are raised to 2. For a foreground
+`hx watch` the `HX_WATCHDOG_MINUTES` environment variable overrides the
+setting.
+
 ## Develop
 
 Requires [Bun](https://bun.sh) `1.3.14`.
