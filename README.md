@@ -43,6 +43,7 @@ are working in, even when hx itself misbehaves:
 | Disk I/O | throttled: the `Background` class plus `LowPriorityBackgroundIO` | `IOSchedulingClass=idle` | not set |
 | Restart after a crash | at most once a minute (`ThrottleInterval` 60) | after 60 s (`RestartSec=60`); gives up after 5 starts in 10 minutes | within 5 minutes, by the repeating trigger |
 | Memory | no limit available | `MemoryHigh=1G`, `MemoryMax=2G`, `MemorySwapMax=512M` | no limit available |
+| Stop | SIGKILL 5 s after SIGTERM (`ExitTimeOut` 5) | SIGKILL 5 s after SIGTERM (`TimeoutStopSec=5`) | immediate (`taskkill /F`) |
 
 On Linux, `CPUWeight` and the memory limits are cgroup v2 settings. They only
 take effect when your user manager has the controller: systemd gives it the
@@ -51,6 +52,13 @@ controller is missing, the setting does nothing and the unit still starts.
 `Nice` and `IOSchedulingClass` work in every user unit; the idle I/O class only
 matters with an I/O scheduler that supports priorities, such as BFQ. After the
 unit gives up, `hx start` (or `hx restart`, or `hx update`) brings it back.
+
+**Stopping.** A stop sends SIGTERM first. A daemon whose event loop is frozen
+never runs its SIGTERM handler, so launchd and systemd send SIGKILL 5 seconds
+later. `hx stop` and `hx restart` also send it themselves if the daemon is
+still running after 5 seconds, which covers a definition installed before
+these settings, and say so when they had to. The container hook already sends
+SIGKILL after 1.5 seconds.
 
 hx owns the service definition (`~/Library/LaunchAgents/ai.let.hx-vision.plist`,
 `~/.config/systemd/user/hx-vision.service`): `hx start`, `hx restart`, `hx

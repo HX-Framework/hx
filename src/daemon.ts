@@ -112,6 +112,17 @@ const MEMORY_HIGH = "1G";
 const MEMORY_MAX = "2G";
 const MEMORY_SWAP_MAX = "512M";
 
+/**
+ * How long a stop waits after SIGTERM before it sends SIGKILL, on every path
+ * that sends SIGTERM: the plist's ExitTimeOut (launchd's own stops: bootout,
+ * kickstart -k, logout), the unit's TimeoutStopSec (systemd's), and `hx stop`
+ * itself. A healthy daemon exits in well under a second (state.ts flushes,
+ * then re-raises). A frozen one never runs its SIGTERM handler, which is
+ * JavaScript, so without the SIGKILL it stays up: 5 s under launchd's default
+ * on current macOS, 90 s under systemd's.
+ */
+export const STOP_GRACE_SECONDS = 5;
+
 export interface DaemonState {
   /** Service manager has the unit loaded (regardless of process state). */
   loaded: boolean;
@@ -130,9 +141,10 @@ export interface DaemonOps {
    * auto-start when enabled), so stop also disables the service — install()
    * re-enables it. Resolves with whether anything was actually running, and
    * throws if the service survived the stop, so the CLI never reports
-   * "stopped" while the daemon is still alive.
+   * "stopped" while the daemon is still alive. `forced` is true when the
+   * daemon ignored SIGTERM for STOP_GRACE_SECONDS and was killed.
    */
-  stop(): Promise<{ wasRunning: boolean }>;
+  stop(): Promise<{ wasRunning: boolean; forced?: boolean }>;
   /**
    * Restart the already-installed service so it re-execs the binary at its
    * configured path — used by `hx update` after the binary is atomically
@@ -178,6 +190,58 @@ export function getDaemonOps(): DaemonOps {
     default:
       return unsupportedOps();
   }
+}
+
+/** kill(pid, 0): ESRCH means gone; EPERM means alive and someone else's. Used
+ *  where the service manager reaps its children (launchd, systemd), so a
+ *  zombie never reads as alive for long. */
+function posixPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+export interface ExitOrKillDeps {
+  alive(pid: number): boolean;
+  kill(pid: number): void;
+  sleep(ms: number): void;
+  now(): number;
+}
+
+/**
+ * For a stop that has already sent SIGTERM: wait up to `graceMs` for `pid` to
+ * exit, then SIGKILL it and wait up to 2 s more. Returns whether the SIGKILL
+ * was needed. A daemon whose event loop is frozen never runs its SIGTERM
+ * handler, so this is what ends it.
+ */
+export function awaitExitOrKill(
+  pid: number,
+  graceMs: number,
+  deps: ExitOrKillDeps = {
+    alive: posixPidAlive,
+    kill: (p) => process.kill(p, "SIGKILL"),
+    sleep: sleepSync,
+    now: Date.now,
+  },
+): boolean {
+  const deadline = deps.now() + graceMs;
+  while (deps.alive(pid)) {
+    if (deps.now() >= deadline) {
+      try {
+        deps.kill(pid);
+      } catch {
+        // exited meanwhile
+      }
+      const killDeadline = deps.now() + 2000;
+      while (deps.alive(pid) && deps.now() < killDeadline) deps.sleep(50);
+      return true;
+    }
+    deps.sleep(100);
+  }
+  return false;
 }
 
 // ─────────────────────────── macOS / launchd ────────────────────────────
@@ -240,8 +304,13 @@ function bootstrapWithRetry(target: string, plistPath: string): void {
  * creates a fresh job.
  */
 function reloadLaunchdJob(target: string): void {
+  const running = macState().pid;
   // bootout is the modern "unload"; tolerate "not loaded" so this is idempotent.
   spawnSync("launchctl", ["bootout", `${target}/${LAUNCHD_LABEL}`], { stdio: "ignore" });
+  // A frozen daemon ignores the SIGTERM bootout sends, and the label stays
+  // loaded until launchd sends SIGKILL after the ExitTimeOut of the plist it
+  // loaded (5 s by default on current macOS), past the wait below.
+  if (running !== null) awaitExitOrKill(running, STOP_GRACE_SECONDS * 1000);
   // Let launchd finish reaping the old job before bootstrapping the new one,
   // and retry the bootstrap through the transient teardown race.
   waitUntilUnloaded();
@@ -286,6 +355,8 @@ function macOps(): DaemonOps {
         // launchd holds a kickstart until ThrottleInterval has passed since the
         // last spawn, so a daemon started less than a minute ago comes back up
         // to a minute late; one that has been running longer restarts at once.
+        // The kill is SIGTERM and, after the plist's ExitTimeOut, SIGKILL, so
+        // a frozen daemon is replaced in about 5 s (measured on macOS 26).
         runOrThrow("launchctl", ["kickstart", "-k", `${target}/${LAUNCHD_LABEL}`]);
       } else {
         // Not loaded, or the plist changed and launchd must read it again.
@@ -313,14 +384,20 @@ function macOps(): DaemonOps {
       const before = macState();
       if (!before.loaded) return { wasRunning: false };
       const r = spawnSync("launchctl", ["bootout", `${target}/${LAUNCHD_LABEL}`], { stdio: "pipe" });
-      // bootout returns before launchd finishes tearing the job down — wait,
-      // then confirm the label is actually gone instead of reporting success
+      // bootout sends SIGTERM and returns at once. A frozen daemon ignores the
+      // SIGTERM, and the label stays loaded until launchd sends SIGKILL after
+      // the plist's ExitTimeOut (5.3 s measured on macOS 26 with the default),
+      // which is past the 2 s wait below, so this used to report a failed
+      // stop. Escalate here rather than depend on the ExitTimeOut of a plist
+      // that an older hx loaded.
+      const forced = before.pid !== null && awaitExitOrKill(before.pid, STOP_GRACE_SECONDS * 1000);
+      // Then confirm the label is actually gone instead of reporting success
       // blind (the old fire-and-forget printed "stopped" even on failure).
       waitUntilUnloaded();
       if (macState().loaded) {
         throw new Error(`launchctl bootout ${target}/${LAUNCHD_LABEL} failed: ${failureDetail(r)}`);
       }
-      return { wasRunning: true };
+      return { wasRunning: true, forced };
     },
     async state() {
       return macState();
@@ -394,6 +471,18 @@ function clearStartLimit(): void {
   spawnSync("systemctl", ["--user", "reset-failed", SYSTEMD_UNIT_NAME], { stdio: "ignore" });
 }
 
+/** Is any process of the unit still up? `is-active` exits non-zero for a unit
+ *  whose stop job is waiting on a process that ignores SIGTERM (it reads
+ *  "deactivating"), so it cannot answer this; ActiveState can. */
+function systemdUnitRunning(): boolean {
+  const r = spawnSync("systemctl", ["--user", "show", SYSTEMD_UNIT_NAME, "--property=ActiveState"], {
+    stdio: "pipe",
+  });
+  if (r.error || r.status !== 0) return false;
+  const state = /ActiveState=(\S+)/.exec(r.stdout.toString())?.[1] ?? "";
+  return ["active", "activating", "deactivating", "reloading"].includes(state);
+}
+
 function systemdOps(): DaemonOps {
   return {
     managerName: "systemd (user)",
@@ -431,17 +520,31 @@ function systemdOps(): DaemonOps {
     },
     async stop() {
       const before = linuxState();
-      // disable --now = stop now AND drop the login autostart, so "stopped"
-      // holds until `hx start` re-enables (mirrors the launchd disable).
-      // Tolerate a missing unit so stop stays idempotent.
-      spawnSync("systemctl", ["--user", "disable", "--now", SYSTEMD_UNIT_NAME], { stdio: "ignore" });
-      // Verify instead of trusting the exit code: is-active exits 0 only while
-      // the unit is still running.
-      const active = spawnSync("systemctl", ["--user", "is-active", SYSTEMD_UNIT_NAME], { stdio: "pipe" });
-      if (active.status === 0) {
-        throw new Error(`systemctl --user disable --now ${SYSTEMD_UNIT_NAME} failed: unit still active`);
+      // Drop the login autostart, so "stopped" holds until `hx start`
+      // re-enables (mirrors the launchd disable). Tolerate a missing unit so
+      // stop stays idempotent.
+      spawnSync("systemctl", ["--user", "disable", SYSTEMD_UNIT_NAME], { stdio: "ignore" });
+      // `stop` sends SIGTERM and blocks until the unit's TimeoutStopSec runs
+      // out before it sends SIGKILL: 90 s on a unit written before that key
+      // was added, and a frozen daemon ignores the SIGTERM. Bound the wait
+      // here; the stop job carries on inside systemd when this client is
+      // killed, and the SIGKILL below completes it.
+      spawnSync("systemctl", ["--user", "stop", SYSTEMD_UNIT_NAME], {
+        stdio: "ignore",
+        timeout: STOP_GRACE_SECONDS * 1000,
+      });
+      let forced = false;
+      if (systemdUnitRunning()) {
+        forced = true;
+        spawnSync("systemctl", ["--user", "kill", "--signal=SIGKILL", SYSTEMD_UNIT_NAME], { stdio: "ignore" });
+        const deadline = Date.now() + 2000;
+        while (systemdUnitRunning() && Date.now() < deadline) sleepSync(100);
       }
-      return { wasRunning: before.pid !== null };
+      // Verify instead of trusting the exit codes.
+      if (systemdUnitRunning()) {
+        throw new Error(`systemctl --user stop ${SYSTEMD_UNIT_NAME} failed: unit still running`);
+      }
+      return { wasRunning: before.pid !== null, forced };
     },
     async state() {
       return linuxState();
@@ -1082,6 +1185,11 @@ const MANAGED_NOTE =
  *     (default: every 10 s). A job that ran longer than that is respawned at
  *     once, so this only slows a crash loop. It also holds `kickstart -k` back
  *     until a minute has passed since the last spawn (see restart()).
+ *   • ExitTimeOut=5 — launchd sends SIGKILL 5 s after the SIGTERM of any stop
+ *     (bootout, kickstart -k, logout). launchd.plist(5) leaves the default to
+ *     the system (5 s measured on macOS 26.4); setting it means a frozen
+ *     daemon, which never runs its JavaScript SIGTERM handler, goes away
+ *     within 5 s on every release.
  *
  * The log paths are a parameter only so tests can render the file without the
  * caller's home directory in it.
@@ -1115,6 +1223,7 @@ export function renderPlist(binPath: string, logs: LogPaths = DAEMON_LOGS): stri
       <key>SuccessfulExit</key><false/>
     </dict>
     <key>ThrottleInterval</key><integer>${RESPAWN_DELAY_SEC}</integer>
+    <key>ExitTimeOut</key><integer>${STOP_GRACE_SECONDS}</integer>
     <key>ProcessType</key><string>Background</string>
     <key>LowPriorityBackgroundIO</key><true/>
     <key>Nice</key><integer>${SERVICE_NICE}</integer>
@@ -1153,6 +1262,9 @@ ${envBlock}
  *     nothing there.
  *   • Restart/RestartSec/StartLimit* — the manager's own bookkeeping; work
  *     everywhere. StartLimit* belongs in [Unit] (systemd 230+).
+ *   • TimeoutStopSec=5 — the manager sends SIGKILL 5 s after the SIGTERM of a
+ *     stop (default 90 s), so a frozen daemon, which never runs its
+ *     JavaScript SIGTERM handler, cannot hold a stop or a restart for long.
  *
  * systemd writes cgroup attributes only for controllers available to the
  * manager; a setting whose controller is missing is left unapplied and the
@@ -1177,6 +1289,7 @@ Type=simple
 ExecStart=${binPath} watch
 Restart=always
 RestartSec=${RESPAWN_DELAY_SEC}
+TimeoutStopSec=${STOP_GRACE_SECONDS}
 Nice=${SERVICE_NICE}
 IOSchedulingClass=idle
 CPUWeight=20
@@ -1346,9 +1459,10 @@ export async function reconcileServiceDefinition(
  * cleanup of a stopped job kills only the job's process group (see
  * AbandonProcessGroup in launchd.plist(5)), so the helper outlives the bootout.
  * Verified with a probe job on macOS 26.4. The helper is `hx restart` from this
- * same binary — it writes the plist from its own path, then bootout, wait for
- * the unload, enable, bootstrap with retries: the path `hx start` has always
- * taken — and its output goes to the daemon's own log descriptors.
+ * same binary — it stops the job (bootout, then SIGKILL if the old process
+ * outlives STOP_GRACE_SECONDS), writes the plist from its own path, then
+ * enable and bootstrap with retries: the path `hx start` has always taken —
+ * and its output goes to the daemon's own log descriptors.
  */
 function reloadLaunchdFromJob(): void {
   const child = spawn(process.execPath, ["restart"], {

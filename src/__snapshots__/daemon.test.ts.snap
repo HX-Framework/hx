@@ -18,6 +18,7 @@ exports[`launchd: plist matches the snapshot 1`] = `
       <key>SuccessfulExit</key><false/>
     </dict>
     <key>ThrottleInterval</key><integer>60</integer>
+    <key>ExitTimeOut</key><integer>5</integer>
     <key>ProcessType</key><string>Background</string>
     <key>LowPriorityBackgroundIO</key><true/>
     <key>Nice</key><integer>10</integer>
@@ -46,6 +47,7 @@ Type=simple
 ExecStart=/home/me/.let/bin/hx watch
 Restart=always
 RestartSec=60
+TimeoutStopSec=5
 Nice=10
 IOSchedulingClass=idle
 CPUWeight=20

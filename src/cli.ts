@@ -17,6 +17,7 @@ import {
   getDaemonOps,
   reconcileServiceDefinition,
   startLogRotation,
+  STOP_GRACE_SECONDS,
   tailLogs,
   teeStdioToLogs,
   type DaemonOps,
@@ -1082,9 +1083,10 @@ async function cmdStop(): Promise<void> {
   const ops = getDaemonOps();
   // stop() verifies the service is actually gone (and throws if it survived),
   // so this success line can't lie about a daemon that's still running.
-  const { wasRunning } = await ops.stop();
+  const { wasRunning, forced } = await ops.stop();
   if (wasRunning) {
     log(`hx stopped (${ops.managerName}). Run \`hx start\` to resume.`);
+    if (forced) log(forcedStopNote());
   } else {
     log(`hx is not running — nothing to stop. Run \`hx start\` to start it.`);
   }
@@ -1095,8 +1097,18 @@ async function cmdRestart(): Promise<void> {
   const ops = getDaemonOps();
   const binPath = process.execPath;
   const dotfileConsent = await resolveDotfileConsent(ops);
+  // Stop, then install. Under systemd and the container hook, install() only
+  // starts a service that is not running (or, on systemd, whose unit file
+  // changed), so on its own it left a running or frozen daemon in place.
+  // stop() also kills a daemon that ignores SIGTERM.
+  const { forced } = await ops.stop();
   await ops.install({ binPath, dotfileConsent });
   log(`hx restarted (${ops.managerName}).`);
+  if (forced) log(forcedStopNote());
+}
+
+function forcedStopNote(): string {
+  return `The daemon did not exit within ${STOP_GRACE_SECONDS} s of SIGTERM, so it was killed with SIGKILL.`;
 }
 
 async function cmdLogs(): Promise<void> {
