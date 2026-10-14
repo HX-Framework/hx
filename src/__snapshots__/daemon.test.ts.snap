@@ -1,0 +1,116 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`launchd: plist matches the snapshot 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by hx. hx start, hx update and the hx daemon rewrite this file, so local edits do not last. -->
+<plist version="1.0">
+  <dict>
+    <key>Label</key><string>ai.let.hx-vision</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/me/.let/bin/hx</string>
+      <string>watch</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key><false/>
+    </dict>
+    <key>ThrottleInterval</key><integer>60</integer>
+    <key>ProcessType</key><string>Background</string>
+    <key>LowPriorityBackgroundIO</key><true/>
+    <key>Nice</key><integer>10</integer>
+    <key>StandardOutPath</key><string>/Users/me/.let/hx/stdout.log</string>
+    <key>StandardErrorPath</key><string>/Users/me/.let/hx/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+  </dict>
+</plist>
+"
+`;
+
+exports[`systemd: unit matches the snapshot 1`] = `
+"# Managed by hx. hx start, hx update and the hx daemon rewrite this file, so local edits do not last.
+# To override a setting, use a drop-in: systemctl --user edit hx-vision.service
+[Unit]
+Description=hx-vision session mirror
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/home/me/.let/bin/hx watch
+Restart=always
+RestartSec=60
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+MemoryHigh=1G
+MemoryMax=2G
+MemorySwapMax=512M
+StandardOutput=append:/home/me/.let/hx/stdout.log
+StandardError=append:/home/me/.let/hx/stderr.log
+
+[Install]
+WantedBy=default.target
+"
+`;
+
+exports[`windows: background priority matches the snapshot 1`] = `
+"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>hx-vision session mirror</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>CORP\\me</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <StartBoundary>2024-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>CORP\\me</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\\Users\\me\\.let\\bin\\hx-svc.exe</Command>
+      <Arguments>watch</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"
+`;

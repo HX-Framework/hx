@@ -32,6 +32,40 @@ inside WSL or a VM watches that environment's own `~/.claude`. They share no
 state and do not coordinate — run both and you get two devices, which is the
 intended model, not a defect.
 
+## The background service
+
+The service is defined as a background process, so it gives way to the apps you
+are working in, even when hx itself misbehaves:
+
+| | macOS (launchd) | Linux (systemd user unit) | Windows (Task Scheduler) |
+|---|---|---|---|
+| CPU | `ProcessType` `Background`, `Nice` 10 | `Nice=10`, `CPUWeight=20` | priority 7 (below normal) |
+| Disk I/O | throttled: the `Background` class plus `LowPriorityBackgroundIO` | `IOSchedulingClass=idle` | not set |
+| Restart after a crash | at most once a minute (`ThrottleInterval` 60) | after 60 s (`RestartSec=60`); gives up after 5 starts in 10 minutes | within 5 minutes, by the repeating trigger |
+| Memory | no limit available | `MemoryHigh=1G`, `MemoryMax=2G`, `MemorySwapMax=512M` | no limit available |
+
+On Linux, `CPUWeight` and the memory limits are cgroup v2 settings. They only
+take effect when your user manager has the controller: systemd gives it the
+memory controller by default and the cpu controller since systemd 252. Where a
+controller is missing, the setting does nothing and the unit still starts.
+`Nice` and `IOSchedulingClass` work in every user unit; the idle I/O class only
+matters with an I/O scheduler that supports priorities, such as BFQ. After the
+unit gives up, `hx start` (or `hx restart`, or `hx update`) brings it back.
+
+hx owns the service definition (`~/Library/LaunchAgents/ai.let.hx-vision.plist`,
+`~/.config/systemd/user/hx-vision.service`): `hx start`, `hx restart`, `hx
+update` and the daemon itself rewrite it. When a new version of the daemon starts
+under an older definition — `hx update` restarts the service with the previous
+version's template — it writes its own and has launchd or systemd reload it, so
+an update needs no reinstall. On Linux, put local changes in a drop-in
+(`systemctl --user edit hx-vision.service`), which hx never touches.
+
+**Logs.** The daemon writes `~/.let/hx/stdout.log` and `~/.let/hx/stderr.log`.
+When either passes 20 MB, the daemon copies its last 20 MB to `<log>.1` (the
+previous `.1` becomes `.2`) and empties the live file, so each log takes
+at most about 60 MB. `hx logs` starts with the last lines across that boundary,
+then follows the live file.
+
 ## Running in a container
 
 Install as usual — no special setup. A container has no systemd user session, so
@@ -167,10 +201,12 @@ keeps its own offsets (`state.local.json`), so a dev stack that's down only
 stalls the local mirror, never the real one. (`hx update --local` is the one
 non-tee use: it fetches the binary *from* the dev gateway.)
 
-The daemon keeps two files in `~/.let/hx/`:
+The daemon keeps these files in `~/.let/hx/`:
 
 - `config.json` — device token + gateway URL (mode 0600).
 - `state.json` — per-file byte offset, so a restart doesn't re-upload.
+- `stdout.log`, `stderr.log` — the daemon's output, rotated at 20 MB into
+  `.1` and `.2` (see [The background service](#the-background-service)).
 
 ## What it watches
 
