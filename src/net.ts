@@ -60,3 +60,61 @@ export function assertSecureFetchUrl(url: string, label: string): void {
     );
   }
 }
+
+// ── Timeouts ────────────────────────────────────────────────────────────────
+//
+// No gateway or storage call may wait forever. Bun's fetch has no default
+// timeout, and a peer that accepts the connection and then stops answering (a
+// gateway whose database pool is stuck, a Fortress mid-restart) used to pin an
+// upload worker for good: the pass never ended, nothing was logged, and the
+// daemon sat at full CPU on its timers for hours while its backlog aged
+// (Request Pricing M13). Every call now runs under a deadline sized for what
+// it does; a hit surfaces as an ordinary error on the file's retry path.
+
+/** A call that exceeded its deadline. Named so logs and classifiers can tell
+ *  it from a peer error. */
+export class FetchTimeoutError extends Error {
+  constructor(label: string, timeoutMs: number) {
+    super(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`);
+    this.name = "TimeoutError";
+  }
+}
+
+/** Deadline for the small JSON round trips (append-url, commit, heartbeat…). */
+export const GATEWAY_TIMEOUT_MS = 60_000;
+/** Deadline for the bulk metadata batches (verify, reattribute, retitle). */
+export const GATEWAY_BATCH_TIMEOUT_MS = 120_000;
+
+/** Deadline for a chunk PUT: a 60 s floor plus one second per 64 KiB — a
+ *  64 KB/s link still gets a 4 MB chunk through (≈124 s), and the 32 MB grown
+ *  chunk has about nine and a half minutes. */
+export function chunkPutTimeoutMs(bytes: number): number {
+  return GATEWAY_TIMEOUT_MS + Math.ceil(bytes / 65_536) * 1000;
+}
+
+/**
+ * Run `work` under a deadline. The signal is wired into the fetch AND the
+ * body read: `work` is expected to consume the response before returning, so
+ * a peer that sends headers and then stalls on the body hits the same clock.
+ * On expiry the pending fetch is aborted and the caller gets a
+ * {@link FetchTimeoutError}.
+ */
+export async function withDeadline<T>(
+  label: string,
+  timeoutMs: number,
+  work: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const ctrl = new AbortController();
+  const reason = new FetchTimeoutError(label, timeoutMs);
+  const timer = setTimeout(() => ctrl.abort(reason), timeoutMs);
+  try {
+    return await work(ctrl.signal);
+  } catch (err) {
+    // Whatever shape the runtime rejects with after an abort (the reason
+    // itself, or a DOMException AbortError), the caller sees the deadline.
+    if (ctrl.signal.aborted) throw reason;
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}

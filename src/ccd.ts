@@ -11,11 +11,29 @@
 //
 // Trimmed to the fields hx needs. When CCD isn't installed the directory is
 // absent and every reader degrades to an empty result.
+//
+// The store is large on a long-lived machine: 34,971 files and 925 MB measured
+// on one laptop, and CCD rewrites some of them every few seconds while it is
+// open. The reader used to re-stat every file (35k stats plus a 7.6 MB
+// fingerprint string) on every 10 s TTL lapse, and re-read ALL of them — 35k
+// concurrent reads, about 7 s of CPU and 2-3 GB of allocation — whenever any
+// single file had changed. During a catch-up that was the daemon's dominant
+// cost: about one core continuously, and the allocation churn behind the
+// multi-GB RSS swings (Request Pricing M13).
+//
+// It is now an INCREMENTAL index. Per file we remember (size, mtime) and the
+// parsed record; a refresh stats the org directories first (CCD writes by
+// rename, so a creation or rewrite bumps the parent dir's mtime), re-lists only
+// the directories that moved, stats only their files, and re-reads only the
+// files whose stat moved. Every stat and read goes through a bounded pool. A
+// full per-file stat sweep still runs at most once per FULL_STAT interval as a
+// safety net for in-place rewrites that leave the dir mtime alone.
 
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { posix as posixPath, win32 as winPath } from "node:path";
 import os from "node:os";
+import { mapPool, readdirSafe, statSafe } from "./sources.js";
 
 /**
  * Claude Desktop's per-user data directory. Electron puts this under
@@ -48,15 +66,15 @@ export function ccdAppDir(
 const CCD_ROOT = ccdAppDir();
 let CCD_DIR = CCD_ROOT === null ? null : path.join(CCD_ROOT, "claude-code-sessions");
 
-/** Test seam — point the session-metadata store at a fixture dir (null
- *  restores the platform default) and drop the caches. Linux CI has no CCD
- *  paths at all, so the cache/fingerprint logic is untestable without this. */
-export function setCcdSessionsDirForTests(dir: string | null): void {
-  CCD_DIR = dir ?? (CCD_ROOT === null ? null : path.join(CCD_ROOT, "claude-code-sessions"));
-  recordsCache = null;
-  recordsInFlight = null;
-  cachedMap = null;
-}
+/** How long a refresh result is reused before the org dirs are re-statted.
+ *  Titles and group membership may lag the store by this much. */
+export const CCD_REFRESH_TTL_MS = 20_000;
+/** How often EVERY file is re-statted regardless of dir mtimes — the safety
+ *  net for a rewrite that leaves the parent dir's mtime alone. */
+export const CCD_FULL_STAT_INTERVAL_MS = 60_000;
+/** Stats and reads in flight at once. Bounds the memory of a refresh to this
+ *  many file buffers (CCD session files are tens to a few hundred KB). */
+export const CCD_IO_CONCURRENCY = 32;
 
 export interface CcdSessionMeta {
   /** CCD's internal id, "local_<uuid>". */
@@ -70,11 +88,64 @@ export interface CcdSessionMeta {
   lastActivityAt: number;
 }
 
-async function listSessionFiles(): Promise<string[]> {
+interface IndexedFile {
+  size: number;
+  mtimeMs: number;
+  record: CcdSessionMeta | null;
+}
+
+interface OrgDirListing {
+  mtimeMs: number;
+  /** Absolute paths of the local_*.json files present at `mtimeMs`. */
+  files: string[];
+}
+
+// ── The index ───────────────────────────────────────────────────────────────
+const index = new Map<string, IndexedFile>();
+const orgDirs = new Map<string, OrgDirListing>();
+/** Snapshot of every parsed record. Its IDENTITY changes only when the index
+ *  changed, so callers can cache derived maps against it. */
+let records: CcdSessionMeta[] = [];
+let version = 0;
+let lastRefreshAtMs = Number.NEGATIVE_INFINITY;
+let lastFullStatAtMs = Number.NEGATIVE_INFINITY;
+let refreshInFlight: Promise<void> | null = null;
+
+function resetIndex(): void {
+  index.clear();
+  orgDirs.clear();
+  records = [];
+  version = 0;
+  lastRefreshAtMs = Number.NEGATIVE_INFINITY;
+  lastFullStatAtMs = Number.NEGATIVE_INFINITY;
+  cachedMap = null;
+}
+
+/** Test seam — point the session-metadata store at a fixture dir (null
+ *  restores the platform default) and drop the index. Linux CI has no CCD
+ *  paths at all, so the index logic is untestable without this. */
+export function setCcdSessionsDirForTests(dir: string | null): void {
+  CCD_DIR = dir ?? (CCD_ROOT === null ? null : path.join(CCD_ROOT, "claude-code-sessions"));
+  resetIndex();
+}
+
+/** Monotonic counter bumped whenever the indexed records changed — the cache
+ *  key for anything derived from them (the group mirror). */
+export function ccdIndexVersion(): number {
+  return version;
+}
+
+function isSessionFile(name: string): boolean {
+  return name.startsWith("local_") && name.endsWith(".json");
+}
+
+/** <store>/<accountId>/<orgId> for every account and org on disk. */
+async function listOrgDirs(): Promise<string[]> {
   const out: string[] = [];
   if (CCD_DIR === null) return out; // CCD doesn't ship on this platform
   let accountDirs: string[];
   try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixed CCD store path
     accountDirs = await readdir(CCD_DIR);
   } catch {
     return out;
@@ -82,25 +153,19 @@ async function listSessionFiles(): Promise<string[]> {
   for (const acc of accountDirs) {
     if (acc.startsWith(".")) continue;
     const accPath = path.join(CCD_DIR, acc);
-    let orgs: string[];
-    try {
-      orgs = await readdir(accPath);
-    } catch {
-      continue;
-    }
-    for (const org of orgs) {
+    for (const org of await readdirSafe(accPath)) {
       if (org.startsWith(".")) continue;
-      const orgPath = path.join(accPath, org);
-      let files: string[];
-      try {
-        files = await readdir(orgPath);
-      } catch {
-        continue;
-      }
-      for (const f of files) {
-        if (!f.startsWith("local_") || !f.endsWith(".json")) continue;
-        out.push(path.join(orgPath, f));
-      }
+      out.push(path.join(accPath, org));
+    }
+  }
+  return out;
+}
+
+async function listSessionFiles(): Promise<string[]> {
+  const out: string[] = [];
+  for (const dir of await listOrgDirs()) {
+    for (const f of await readdirSafe(dir)) {
+      if (isSessionFile(f)) out.push(path.join(dir, f));
     }
   }
   return out;
@@ -109,6 +174,7 @@ async function listSessionFiles(): Promise<string[]> {
 async function readSessionFile(filePath: string): Promise<CcdSessionMeta | null> {
   let raw: string;
   try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- path listed from the CCD store
     raw = await readFile(filePath, "utf8");
   } catch {
     return null;
@@ -132,98 +198,140 @@ async function readSessionFile(filePath: string): Promise<CcdSessionMeta | null>
   };
 }
 
-/** All CCD session-metadata records (including archived). Uncached — prefer
- *  {@link readCcdRecentsCached} anywhere called on a timer or the hot path. */
+/** All CCD session-metadata records (including archived), read fresh through
+ *  the bounded pool. Uncached — prefer {@link readCcdRecentsCached} anywhere
+ *  called on a timer or the hot path. */
 export async function readCcdRecents(): Promise<CcdSessionMeta[]> {
   const files = await listSessionFiles();
-  const records = await Promise.all(files.map(readSessionFile));
-  return records.filter((r): r is CcdSessionMeta => !!r);
+  const out: CcdSessionMeta[] = [];
+  await mapPool(files, CCD_IO_CONCURRENCY, async (p) => {
+    const r = await readSessionFile(p);
+    if (r) out.push(r);
+  });
+  return out;
 }
 
 /**
- * Cheap change fingerprint over the CCD session-metadata store: every
- * `local_*.json`'s (path, size, mtime), sorted. A rewrite bumps the file's
- * mtime even though the org dir's mtime stays put — so this must stat files,
- * not directories. Stats only; no file is ever read here.
+ * One refresh of the index. `fullStat` re-stats every known file; otherwise
+ * only the files of org dirs whose mtime moved (plus any dir not seen before)
+ * are statted. Reads happen only for files whose (size, mtime) moved.
  */
-export async function ccdSessionsFingerprint(): Promise<string> {
-  const files = await listSessionFiles();
-  const parts = await Promise.all(
-    files.map(async (p) => {
-      try {
-        const st = await stat(p);
-        return `${p}:${st.size}:${st.mtimeMs}`;
-      } catch {
-        return `${p}:gone`;
+async function refreshNow(nowMs: number, fullStat: boolean): Promise<void> {
+  if (CCD_DIR === null) {
+    if (index.size > 0 || orgDirs.size > 0) {
+      resetIndex();
+      version += 1;
+    }
+    lastRefreshAtMs = nowMs;
+    return;
+  }
+  let changed = false;
+  const dirs = await listOrgDirs();
+  const seenDirs = new Set(dirs);
+  const toStat = new Set<string>();
+
+  // Directory pass: a dir whose mtime moved is re-listed and its files queued
+  // for a stat. Deletions and renames surface here (both bump the dir).
+  await mapPool(dirs, CCD_IO_CONCURRENCY, async (dir) => {
+    const st = await statSafe(dir);
+    const known = orgDirs.get(dir);
+    if (!st || !st.isDir) {
+      if (known) {
+        for (const p of known.files) if (index.delete(p)) changed = true;
+        orgDirs.delete(dir);
       }
-    }),
-  );
-  return parts.sort().join("|");
+      return;
+    }
+    if (known && known.mtimeMs === st.mtimeMs) {
+      if (fullStat) for (const p of known.files) toStat.add(p);
+      return;
+    }
+    const present: string[] = [];
+    for (const f of await readdirSafe(dir)) {
+      if (isSessionFile(f)) present.push(path.join(dir, f));
+    }
+    if (known) {
+      const presentSet = new Set(present);
+      for (const p of known.files) {
+        if (!presentSet.has(p) && index.delete(p)) changed = true;
+      }
+    }
+    orgDirs.set(dir, { mtimeMs: st.mtimeMs, files: present });
+    for (const p of present) toStat.add(p);
+  });
+  // An account or org dir that vanished takes its files with it.
+  for (const [dir, listing] of [...orgDirs]) {
+    if (seenDirs.has(dir)) continue;
+    for (const p of listing.files) if (index.delete(p)) changed = true;
+    orgDirs.delete(dir);
+  }
+
+  // File pass: stat each queued file; read only what moved.
+  await mapPool([...toStat], CCD_IO_CONCURRENCY, async (p) => {
+    const st = await statSafe(p);
+    if (!st || st.isDir) {
+      if (index.delete(p)) changed = true;
+      return;
+    }
+    const known = index.get(p);
+    if (known && known.size === st.size && known.mtimeMs === st.mtimeMs) return;
+    const record = await readSessionFile(p);
+    index.set(p, { size: st.size, mtimeMs: st.mtimeMs, record });
+    changed = true;
+  });
+
+  if (fullStat) lastFullStatAtMs = nowMs;
+  lastRefreshAtMs = nowMs;
+  if (changed) {
+    version += 1;
+    const next: CcdSessionMeta[] = [];
+    for (const e of index.values()) if (e.record) next.push(e.record);
+    records = next;
+  }
 }
 
-// Reading every local_*.json on each 1.5s watcher tick would be wasteful, so we
-// cache the records and refresh at most every TTL — and even then only when the
-// store's stat fingerprint moved (a TTL expiry alone costs stats, not reads).
-// Single-flight: concurrent misses (the upload pool) share one refresh.
-const CCD_CACHE_TTL_MS = 10_000;
-let recordsCache: { atMs: number; fp: string; records: CcdSessionMeta[] } | null = null;
-let recordsInFlight: Promise<CcdSessionMeta[]> | null = null;
-
-/** All CCD records, ≤ TTL stale, re-read only when the store changed.
- *
- *  `expectedFp` (a fingerprint the CALLER just computed) bypasses the TTL
- *  when it differs from the cached one: the mirror cycle fingerprints the
- *  store itself, and without this a rebuild landing INSIDE the TTL of a
- *  pre-change read would build from stale records yet be cached under the
- *  fresh fingerprint — permanently stale until the store changes again. */
-export async function readCcdRecentsCached(
+/**
+ * Bring the index up to date if it is older than the TTL (or `force`), and
+ * return its version. Single-flight: concurrent callers share one refresh.
+ * The first call builds the whole index — one bounded read of every file.
+ */
+export async function refreshCcdIndex(
   nowMs: number,
-  expectedFp?: string,
-): Promise<CcdSessionMeta[]> {
-  if (recordsCache && nowMs - recordsCache.atMs < CCD_CACHE_TTL_MS) {
-    if (expectedFp === undefined || recordsCache.fp === expectedFp) return recordsCache.records;
-    // TTL-fresh but fingerprint-stale — fall through to a forced refresh.
+  opts: { force?: boolean } = {},
+): Promise<number> {
+  if (!opts.force && nowMs - lastRefreshAtMs < CCD_REFRESH_TTL_MS) return version;
+  if (refreshInFlight) {
+    await refreshInFlight;
+    return version;
   }
-  if (recordsInFlight) {
-    if (expectedFp === undefined) return recordsInFlight;
-    // A with-fingerprint caller must not accept an in-flight read that
-    // STARTED before the change it just fingerprinted: await it, then
-    // re-check — one forced re-read on mismatch (the in-flight slot is
-    // clear by then, so the recursion takes the fresh path).
-    return recordsInFlight.then((r) =>
-      recordsCache?.fp === expectedFp ? r : readCcdRecentsCached(nowMs, expectedFp),
-    );
-  }
-  recordsInFlight = (async () => {
-    try {
-      const fp = expectedFp ?? (await ccdSessionsFingerprint());
-      if (recordsCache && recordsCache.fp === fp) {
-        recordsCache = { ...recordsCache, atMs: nowMs };
-        return recordsCache.records;
-      }
-      const records = await readCcdRecents();
-      recordsCache = { atMs: nowMs, fp, records };
-      return records;
-    } finally {
-      recordsInFlight = null;
-    }
-  })();
-  return recordsInFlight;
+  const fullStat = opts.force === true || nowMs - lastFullStatAtMs >= CCD_FULL_STAT_INTERVAL_MS;
+  refreshInFlight = refreshNow(nowMs, fullStat).finally(() => {
+    refreshInFlight = null;
+  });
+  await refreshInFlight;
+  return version;
+}
+
+/** All CCD records, at most CCD_REFRESH_TTL_MS stale. The returned array keeps
+ *  its identity while nothing on disk changed. */
+export async function readCcdRecentsCached(nowMs: number): Promise<CcdSessionMeta[]> {
+  await refreshCcdIndex(nowMs);
+  return records;
 }
 
 let cachedMap: { records: CcdSessionMeta[]; byCli: Map<string, CcdSessionMeta> } | null = null;
 
-/** cliSessionId → CCD metadata, derived from the cached records (the map is
+/** cliSessionId → CCD metadata, derived from the indexed records (the map is
  *  rebuilt only when the records array identity changes). */
 export async function getCcdRecentsByCliId(
   nowMs: number,
 ): Promise<Map<string, CcdSessionMeta>> {
-  const records = await readCcdRecentsCached(nowMs);
-  if (cachedMap && cachedMap.records === records) return cachedMap.byCli;
+  const current = await readCcdRecentsCached(nowMs);
+  if (cachedMap && cachedMap.records === current) return cachedMap.byCli;
   const byCli = new Map<string, CcdSessionMeta>();
-  for (const r of records) {
+  for (const r of current) {
     if (r.cliSessionId) byCli.set(r.cliSessionId, r);
   }
-  cachedMap = { records, byCli };
+  cachedMap = { records: current, byCli };
   return byCli;
 }

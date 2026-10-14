@@ -78,3 +78,22 @@ export class ByteSemaphore {
     return this.used;
   }
 }
+
+/**
+ * Wrap an async job so that a call made while a previous call is still
+ * running joins that run instead of starting another. For the daemon's
+ * interval timers (mirror sync, heartbeat): setInterval fires on the clock no
+ * matter how long the last run took, so a run slowed by a loaded machine or a
+ * stalled peer must not stack a second, third, fourth copy of itself behind
+ * it — that is how a 20 s timer turned into back-to-back full store scans.
+ */
+export function singleFlight<T>(job: () => Promise<T>): () => Promise<T> {
+  let inFlight: Promise<T> | null = null;
+  return () => {
+    if (inFlight) return inFlight;
+    inFlight = job().finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
+  };
+}

@@ -22,7 +22,7 @@
 import path from "node:path";
 import { readdir, stat } from "node:fs/promises";
 import { leveldbScanBuffers } from "./ccd-leveldb.js";
-import { ccdAppDir, ccdSessionsFingerprint, readCcdRecentsCached } from "./ccd.js";
+import { ccdAppDir, readCcdRecentsCached, refreshCcdIndex } from "./ccd.js";
 import type { HxCcdGroupMirrorBlob, HxCcdGroup } from "./mirror-types.js";
 
 const CCD_ROOT = ccdAppDir();
@@ -33,6 +33,7 @@ let LS_DIR = CCD_ROOT === null ? null : path.join(CCD_ROOT, "Local Storage", "le
 export function setCcdLeveldbDirForTests(dir: string | null): void {
   LS_DIR = dir ?? (CCD_ROOT === null ? null : path.join(CCD_ROOT, "Local Storage", "leveldb"));
   mirrorCache = null;
+  mirrorInFlight = null;
 }
 
 interface DframeState {
@@ -165,19 +166,32 @@ function stripCodePrefix(s: string): string {
   return s.replace(/^code:/, "");
 }
 
-// Change gate: both sources fingerprinted by stats alone (a readdir + a stat
-// per file) before any byte is read or decompressed. Unchanged fingerprints
-// return the cached blob — the 20 s cadence then costs stats, not scans. The
-// caller's content-hash gate (syncGroupMirror) is unaffected: it already
-// excludes the volatile syncedAtMs, so a re-stamped cached blob never uploads.
-let mirrorCache: { ldbFp: string | null; sessFp: string; blob: HxCcdGroupMirrorBlob } | null = null;
+// Change gate: the leveldb is fingerprinted by stats alone (a readdir + a stat
+// per file) and the session store is answered by the incremental index's
+// version, so an unchanged pair returns the cached blob — the 20 s cadence
+// then costs a dozen stats, not scans. The caller's content-hash gate
+// (syncGroupMirror) is unaffected: it already excludes the volatile
+// syncedAtMs, so a re-stamped cached blob never uploads.
+let mirrorCache: { ldbFp: string | null; indexVersion: number; blob: HxCcdGroupMirrorBlob } | null = null;
+// Single-flight: the daemon fires this on a timer regardless of whether the
+// previous build finished. A build slowed by a loaded machine must join the
+// one in flight, never stack a second scan on top of it.
+let mirrorInFlight: Promise<HxCcdGroupMirrorBlob> | null = null;
 
 /**
  * Assemble the CCD sidebar mirror the gateway stores. Returns a disabled-empty
  * mirror when CCD isn't in "Group by: Custom" mode or nothing could be read —
  * the UI then falls back to its own grouping dimensions.
  */
-export async function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorBlob> {
+export function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorBlob> {
+  if (mirrorInFlight) return mirrorInFlight.then((blob) => ({ ...blob, syncedAtMs: nowMs }));
+  mirrorInFlight = buildGroupMirrorNow(nowMs).finally(() => {
+    mirrorInFlight = null;
+  });
+  return mirrorInFlight;
+}
+
+async function buildGroupMirrorNow(nowMs: number): Promise<HxCcdGroupMirrorBlob> {
   const empty: HxCcdGroupMirrorBlob = {
     groupingEnabled: false,
     groups: [],
@@ -187,10 +201,10 @@ export async function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorB
   };
 
   let ldbFp: string | null = null;
-  let sessFp = "";
+  let indexVersion = -1;
   try {
-    [ldbFp, sessFp] = await Promise.all([leveldbFingerprint(), ccdSessionsFingerprint()]);
-    if (mirrorCache && mirrorCache.ldbFp === ldbFp && mirrorCache.sessFp === sessFp) {
+    [ldbFp, indexVersion] = await Promise.all([leveldbFingerprint(), refreshCcdIndex(nowMs)]);
+    if (mirrorCache && mirrorCache.ldbFp === ldbFp && mirrorCache.indexVersion === indexVersion) {
       return { ...mirrorCache.blob, syncedAtMs: nowMs };
     }
   } catch {
@@ -209,7 +223,7 @@ export async function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorB
   const enabled = dframe?.groupByByMode?.code === "custom";
   if (!enabled || !Array.isArray(dframe?.customGroups) || dframe.customGroups.length === 0) {
     const blob = { ...empty, unreadIds: (unreadIds ?? []).map(stripCodePrefix) };
-    mirrorCache = { ldbFp, sessFp, blob };
+    mirrorCache = { ldbFp, indexVersion, blob };
     return blob;
   }
 
@@ -243,11 +257,9 @@ export async function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorB
   // so a freshly-stamped session still matches via the ccdSessionId fallback.
   const cliByCcd = new Map<string, string>();
   try {
-    // Cached — but pinned to THIS rebuild's fresh fingerprint: passing sessFp
-    // forces a refresh when the TTL-cached records predate the change that
-    // triggered this rebuild (they'd otherwise be cached under the fresh
-    // fingerprint and never corrected).
-    for (const r of await readCcdRecentsCached(nowMs, sessFp || undefined)) {
+    // The index was refreshed above, so this is the mapping as of
+    // `indexVersion` — exactly what the cache entry below is keyed by.
+    for (const r of await readCcdRecentsCached(nowMs)) {
       if (r.cliSessionId) cliByCcd.set(r.ccdSessionId, r.cliSessionId);
     }
   } catch {
@@ -273,6 +285,6 @@ export async function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorB
     note: `CCD custom grouping: ${groups.length} groups`,
     syncedAtMs: nowMs,
   };
-  mirrorCache = { ldbFp, sessFp, blob };
+  mirrorCache = { ldbFp, indexVersion, blob };
   return blob;
 }

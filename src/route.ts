@@ -9,7 +9,7 @@
 // Discovery is OFF the hot path: results are cached per repo, and when the cloud
 // is unreachable we reuse the last good route rather than blocking an upload.
 
-import { isSecureFetchUrl, assertSecureFetchUrl } from "./net.js";
+import { isSecureFetchUrl, assertSecureFetchUrl, withDeadline } from "./net.js";
 
 export type Route =
   | { mode: "cloud"; attributedOrgIds?: string[] }
@@ -33,6 +33,10 @@ export interface ResolveRouteOpts {
 // Re-resolve a fortress route while it still has comfortably more than this much
 // life left, so the capability token never expires mid-upload.
 const REFRESH_BEFORE_EXPIRY_MS = 5 * 60_000;
+// Discovery is off the hot path and falls back to the last good route on any
+// failure — a stalled gateway must become that fallback quickly, not hold the
+// upload that asked.
+const ROUTE_TIMEOUT_MS = 30_000;
 
 const memo = new Map<string, Route>();
 
@@ -54,11 +58,15 @@ export async function resolveRoute(opts: ResolveRouteOpts): Promise<Route> {
   // a non-loopback host (a downgraded/impersonated gateway URL from config).
   assertSecureFetchUrl(gatewayBaseUrl, "route discovery");
   try {
-    const res = await fetcher(`${gatewayBaseUrl}/route?repo=${encodeURIComponent(repo)}`, {
-      headers: { authorization: `Bearer ${accessToken}` },
+    const route = await withDeadline("route discovery", ROUTE_TIMEOUT_MS, async (signal) => {
+      const res = await fetcher(`${gatewayBaseUrl}/route?repo=${encodeURIComponent(repo)}`, {
+        headers: { authorization: `Bearer ${accessToken}` },
+        signal,
+      });
+      if (!res.ok) return null;
+      return (await res.json()) as Route;
     });
-    if (!res.ok) return cached ?? { mode: "cloud" };
-    const route = (await res.json()) as Route;
+    if (route === null) return cached ?? { mode: "cloud" };
     // A fortress-direct route sends session bytes + a capability token straight
     // to `route.gatewayUrl`. That URL comes from the gateway response, so treat
     // it as untrusted: if it isn't https (loopback http excepted), drop the

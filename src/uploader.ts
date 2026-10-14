@@ -2,12 +2,23 @@
 //   1. POST /sessions/append-url     → { chunkId, uploadUrl }
 //   2. PUT  <uploadUrl> <bytes>          (direct to GCS)
 //   3. POST /sessions/commit         → gateway runs GCS Compose
+//
+// Every call here runs under a deadline (net.ts withDeadline): a peer that
+// accepts the connection and never answers must surface as an error on the
+// file's retry path, not pin an upload worker — and with it the whole pass —
+// for the rest of the daemon's life.
 
 import type { HxConfig } from "./config.js";
 import type { Family } from "./sources.js";
 import type { HxCcdGroupMirrorBlob } from "./mirror-types.js";
 import type { SyncBlockerDetails, SyncBlockerDestination } from "./state.js";
-import { assertSecureFetchUrl } from "./net.js";
+import {
+  GATEWAY_BATCH_TIMEOUT_MS,
+  GATEWAY_TIMEOUT_MS,
+  assertSecureFetchUrl,
+  chunkPutTimeoutMs,
+  withDeadline,
+} from "./net.js";
 
 /** One fan-out target for a chunk. `ready` carries a signed staging URL; `held`
  *  means that org's vault is offline right now — skip it this pass and retry. */
@@ -214,15 +225,18 @@ function dropNulls(o: Record<string, unknown>): Record<string, unknown> {
 // Best-effort: the caller swallows transient failures — the next beat, or any
 // real upload, refreshes lastSeenAt just the same.
 export async function sendHeartbeat(cfg: HxConfig): Promise<void> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/devices/heartbeat`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: "{}",
+  return withDeadline("heartbeat", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/devices/heartbeat`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: "{}",
+      signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`heartbeat failed: ${res.status} ${txt.slice(0, 200)}`);
+    }
   });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`heartbeat failed: ${res.status} ${txt.slice(0, 200)}`);
-  }
 }
 
 /** Catch-up progress the watcher reports as it works through the on-disk
@@ -240,28 +254,34 @@ export interface SyncSnapshot {
 // like the heartbeat — a dropped report just means the bar updates on the next
 // one; the next real upload refreshes liveness regardless.
 export async function sendSyncStatus(cfg: HxConfig, snap: SyncSnapshot): Promise<void> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/devices/sync-status`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify(snap),
+  return withDeadline("sync-status", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/devices/sync-status`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify(snap),
+      signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`sync-status failed: ${res.status} ${txt.slice(0, 200)}`);
+    }
   });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`sync-status failed: ${res.status} ${txt.slice(0, 200)}`);
-  }
 }
 
 export async function requestAppendUrl(
   cfg: HxConfig,
   args: { family: Family; sessionId: string; byteCount: number; repoSlug?: string | null },
 ): Promise<AppendUrlResponse> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/append-url`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify(args),
+  return withDeadline("append-url", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/append-url`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify(args),
+      signal,
+    });
+    if (!res.ok) await throwHttp(res, "append-url");
+    return (await res.json()) as AppendUrlResponse;
   });
-  if (!res.ok) await throwHttp(res, "append-url");
-  return (await res.json()) as AppendUrlResponse;
 }
 
 export async function putChunk(uploadUrl: string, bytes: Buffer): Promise<void> {
@@ -270,12 +290,15 @@ export async function putChunk(uploadUrl: string, bytes: Buffer): Promise<void> 
   // to PUT it over cleartext to a non-loopback host — an impersonated gateway
   // could otherwise redirect an upload to http and exfiltrate transcripts.
   assertSecureFetchUrl(uploadUrl, "PUT chunk");
-  const res = await fetch(uploadUrl, {
-    method: "PUT",
-    headers: { "content-type": "application/x-ndjson" },
-    body: bytes as unknown as BodyInit,
+  return withDeadline("PUT chunk", chunkPutTimeoutMs(bytes.length), async (signal) => {
+    const res = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: { "content-type": "application/x-ndjson" },
+      body: bytes as unknown as BodyInit,
+      signal,
+    });
+    if (!res.ok) await throwHttp(res, "PUT chunk");
   });
-  if (!res.ok) await throwHttp(res, "PUT chunk");
 }
 
 export async function commitChunk(
@@ -306,13 +329,16 @@ export async function commitChunk(
       ? dropNulls(args.meta as unknown as Record<string, unknown>)
       : undefined,
   };
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/commit`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify(body),
+  return withDeadline("commit", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/commit`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) await throwHttp(res, "commit");
+    return (await res.json()) as { ok: true; totalBytes: number; componentCount: number };
   });
-  if (!res.ok) await throwHttp(res, "commit");
-  return (await res.json()) as { ok: true; totalBytes: number; componentCount: number };
 }
 
 /** One session in a reattribute batch: the re-detected slug when the client
@@ -345,13 +371,16 @@ export async function reattributeSessions(
   cfg: HxConfig,
   items: ReattributeItem[],
 ): Promise<{ ok: true; results: ReattributeResult[] }> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/reattribute`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify({ items }),
+  return withDeadline("reattribute", GATEWAY_BATCH_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/reattribute`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify({ items }),
+      signal,
+    });
+    if (!res.ok) await throwHttp(res, "reattribute");
+    return (await res.json()) as { ok: true; results: ReattributeResult[] };
   });
-  if (!res.ok) await throwHttp(res, "reattribute");
-  return (await res.json()) as { ok: true; results: ReattributeResult[] };
 }
 
 /** One session in a title-backfill batch (LETAIR-481): the client's OWN name
@@ -380,13 +409,16 @@ export async function retitleSessions(
   cfg: HxConfig,
   items: RetitleItem[],
 ): Promise<{ ok: true; results: RetitleResult[] }> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/retitle`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify({ items }),
+  return withDeadline("retitle", GATEWAY_BATCH_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/retitle`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify({ items }),
+      signal,
+    });
+    if (!res.ok) await throwHttp(res, "retitle");
+    return (await res.json()) as { ok: true; results: RetitleResult[] };
   });
-  if (!res.ok) await throwHttp(res, "retitle");
-  return (await res.json()) as { ok: true; results: RetitleResult[] };
 }
 
 // ── Child execution lanes (subagents + workflow agents) ────────────────────
@@ -412,13 +444,16 @@ export async function requestAgentAppendUrl(
   cfg: HxConfig,
   args: { family: Family; sessionId: string; agentId: string; byteCount: number },
 ): Promise<AppendUrlResponse> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/agent-append-url`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify(args),
+  return withDeadline("agent-append-url", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/agent-append-url`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify(args),
+      signal,
+    });
+    if (!res.ok) await throwHttp(res, "agent-append-url");
+    return (await res.json()) as AppendUrlResponse;
   });
-  if (!res.ok) await throwHttp(res, "agent-append-url");
-  return (await res.json()) as AppendUrlResponse;
 }
 
 export async function commitAgentChunk(
@@ -447,13 +482,16 @@ export async function commitAgentChunk(
       ? dropNulls(args.meta as unknown as Record<string, unknown>)
       : undefined,
   };
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/agent-commit`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify(body),
+  return withDeadline("agent-commit", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/agent-commit`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) await throwHttp(res, "agent-commit");
+    return (await res.json()) as { ok: true; totalBytes: number; componentCount: number };
   });
-  if (!res.ok) await throwHttp(res, "agent-commit");
-  return (await res.json()) as { ok: true; totalBytes: number; componentCount: number };
 }
 
 /** Workflow-run sidecar: persisted script + journal.jsonl, whole-file,
@@ -469,16 +507,19 @@ export async function uploadWorkflowRun(
     journal?: string | null;
   },
 ): Promise<{ ok: true }> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/workflow`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify(dropNulls(args as unknown as Record<string, unknown>)),
+  return withDeadline("workflow upload", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/workflow`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify(dropNulls(args as unknown as Record<string, unknown>)),
+      signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`workflow upload failed: ${res.status} ${txt.slice(0, 200)}`);
+    }
+    return (await res.json()) as { ok: true };
   });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`workflow upload failed: ${res.status} ${txt.slice(0, 200)}`);
-  }
-  return (await res.json()) as { ok: true };
 }
 
 /** Agent-team mirror — the device's ~/.claude/teams/* configs, rewritten in
@@ -487,16 +528,19 @@ export async function uploadTeamMirror(
   cfg: HxConfig,
   mirror: { teams: Array<{ name: string; config: unknown }>; syncedAtMs?: number | null },
 ): Promise<{ ok: true; teams: number }> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/team-mirror`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify({ mirror }),
+  return withDeadline("team-mirror upload", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/team-mirror`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify({ mirror }),
+      signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`team-mirror upload failed: ${res.status} ${txt.slice(0, 200)}`);
+    }
+    return (await res.json()) as { ok: true; teams: number };
   });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`team-mirror upload failed: ${res.status} ${txt.slice(0, 200)}`);
-  }
-  return (await res.json()) as { ok: true; teams: number };
 }
 
 // ── Canonical divergence audit ──────────────────────────────────────────────
@@ -527,18 +571,21 @@ export interface DeviceInventory {
  */
 export async function fetchDeviceInventory(cfg: HxConfig): Promise<DeviceInventory | null> {
   try {
-    const res = await fetch(`${cfg.gatewayBaseUrl}/devices/inventory`, {
-      headers: authHeaders(cfg),
+    return await withDeadline("inventory", GATEWAY_TIMEOUT_MS, async (signal) => {
+      const res = await fetch(`${cfg.gatewayBaseUrl}/devices/inventory`, {
+        headers: authHeaders(cfg),
+        signal,
+      });
+      if (!res.ok) return null;
+      const json = (await res.json()) as Partial<DeviceInventory>;
+      if (typeof json.sessions !== "number" || typeof json.bytes !== "number") return null;
+      return {
+        sessions: json.sessions,
+        bytes: json.bytes,
+        oldestAt: json.oldestAt ?? null,
+        newestAt: json.newestAt ?? null,
+      };
     });
-    if (!res.ok) return null;
-    const json = (await res.json()) as Partial<DeviceInventory>;
-    if (typeof json.sessions !== "number" || typeof json.bytes !== "number") return null;
-    return {
-      sessions: json.sessions,
-      bytes: json.bytes,
-      oldestAt: json.oldestAt ?? null,
-      newestAt: json.newestAt ?? null,
-    };
   } catch {
     return null;
   }
@@ -565,14 +612,17 @@ export async function verifySessions(
   cfg: HxConfig,
   sessions: VerifySessionsItem[],
 ): Promise<VerifySessionsResult[]> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/verify`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify({ sessions }),
+  return withDeadline("verify", GATEWAY_BATCH_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/verify`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify({ sessions }),
+      signal,
+    });
+    if (!res.ok) await throwHttp(res, "verify");
+    const json = (await res.json()) as { results: VerifySessionsResult[] };
+    return json.results;
   });
-  if (!res.ok) await throwHttp(res, "verify");
-  const json = (await res.json()) as { results: VerifySessionsResult[] };
-  return json.results;
 }
 
 // ── Sidecar artifacts (tasks / plan) ───────────────────────────────────────
@@ -583,32 +633,38 @@ export async function uploadTasks(
   cfg: HxConfig,
   args: { family: Family; sessionId: string; tasks: unknown[] },
 ): Promise<{ ok: true; count: number }> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/tasks`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify(args),
+  return withDeadline("tasks upload", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/tasks`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify(args),
+      signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`tasks upload failed: ${res.status} ${txt.slice(0, 200)}`);
+    }
+    return (await res.json()) as { ok: true; count: number };
   });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`tasks upload failed: ${res.status} ${txt.slice(0, 200)}`);
-  }
-  return (await res.json()) as { ok: true; count: number };
 }
 
 export async function uploadPlan(
   cfg: HxConfig,
   args: { family: Family; sessionId: string; planFilePath: string; content: string },
 ): Promise<{ ok: true }> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/plan`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify(args),
+  return withDeadline("plan upload", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/plan`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify(args),
+      signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`plan upload failed: ${res.status} ${txt.slice(0, 200)}`);
+    }
+    return (await res.json()) as { ok: true };
   });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`plan upload failed: ${res.status} ${txt.slice(0, 200)}`);
-  }
-  return (await res.json()) as { ok: true };
 }
 
 // CCD sidebar group mirror — the device's whole grouping, rewritten in place.
@@ -617,14 +673,17 @@ export async function uploadGroupMirror(
   cfg: HxConfig,
   mirror: HxCcdGroupMirrorBlob,
 ): Promise<{ ok: true; groups: number }> {
-  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/group-mirror`, {
-    method: "POST",
-    headers: authHeaders(cfg),
-    body: JSON.stringify({ mirror }),
+  return withDeadline("group-mirror upload", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/group-mirror`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify({ mirror }),
+      signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`group-mirror upload failed: ${res.status} ${txt.slice(0, 200)}`);
+    }
+    return (await res.json()) as { ok: true; groups: number };
   });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`group-mirror upload failed: ${res.status} ${txt.slice(0, 200)}`);
-  }
-  return (await res.json()) as { ok: true; groups: number };
 }

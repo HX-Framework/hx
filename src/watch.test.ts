@@ -2,6 +2,8 @@ import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import {
   SessionUpstreamUnavailable,
+  WATCHDOG_DEFAULT_MINUTES,
+  WATCHDOG_MIN_MINUTES,
   buildChildParentIndex,
   classifyUpstreamError,
   collectBehind,
@@ -10,8 +12,11 @@ import {
   electChildUploaders,
   planChildLaneResets,
   reconcileChildParent,
+  resolveWatchdogMs,
   snapshotFrom,
+  watchdogVerdict,
 } from "./watch.js";
+import { DEFAULT_SETTINGS, type HxSettings } from "./settings.js";
 import { HxHttpError } from "./uploader.js";
 import type { FileState, HxState } from "./state.js";
 import type { DiscoveredChildFile, DiscoveredFile } from "./sources.js";
@@ -400,5 +405,38 @@ describe("child parent identity", () => {
     });
 
     assert.deepEqual(repaired.offsets, { letai: 42 });
+  });
+});
+
+describe("watchdog", () => {
+  const MIN = 60_000;
+  const settings = (tuning?: Record<string, unknown>): HxSettings => ({ ...DEFAULT_SETTINGS, tuning });
+
+  it("resolves the limit: default, settings, env override, disable, floor", () => {
+    assert.equal(resolveWatchdogMs(settings(), {}), WATCHDOG_DEFAULT_MINUTES * MIN);
+    assert.equal(resolveWatchdogMs(settings({ watchdogMinutes: 15 }), {}), 15 * MIN);
+    assert.equal(resolveWatchdogMs(settings({ watchdogMinutes: 15 }), { HX_WATCHDOG_MINUTES: "4" }), 4 * MIN);
+    assert.equal(resolveWatchdogMs(settings({ watchdogMinutes: 0 }), {}), 0, "0 disables");
+    assert.equal(resolveWatchdogMs(settings(), { HX_WATCHDOG_MINUTES: "0" }), 0, "env 0 disables");
+    assert.equal(resolveWatchdogMs(settings({ watchdogMinutes: 1 }), {}), WATCHDOG_MIN_MINUTES * MIN, "floored");
+    assert.equal(resolveWatchdogMs(settings({ watchdogMinutes: "soon" }), {}), WATCHDOG_DEFAULT_MINUTES * MIN, "garbage → default");
+    assert.equal(resolveWatchdogMs(settings(), { HX_WATCHDOG_MINUTES: " " }), WATCHDOG_DEFAULT_MINUTES * MIN, "blank env ignored");
+  });
+
+  it("fires only for a pass that is both long-running and silent", () => {
+    const limitMs = 10 * MIN;
+    const base = { passBusy: true, passStartedAtMs: 0, lastLogAtMs: 0, limitMs };
+    assert.equal(watchdogVerdict({ ...base, nowMs: 10 * MIN - 1 }).stuck, false, "not yet");
+    assert.equal(watchdogVerdict({ ...base, nowMs: 10 * MIN }).stuck, true, "at the limit");
+    // A long pass that keeps logging (a catch-up uploading chunk after chunk) is healthy.
+    assert.equal(watchdogVerdict({ ...base, lastLogAtMs: 9 * MIN, nowMs: 18 * MIN }).stuck, false);
+    // Silence with no pass running is idleness, not a stall (an offline vault
+    // with every file in backoff logs nothing and completes every pass).
+    assert.equal(watchdogVerdict({ ...base, passBusy: false, nowMs: 60 * MIN }).stuck, false);
+    // Disabled.
+    assert.equal(watchdogVerdict({ ...base, limitMs: 0, nowMs: 60 * MIN }).stuck, false);
+    const v = watchdogVerdict({ ...base, nowMs: 12 * MIN });
+    assert.equal(v.busyForMs, 12 * MIN);
+    assert.equal(v.quietForMs, 12 * MIN);
   });
 });

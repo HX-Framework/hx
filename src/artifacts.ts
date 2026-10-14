@@ -11,6 +11,8 @@
 // callers pass the derived tasks/teams dirs.
 
 import { open, readdir, readFile, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
 import path from "node:path";
 
@@ -137,15 +139,23 @@ export async function readPlanFile(planFilePath: string): Promise<PlanArtifact |
   }
 }
 
-/** Whole-file variant for backfill: scan an entire jsonl for the plan path. */
+/** Whole-file variant for backfill: scan an entire jsonl for the plan path.
+ *  Streamed line by line — transcripts run to hundreds of MB, and the old
+ *  read-it-all-then-split held the file twice over in memory. */
 export async function readPlanForJsonl(jsonlPath: string): Promise<PlanArtifact | null> {
-  let text: string;
+  let planFilePath: string | null = null;
+  const stream = createReadStream(jsonlPath, { encoding: "utf8" });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
   try {
-    text = await readFile(jsonlPath, "utf8");
+    for await (const line of rl) {
+      const found = findPlanPathInText(line);
+      if (found) planFilePath = found;
+    }
   } catch {
     return null;
+  } finally {
+    stream.destroy();
   }
-  const planFilePath = findPlanPathInText(text);
   if (!planFilePath) return null;
   return readPlanFile(planFilePath);
 }
