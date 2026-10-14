@@ -185,6 +185,8 @@ let mirrorInFlight: Promise<HxCcdGroupMirrorBlob> | null = null;
  */
 export function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorBlob> {
   if (mirrorInFlight) return mirrorInFlight.then((blob) => ({ ...blob, syncedAtMs: nowMs }));
+  // Cleared by .finally() on the promise, never inside buildGroupMirrorNow:
+  // see singleFlight in upload-scheduler.ts for why.
   mirrorInFlight = buildGroupMirrorNow(nowMs).finally(() => {
     mirrorInFlight = null;
   });

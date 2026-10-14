@@ -305,6 +305,8 @@ export async function refreshCcdIndex(
     return version;
   }
   const fullStat = opts.force === true || nowMs - lastFullStatAtMs >= CCD_FULL_STAT_INTERVAL_MS;
+  // Cleared by .finally() on the promise, never inside refreshNow: see
+  // singleFlight in upload-scheduler.ts for why.
   refreshInFlight = refreshNow(nowMs, fullStat).finally(() => {
     refreshInFlight = null;
   });
