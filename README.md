@@ -42,7 +42,8 @@ are working in, even when hx itself misbehaves:
 | CPU | `ProcessType` `Background`, `Nice` 10 | `Nice=10`, `CPUWeight=20` | priority 7 (below normal) |
 | Disk I/O | throttled: the `Background` class plus `LowPriorityBackgroundIO` | `IOSchedulingClass=idle` | not set |
 | Restart after a crash | at most once a minute (`ThrottleInterval` 60) | after 60 s (`RestartSec=60`); gives up after 5 starts in 10 minutes | within 5 minutes, by the repeating trigger |
-| Memory | no limit available | `MemoryHigh=1G`, `MemoryMax=2G`, `MemorySwapMax=512M` | no limit available |
+| Memory | none from launchd; hx's [watchdog](#freeze-and-memory-watchdog) kills it above 1536 MB of RSS | `MemoryHigh=1G`, `MemoryMax=2G`, `MemorySwapMax=512M`, and the watchdog | none from Task Scheduler; the watchdog |
+| Stop | SIGKILL 5 s after SIGTERM (`ExitTimeOut` 5) | SIGKILL 5 s after SIGTERM (`TimeoutStopSec=5`) | immediate (`taskkill /F`) |
 
 On Linux, `CPUWeight` and the memory limits are cgroup v2 settings. They only
 take effect when your user manager has the controller: systemd gives it the
@@ -51,6 +52,16 @@ controller is missing, the setting does nothing and the unit still starts.
 `Nice` and `IOSchedulingClass` work in every user unit; the idle I/O class only
 matters with an I/O scheduler that supports priorities, such as BFQ. After the
 unit gives up, `hx start` (or `hx restart`, or `hx update`) brings it back.
+
+**Crash loops.** On every platform hx also spaces out its own restarts when it
+keeps ending abnormally; see [Crash-loop backoff](#crash-loop-backoff).
+
+**Stopping.** A stop sends SIGTERM first. A daemon whose event loop is frozen
+never runs its SIGTERM handler, so launchd and systemd send SIGKILL 5 seconds
+later. `hx stop` and `hx restart` also send it themselves if the daemon is
+still running after 5 seconds, which covers a definition installed before
+these settings, and say so when they had to. The container hook already sends
+SIGKILL after 1.5 seconds.
 
 hx owns the service definition (`~/Library/LaunchAgents/ai.let.hx-vision.plist`,
 `~/.config/systemd/user/hx-vision.service`): `hx start`, `hx restart`, `hx
@@ -207,6 +218,8 @@ The daemon keeps these files in `~/.let/hx/`:
 - `state.json` — per-file byte offset, so a restart doesn't re-upload.
 - `stdout.log`, `stderr.log` — the daemon's output, rotated at 20 MB into
   `.1` and `.2` (see [The background service](#the-background-service)).
+- `watch-run.json`, `watch-exits.json` — the running daemon, and the recent
+  runs that ended abnormally (see [Crash-loop backoff](#crash-loop-backoff)).
 
 ## What it watches
 
@@ -277,6 +290,76 @@ Scheduler, or the container shell hook) starts a fresh process. The limit is
 `0` disables it; positive values below 2 are raised to 2. For a foreground
 `hx watch` the `HX_WATCHDOG_MINUTES` environment variable overrides the
 setting.
+
+The progress watchdog runs on the daemon's event loop, so it cannot fire when
+that loop is frozen. The freeze and memory watchdog below covers that case.
+
+### Freeze and memory watchdog
+
+A second watchdog runs on its own thread, so it keeps working when the
+daemon's event loop does not. The main thread adds 1 to a counter once a
+second; the watchdog thread reads it, and the process RSS, every 250 ms. It
+kills the daemon with SIGKILL when:
+
+- the counter has not moved for `freezeSeconds` (default 60): the event loop
+  is frozen, or
+- the RSS is above `memoryCeilingMb` (default 1536).
+
+SIGKILL because nothing else ends a frozen daemon: its SIGTERM and SIGINT
+handlers are JavaScript, and they never run while the loop is stuck. The
+service manager then starts a fresh daemon, subject to the
+[crash-loop backoff](#crash-loop-backoff).
+
+Both limits live in `~/.let/hx/settings.json`, re-read every 30 seconds:
+
+```json
+{ "tuning": { "freezeSeconds": 60, "memoryCeilingMb": 1536 } }
+```
+
+`0` turns a check off. Positive values below 10 seconds and 512 MB are raised
+to those floors. The memory default is about 1.6 times the highest RSS
+measured for a healthy daemon: 935 MB while re-uploading a 319 MB transcript
+from zero, on a machine with 35,000 Claude Desktop sessions and 19 GB of
+transcripts, where a caught-up daemon levels off at about 920 MB. RSS counts
+shared and file-backed pages too, so it reads higher than the memory
+footprint Activity Monitor shows (577 to 670 MB in the same runs).
+
+A kill writes one line to `~/.let/hx/stderr.log`:
+
+```
+2026-10-14 17:42:03 [hx] watchdog: killing pid 4242 with SIGKILL: the event loop has not run for 60 s (freeze limit 60 s); rss 412 MB
+2026-10-14 17:42:03 [hx] watchdog: killing pid 4242 with SIGKILL: rss 1540 MB is over the memory limit of 1536 MB; the event loop last ran 0 s ago
+```
+
+The next daemon then logs the reason to `~/.let/hx/stdout.log`, which is what
+`hx logs` and the web UI show:
+
+```
+2026-10-14 17:42:13 [hx] warning: the previous run (pid 4242) ended abnormally: killed by the watchdog: the event loop has not run for 60 s (freeze limit 60 s); 1 abnormal exit in the last 30 min
+```
+
+### Crash-loop backoff
+
+An abnormal exit is a daemon run that ended without being told to stop: a
+watchdog kill, a non-zero exit (the progress watchdog's 70 included), a crash,
+or any signal other than the SIGTERM or SIGINT of a stop. Each run records
+itself in `~/.let/hx/watch-run.json`, and the abnormal exits are kept in
+`~/.let/hx/watch-exits.json`. When there were 3 or more in the last 30 minutes,
+the next start waits before its first pass, 1 minute at first and doubling
+with each further abnormal exit, up to 30 minutes, and logs one line:
+
+```
+2026-10-14 17:50:01 [hx] crash loop: 4 abnormal exits in the last 30 min (previous run: killed by the watchdog: rss 1540 MB is over the memory limit of 1536 MB); backing off 2 min before the first pass
+```
+
+Time spent waiting does not count toward the 30 minutes, so a daemon that
+keeps failing stays at one start per half hour until it runs for 30 minutes
+without an abnormal exit. While it waits the daemon makes no gateway calls,
+so the device reads as offline.
+
+A start you ask for begins at once: `hx start`, `hx restart`, `hx update`,
+`hx connect`, `hx retry`, and the web UI's daemon controls clear the history
+first.
 
 ## Develop
 

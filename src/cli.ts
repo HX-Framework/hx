@@ -17,11 +17,15 @@ import {
   getDaemonOps,
   reconcileServiceDefinition,
   startLogRotation,
+  STDERR_LOG,
+  STOP_GRACE_SECONDS,
   tailLogs,
   teeStdioToLogs,
   type DaemonOps,
   type DaemonState,
 } from "./daemon.js";
+import { beginWatchRun, describeWatchRun, hookWatchRunToProcess } from "./crash-loop.js";
+import { resolveWatchdogLimits, startWatchdogThread } from "./watchdog.js";
 import { probeConnection, formatRate } from "./probe.js";
 import { fetchDeviceInventory } from "./uploader.js";
 import { runUpdate, type UpdateProgress, type UpdateResult } from "./update.js";
@@ -425,6 +429,7 @@ async function cmdWatch(): Promise<void> {
   const localCfg = hasFlag("local") ? await ensureLocalConfig() : null;
   const oneShot = process.argv.includes("--once") || process.argv.includes("-1");
   const only = flag("only");
+  if (!oneShot) await prepareLongRunningWatch(stamped(log));
   const [main, local] = await Promise.all([
     startWatch(cfg, { oneShot, only }, stamped(log)),
     localCfg ? startWatch(localCfg, { oneShot, only }, stamped(localLog)) : null,
@@ -443,6 +448,27 @@ async function cmdWatch(): Promise<void> {
       );
     });
   }
+}
+
+// What the long-running loop sets up before its first pass: the run marker and
+// the crash-loop backoff (crash-loop.ts), then the freeze and memory watchdog
+// on its own thread (watchdog.ts). One-shot runs get neither: a person is
+// watching them, and Ctrl-C ends them (they install no SIGINT handler).
+async function prepareLongRunningWatch(out: (msg: string) => void): Promise<void> {
+  // Before startWatch, so its SIGINT/SIGTERM listeners run ahead of the ones
+  // startWatch and cmdWatch add (see hookWatchRunToProcess).
+  const run = beginWatchRun();
+  hookWatchRunToProcess(run);
+  startWatchdogThread({
+    limits: resolveWatchdogLimits(await readSettings()),
+    logPath: STDERR_LOG,
+    marker: run.marker,
+    reloadLimits: async () => resolveWatchdogLimits(await readSettings()),
+    onError: (message) => out(`[hx] watchdog thread failed (${message}); running without it`),
+  });
+  const line = describeWatchRun(run);
+  if (line) out(line);
+  if (run.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, run.delayMs));
 }
 
 async function cmdTick(): Promise<void> {
@@ -1082,9 +1108,10 @@ async function cmdStop(): Promise<void> {
   const ops = getDaemonOps();
   // stop() verifies the service is actually gone (and throws if it survived),
   // so this success line can't lie about a daemon that's still running.
-  const { wasRunning } = await ops.stop();
+  const { wasRunning, forced } = await ops.stop();
   if (wasRunning) {
     log(`hx stopped (${ops.managerName}). Run \`hx start\` to resume.`);
+    if (forced) log(forcedStopNote());
   } else {
     log(`hx is not running — nothing to stop. Run \`hx start\` to start it.`);
   }
@@ -1095,8 +1122,18 @@ async function cmdRestart(): Promise<void> {
   const ops = getDaemonOps();
   const binPath = process.execPath;
   const dotfileConsent = await resolveDotfileConsent(ops);
+  // Stop, then install. Under systemd and the container hook, install() only
+  // starts a service that is not running (or, on systemd, whose unit file
+  // changed), so on its own it left a running or frozen daemon in place.
+  // stop() also kills a daemon that ignores SIGTERM.
+  const { forced } = await ops.stop();
   await ops.install({ binPath, dotfileConsent });
   log(`hx restarted (${ops.managerName}).`);
+  if (forced) log(forcedStopNote());
+}
+
+function forcedStopNote(): string {
+  return `The daemon did not exit within ${STOP_GRACE_SECONDS} s of SIGTERM, so it was killed with SIGKILL.`;
 }
 
 async function cmdLogs(): Promise<void> {

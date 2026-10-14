@@ -2,10 +2,12 @@ import { test, expect, describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  STOP_GRACE_SECONDS,
+  awaitExitOrKill,
   definitionBinPath,
   insertHookBlock,
   parseWinState,
@@ -252,6 +254,12 @@ describe("launchd: plist", () => {
     assert.match(renderPlist(MAC_BIN, MAC_LOGS), /<key>ThrottleInterval<\/key><integer>60<\/integer>/);
   });
 
+  it("sends SIGKILL 5 s after the SIGTERM of a stop", () => {
+    // A frozen daemon never runs its JavaScript SIGTERM handler; launchd's
+    // default wait is system-defined.
+    assert.match(renderPlist(MAC_BIN, MAC_LOGS), /<key>ExitTimeOut<\/key><integer>5<\/integer>/);
+  });
+
   it("says that hx owns the file, in a comment plist parsers skip", () => {
     const plist = renderPlist(MAC_BIN, MAC_LOGS);
     const open = plist.indexOf("<!--");
@@ -281,6 +289,7 @@ describe("launchd: plist", () => {
       assert.equal(parsed.LowPriorityBackgroundIO, true);
       assert.equal(parsed.Nice, 10);
       assert.equal(parsed.ThrottleInterval, 60);
+      assert.equal(parsed.ExitTimeOut, STOP_GRACE_SECONDS);
       assert.deepEqual(parsed.ProgramArguments, [MAC_BIN, "watch"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -291,6 +300,11 @@ describe("launchd: plist", () => {
 describe("systemd: unit", () => {
   it("matches the snapshot", () => {
     expect(renderSystemdUnit(LINUX_BIN, LINUX_LOGS)).toMatchSnapshot();
+  });
+
+  it("sends SIGKILL 5 s after the SIGTERM of a stop, not systemd's default 90 s", () => {
+    const service = unitSection(renderSystemdUnit(LINUX_BIN, LINUX_LOGS), "Service");
+    assert.ok(service.includes(`TimeoutStopSec=${STOP_GRACE_SECONDS}`));
   });
 
   it("lowers CPU and I/O priority", () => {
@@ -487,4 +501,75 @@ describe("reloadedRecently", () => {
     assert.equal(reloadedRecently("{not json", next, now), false);
     assert.equal(reloadedRecently(marker(next, now + 60_000), next, now), false);
   });
+});
+
+describe("stopping a daemon that ignores SIGTERM", () => {
+  it("awaitExitOrKill waits for an exit, and sends SIGKILL only after the grace", () => {
+    let t = 0;
+    let aliveUntil = 0;
+    const killed: number[] = [];
+    const deps = {
+      alive: () => t < aliveUntil,
+      kill: (pid: number) => {
+        killed.push(pid);
+        aliveUntil = t;
+      },
+      sleep: (ms: number) => {
+        t += ms;
+      },
+      now: () => t,
+    };
+    aliveUntil = 300; // exits on its own, as a healthy daemon does on SIGTERM
+    assert.equal(awaitExitOrKill(11, 5_000, deps), false);
+    assert.deepEqual(killed, []);
+
+    t = 0;
+    aliveUntil = Infinity; // never exits: the frozen daemon
+    assert.equal(awaitExitOrKill(12, 5_000, deps), true);
+    assert.deepEqual(killed, [12]);
+    assert.ok(t >= 5_000 && t < 5_200, `killed at ${t} ms`);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "awaitExitOrKill ends a real process that ignores SIGTERM, and leaves alone one that exits",
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), "hx-stop-"));
+      try {
+        // Launched through sh so the process is not this test's child, as the
+        // daemon is launchd's or systemd's child and never the CLI's.
+        const launch = (name: string, script: string): number => {
+          const ready = join(dir, name);
+          const code = `${script}; require("node:fs").writeFileSync(${JSON.stringify(ready)}, ""); setTimeout(() => {}, 30000);`;
+          const r = spawnSync("sh", ["-c", `"$0" -e '${code}' >/dev/null 2>&1 & echo $!`, process.execPath]);
+          const pid = Number(r.stdout.toString().trim());
+          const deadline = Date.now() + 10_000;
+          // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own tmp dir
+          while (!existsSync(ready) && Date.now() < deadline) Bun.sleepSync(20);
+          // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own tmp dir
+          assert.ok(existsSync(ready), `${name} never started`);
+          return pid;
+        };
+        // Liveness from ps, where a zombie (an exited process its new parent
+        // has not reaped yet) reads as gone; kill(pid, 0) still finds one.
+        const alive = (pid: number): boolean => {
+          const stat = spawnSync("ps", ["-o", "stat=", "-p", String(pid)]).stdout.toString().trim();
+          return stat !== "" && !stat.startsWith("Z");
+        };
+        const deps = { alive, kill: (pid: number) => process.kill(pid, "SIGKILL"), sleep: Bun.sleepSync, now: Date.now };
+
+        const stubborn = launch("stubborn", `process.on("SIGTERM", () => {})`);
+        process.kill(stubborn, "SIGTERM");
+        assert.equal(awaitExitOrKill(stubborn, 500, deps), true, "needed SIGKILL");
+        assert.equal(alive(stubborn), false);
+
+        const polite = launch("polite", "void 0");
+        process.kill(polite, "SIGTERM");
+        assert.equal(awaitExitOrKill(polite, 5_000, deps), false, "exited on SIGTERM");
+        assert.equal(alive(polite), false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 });
