@@ -6,12 +6,14 @@ import assert from "node:assert/strict";
 import {
   closeSync,
   existsSync,
+  fstatSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  readSync,
+  renameSync,
   rmSync,
   statSync,
-  unlinkSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -99,12 +101,15 @@ describe("rotateLogFile", () => {
   it.skipIf(process.platform === "win32")(
     "lets an O_APPEND writer keep writing, from offset 0, with no hole",
     () => {
-      const fd = openSync(log, "a");
+      // "a+": append like the service manager's descriptor, and read the
+      // result back through it rather than by path.
+      const fd = openSync(log, "a+");
       try {
         writeSync(fd, lines(0, 100));
         assert.equal(rotateLogFile(log, 1000, 2), true);
         writeSync(fd, "after rotation\n");
-        const live = readFileSync(log);
+        const live = Buffer.alloc(fstatSync(fd).size);
+        readSync(fd, live, 0, live.length, 0);
         assert.equal(live.toString("utf8"), "after rotation\n");
         assert.equal(live.includes(0), false, "no NUL bytes from a stale write offset");
       } finally {
@@ -154,15 +159,16 @@ describe("fdWritesFile", () => {
     }
   });
 
-  // A deleted-and-recreated log is a different file: rotating it would leave
-  // the one actually being written to grow unchecked. Windows will not delete
-  // a file that is open, so this case cannot arise there.
+  // A log replaced under the descriptor is a different file: rotating it would
+  // leave the one actually being written to grow unchecked. Windows will not
+  // replace a file that is open, so this case cannot arise there.
   it.skipIf(process.platform === "win32")("does not match a log replaced under the descriptor", () => {
     writeFileSync(log, "");
     const fd = openSync(log, "a");
     try {
-      unlinkSync(log);
-      writeFileSync(log, "");
+      const replacement = join(dir, "replacement.log");
+      writeFileSync(replacement, "");
+      renameSync(replacement, log);
       assert.equal(fdWritesFile(fd, log), false);
     } finally {
       closeSync(fd);

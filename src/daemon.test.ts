@@ -254,9 +254,12 @@ describe("launchd: plist", () => {
 
   it("says that hx owns the file, in a comment plist parsers skip", () => {
     const plist = renderPlist(MAC_BIN, MAC_LOGS);
-    assert.match(plist, /^<!-- Managed by hx\. .* -->$/m);
+    const open = plist.indexOf("<!--");
+    const close = plist.indexOf("-->", open);
+    assert.ok(open !== -1 && close !== -1, "the plist has a comment");
+    const comment = plist.slice(open + "<!--".length, close);
+    assert.ok(comment.trim().startsWith("Managed by hx."));
     // An XML comment may not contain "--".
-    const comment = plist.match(/<!--(.*)-->/)?.[1] ?? "";
     assert.ok(!comment.includes("--"));
   });
 
