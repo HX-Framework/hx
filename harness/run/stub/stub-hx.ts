@@ -1,8 +1,11 @@
 // A stand-in for the hx binary, for the driver's own unit test: prints a
-// version, talks to the gateway named in ~/.let/hx/config.json the way hx
-// does for one session, and writes a state file. STUB_VARIANT=broken makes
-// it store one byte less, so the comparators have something to catch.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+// version, talks to the gateway the driver names in HX_HARNESS_GATEWAY_URL
+// the way hx does for one session (hx itself reads the gateway from
+// ~/.let/hx/config.json; the stub takes it from the environment so no file
+// contents flow into a request), and writes a state file.
+// STUB_VARIANT=broken makes it store one byte less, so the comparators have
+// something to catch.
+import { writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -15,7 +18,11 @@ if (cmd === "--version") {
   say("hx version: 0.0.1");
   process.exit(0);
 }
-const cfg = JSON.parse(readFileSync(join(hxDir, "config.json"), "utf8")) as { gatewayBaseUrl: string; accessToken: string };
+const cfg = { gatewayBaseUrl: process.env.HX_HARNESS_GATEWAY_URL ?? "", accessToken: process.env.HX_HARNESS_ACCESS_TOKEN ?? "" };
+if (!cfg.gatewayBaseUrl) {
+  say("Not connected. Run `hx connect` first.");
+  process.exit(2);
+}
 const auth = { authorization: `Bearer ${cfg.accessToken}`, "content-type": "application/json" };
 if (cmd === "status") {
   const who = await fetch(`${cfg.gatewayBaseUrl}/whoami`, { headers: auth });

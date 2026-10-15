@@ -76,9 +76,11 @@ jobs:
       - name: Resolve the reference commit
         id: lock
         shell: bash
+        env:
+          REFERENCE_REF: ${{ github.event.inputs.reference_ref }}
         run: |
           set -euo pipefail
-          ref="${{ github.event.inputs.reference_ref }}"
+          ref="$REFERENCE_REF"
           if [ -z "$ref" ]; then
             ref="$(node -e 'console.log(require("./harness/reference.lock.json").commit)')"
           fi
@@ -122,22 +124,28 @@ jobs:
       - name: Pick the candidate source
         id: pick
         shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          URL_LINUX: ${{ github.event.inputs.candidate_url_linux }}
+          URL_MACOS: ${{ github.event.inputs.candidate_url_macos }}
         run: |
           set -euo pipefail
           url=""
-          case "${{ matrix.os }}" in
-            ubuntu-latest) url="${{ github.event.inputs.candidate_url_linux }}" ;;
-            macos-latest)  url="${{ github.event.inputs.candidate_url_macos }}" ;;
+          case "$MATRIX_OS" in
+            ubuntu-latest) url="$URL_LINUX" ;;
+            macos-latest)  url="$URL_MACOS" ;;
           esac
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
       - name: Download the candidate binary
         if: steps.pick.outputs.url != ''
         shell: bash
+        env:
+          CANDIDATE_URL: ${{ steps.pick.outputs.url }}
         run: |
           set -euo pipefail
           mkdir -p bin
-          curl -fsSL "${{ steps.pick.outputs.url }}" -o bin/candidate.gz
+          curl -fsSL "$CANDIDATE_URL" -o bin/candidate.gz
           gunzip -c bin/candidate.gz > bin/hx
           rm bin/candidate.gz
           chmod +x bin/hx
@@ -168,7 +176,9 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
 
       - name: Break it
-        run: git apply --verbose "harness/broken/${{ matrix.patch }}.patch"
+        env:
+          PATCH: ${{ matrix.patch }}
+        run: git apply --verbose "harness/broken/$PATCH.patch"
 
       - name: Build
         run: bash harness/ci/build.sh "$PWD" "$PWD/bin/hx"
@@ -252,6 +262,8 @@ jobs:
 
       - name: Run the harness
         shell: bash
+        env:
+          RUNNER_OS_NAME: ${{ runner.os }}
         run: |
           set -euo pipefail
           chmod +x bin/reference/hx bin/candidate/hx
@@ -259,7 +271,7 @@ jobs:
             --reference bin/reference/hx \
             --candidate bin/candidate/hx --candidate-name "$CANDIDATE_NAME" \
             --scenarios "$SCENARIOS" --out .harness-out --work "$RUNNER_TEMP/hx-harness" \
-            --goldens "harness/golden/${{ runner.os }}" --write-goldens ".harness-out/goldens/${{ runner.os }}"
+            --goldens "harness/golden/$RUNNER_OS_NAME" --write-goldens ".harness-out/goldens/$RUNNER_OS_NAME"
 
       - name: Report
         if: always()
