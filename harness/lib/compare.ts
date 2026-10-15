@@ -10,8 +10,13 @@
 //   state.json        normalized, timestamps run-relative with a tolerance
 //   activity.jsonl    multiset of entries, timestamps dropped, count kept
 //   CLI steps         exit code, normalized stdout and stderr (sorted lines
-//                     where the step says so)
+//                     where the step says so; the DISTINCT lines for a
+//                     long-running daemon step, whose repetition counts are
+//                     cadence)
 //   hx ui             each probe's status and normalized JSON body
+//   ccd-index.json    the saved Claude Desktop index, normalized, when the
+//                     reference writes one (a candidate may not drop it)
+//   state journal     empty or absent at the end of every run
 //   expectations      facts the fixture manifest promises (the group mirror)
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -159,9 +164,10 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   }
 
   // Requests.
+  const daemonSteps = new Set(opts.scenario.steps.filter((s) => s.kind === "watch-for").map((s) => s.name));
   if (opts.scenario.compare.requests === "per-session") {
-    checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "gateway.jsonl", "requests"));
-    if (ref.meta.fortressUrl) checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "fortress.jsonl", "fortress requests"));
+    checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "gateway.jsonl", "requests", daemonSteps));
+    if (ref.meta.fortressUrl) checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "fortress.jsonl", "fortress requests", daemonSteps));
   } else {
     checks.push({ name: "requests", ok: true, details: "end-state scenario: request sequences not compared" });
   }
@@ -206,6 +212,36 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     checks.push(check(f, deepDiff(normalizeJson(a, ctxRef), normalizeJson(b, ctxCand), tolS), "identical"));
   }
 
+  // The saved Claude Desktop index (ccd-index.json, since 77.12). A client
+  // that predates it writes none; a client that has it must write what the
+  // reference writes. So: both absent is fine, a reference without one says
+  // nothing about the candidate, a candidate without one while the reference
+  // wrote it is a dropped file.
+  {
+    const a = readJsonFile(join(ref.dir, "ccd-index.json"));
+    const b = readJsonFile(join(cand.dir, "ccd-index.json"));
+    if (a === null && b === null) checks.push({ name: "ccd-index.json", ok: true, details: "neither run wrote one (no Claude Desktop store on this platform, or a client that predates the saved index)" });
+    else if (a === null) checks.push({ name: "ccd-index.json", ok: true, details: "the reference predates the saved index; the candidate's is not compared" });
+    else if (b === null) checks.push({ name: "ccd-index.json", ok: false, details: "the reference wrote ccd-index.json and the candidate did not" });
+    else checks.push(check("ccd-index.json", deepDiff(normalizeJson(a, ctxRef), normalizeJson(b, ctxCand), tolS), "identical after normalization"));
+  }
+
+  // The offsets journal (state.journal.jsonl, since 77.12) is folded into
+  // state.json at every exit that is not a kill, so a run must end with it
+  // empty or absent — otherwise the compared state.json is stale, and so is
+  // every reader that does not replay it.
+  for (const run of [ref, cand]) {
+    const who = run === ref ? "reference" : "candidate";
+    const lines: string[] = [];
+    for (const f of ["state.journal.jsonl", "state.local.journal.jsonl"]) {
+      const p = join(run.dir, f);
+      if (!existsSync(p)) continue;
+      const n = readFileSync(p, "utf8").split("\n").filter((l) => l.trim()).length;
+      if (n > 0) lines.push(`${f}: ${n} line${n === 1 ? "" : "s"} left unfolded`);
+    }
+    checks.push(check(`${who} state journal folded`, lines, "empty or absent at the end of the run"));
+  }
+
   // CLI steps and UI probes.
   for (const step of opts.scenario.steps) {
     const rs = ref.meta.steps.find((s) => s.name === step.name);
@@ -218,8 +254,8 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
       const codeOk = rs.exitCode === cs.exitCode && rs.signal === cs.signal;
       const sortLines = step.kind === "run" ? step.sortLines === true : true;
       // A long-running daemon logs on its own clock: how many ticks it ran,
-      // how many times a backoff line repeated, is cadence. Its output is
-      // compared as the SET of distinct lines.
+      // how many times a backoff line or a refused retry repeated, is cadence.
+      // Its output is compared as the SET of distinct lines.
       const distinct = step.kind === "watch-for";
       const a = normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stdout`)), ctxRef);
       const b = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stdout`)), ctxCand);
@@ -360,7 +396,7 @@ function normalizeRequest(r: RecordedRequest, ctx: NormalizeContext): Normalized
   };
 }
 
-function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ctxCand: NormalizeContext, tolS: number, file: string, label: string): CheckResult[] {
+function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ctxCand: NormalizeContext, tolS: number, file: string, label: string, daemonSteps: Set<string> = new Set()): CheckResult[] {
   const ra = readJsonl<RecordedRequest>(join(ref.dir, file));
   const rb = readJsonl<RecordedRequest>(join(cand.dir, file));
   const fortress = file === "fortress.jsonl";
@@ -374,12 +410,17 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
     const a = slice(ra, sa);
     const b = slice(rb, sb);
     const diffs: string[] = [];
+    const daemon = daemonSteps.has(sa.name);
 
-    // Per-session sequences.
+    // Per-session sequences. In a long-running daemon step a REFUSED workflow
+    // upload (5xx) leaves the sequence: since 77.12 the client retries it on
+    // a backoff, so how many attempts a run has time for is timing. The first
+    // refusal is the fact, compared as presence per run below.
+    const refusedWorkflow = (r: RecordedRequest): boolean => daemon && r.path === "/sessions/workflow" && r.status >= 500;
     const bySession = (rs: RecordedRequest[], ctx: NormalizeContext): Map<string, NormalizedRequest[]> => {
       const m = new Map<string, NormalizedRequest[]>();
       for (const r of rs) {
-        if (!r.sessionKey) continue;
+        if (!r.sessionKey || refusedWorkflow(r)) continue;
         const key = r.lane ? `${r.sessionKey}/${r.lane}` : r.sessionKey;
         const list = m.get(key) ?? [];
         list.push(normalizeRequest(r, ctx));
@@ -395,6 +436,15 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
       const d = deepDiff(la, lb, tolS, key, [], 8);
       for (const x of d) diffs.push(`${x.path}: ${x.left} ≠ ${x.right}`);
       if (diffs.length > 40) break;
+    }
+    if (daemon) {
+      const refusedRuns = (rs: RecordedRequest[]): Set<string> =>
+        new Set(rs.filter(refusedWorkflow).map((r) => `${r.sessionKey}:wf:${String((r.body as { runId?: unknown } | undefined)?.runId ?? "?")} (refused ${r.status})`));
+      const fa = refusedRuns(a);
+      const fb = refusedRuns(b);
+      for (const k of new Set([...fa, ...fb])) {
+        if (fa.has(k) !== fb.has(k)) diffs.push(`${k}: refused in ${fa.has(k) ? "reference" : "candidate"} only`);
+      }
     }
 
     // Requests that belong to no session, per endpoint. During an outage the
