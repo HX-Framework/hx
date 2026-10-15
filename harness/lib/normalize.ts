@@ -76,6 +76,9 @@ export function normalizeText(input: string, ctx: NormalizeContext): string {
   s = s.replace(/\b\d{1,2}:\d{2}:\d{2} [AP]M\b/g, "<local-time>");
   // hx status: the connection probe.
   s = s.replace(/up — (?:Excellent|Good|Fair|Poor) \(\d+ ms, [^)]*\)/g, "up — <quality> (<latency>, <rate>)");
+  // Which file the client tried first against a refusing gateway follows
+  // discovery order; the refusal itself is the fact.
+  s = s.replace(/\[error\] \S+\.jsonl: ([a-z-]+(?: [a-z-]+)* failed: 5\d\d\b)/g, "[error] <a transcript>: $1");
   // Daemon pids, launch tokens, session tokens, sha prefixes.
   s = s.replace(/\bpid \d+/g, "pid <n>");
   s = s.replace(/#k=[A-Za-z0-9_-]+/g, "#k=<token>");

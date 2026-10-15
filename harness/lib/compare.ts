@@ -236,9 +236,11 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
       const lines = [...(codeOk ? [] : [`exit: ${rs.exitCode ?? rs.signal} ≠ ${cs.exitCode ?? cs.signal}`]), ...outDiff];
       checks.push(check(`step ${step.name}`, lines, `exit ${rs.exitCode ?? rs.signal}, output identical`));
     } else if (step.kind === "ui") {
-      const a = readJsonFile(join(ref.dir, "steps", `${stepFile(rs)}.json`));
-      const b = readJsonFile(join(cand.dir, "steps", `${stepFile(cs)}.json`));
-      checks.push(check(`step ${step.name}`, deepDiff(normalizeJson(a, ctxRef, { sortObjectArrays: true }), normalizeJson(b, ctxCand, { sortObjectArrays: true }), tolS), "every probe identical"));
+      // The probe list keeps the driver's order; only the tie-prone lists
+      // inside each probe's body are compared as sets.
+      const a = normalizeProbes(readJsonFile(join(ref.dir, "steps", `${stepFile(rs)}.json`)), ctxRef);
+      const b = normalizeProbes(readJsonFile(join(cand.dir, "steps", `${stepFile(cs)}.json`)), ctxCand);
+      checks.push(check(`step ${step.name}`, deepDiff(a, b, tolS), "every probe identical"));
     }
   }
 
@@ -251,6 +253,25 @@ function stepFile(s: StepRecord): string {
 
 function readText(p: string): string {
   return existsSync(p) ? readFileSync(p, "utf8") : "";
+}
+
+interface ProbeFile {
+  launchUrl?: string;
+  probes?: Array<{ name: string; method: string; path: string; status: number; body: unknown }>;
+}
+
+function normalizeProbes(v: unknown, ctx: NormalizeContext): unknown {
+  const file = (v ?? {}) as ProbeFile;
+  return {
+    launchUrl: typeof file.launchUrl === "string" ? normalizeText(file.launchUrl, ctx) : null,
+    probes: (file.probes ?? []).map((p) => ({
+      name: p.name,
+      method: p.method,
+      path: normalizeText(p.path, ctx),
+      status: p.status,
+      body: normalizeJson(p.body, ctx, { sortObjectArrays: true }),
+    })),
+  };
 }
 
 function parseJsonOrNull(s: string): unknown {
@@ -370,12 +391,16 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
       if (diffs.length > 40) break;
     }
 
-    // Requests that belong to no session, per endpoint.
+    // Requests that belong to no session, per endpoint. During an outage the
+    // gateway refuses before it can tell which session a request names, and
+    // which files the client tried before pausing follows discovery order:
+    // refused calls are counted per endpoint, not compared one by one.
     const byPath = (rs: RecordedRequest[], ctx: NormalizeContext): Map<string, NormalizedRequest[]> => {
       const m = new Map<string, NormalizedRequest[]>();
       for (const r of rs) {
         if (r.sessionKey) continue;
-        const key = `${r.method} ${normalizeText(r.path, ctx)}${r.query ? `?${normalizeText(r.query, ctx)}` : ""}`;
+        const refused = r.status >= 500;
+        const key = `${r.method} ${normalizeText(r.path, ctx)}${r.query && !refused ? `?${normalizeText(r.query, ctx)}` : ""}${refused ? ` (refused ${r.status})` : ""}`;
         const list = m.get(key) ?? [];
         list.push(normalizeRequest(r, ctx));
         m.set(key, list);
@@ -388,6 +413,10 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
       const la = pa.get(key) ?? [];
       const lb = pb.get(key) ?? [];
       const path = key.split(" ")[1]!.split("?")[0]!;
+      if (key.includes(" (refused ")) {
+        if (la.length !== lb.length) diffs.push(`${key}: ${la.length} ≠ ${lb.length} attempts`);
+        continue;
+      }
       if (path === "/devices/heartbeat") {
         // Sent only when nothing reached the gateway for 60 s: a timing fact.
         if ((la.length > 0) !== (lb.length > 0)) diffs.push(`${key}: present in ${la.length > 0 ? "reference" : "candidate"} only`);
