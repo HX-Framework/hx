@@ -1,0 +1,10 @@
+--- a/src/watch.ts
++++ b/src/watch.ts
+@@ -850,7 +850,6 @@
+             meta: {
+               sourcePath: file.path,
+               title,
+-              titleSource,
+               ccdSessionId: ccdMeta?.ccdSessionId ?? undefined,
+               // cwd doubles as attribution EVIDENCE the gateway now persists
+               // (org rules match on it); evidenceUpload:false withholds it for

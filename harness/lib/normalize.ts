@@ -1,0 +1,127 @@
+// Normalization: what two runs are allowed to differ in before they are
+// compared.
+//
+// The rules are deliberately few and each one names the thing it hides:
+//
+//   • the candidate's name — hx2 prints `hx2` wherever hx prints `hx`, in its
+//     output, its User-Agent and its release asset names. This is the ONE
+//     allowed behavioral difference between the two binaries (the program
+//     doc, "What exactly the same means", row 5), so it is a rule here and
+//     not a diff;
+//   • the version string each binary reports — a candidate built from a
+//     later commit carries a later version;
+//   • wall-clock time — timestamps that fall inside the run's window become
+//     seconds relative to an anchor and compare with a tolerance; timestamps
+//     outside it (the fixed content timestamps inside transcripts) are kept
+//     and compared exactly;
+//   • the probe `hx status` runs — latency, throughput and the grade they
+//     earn vary with the machine, not the binary;
+//   • paths and ports that name the run itself — the fixture home, the
+//     harness work directory, the gateway's port, a UI port, a pid, a launch
+//     token.
+//
+// In "golden" mode (comparing a run against a committed expectation that may
+// be months old) calendar dates are hidden too.
+
+export interface NormalizeContext {
+  candidateName: "hx" | "hx2";
+  /** Version strings reported by the binaries in this comparison. */
+  versions: string[];
+  home: string;
+  workDir: string;
+  gatewayUrl: string;
+  fortressUrl: string | null;
+  /** Timestamps in [anchorMs - windowBeforeMs, anchorMs + windowAfterMs] are run-relative. */
+  anchorMs: number;
+  windowBeforeMs: number;
+  windowAfterMs: number;
+  mode: "diff" | "golden";
+}
+
+export const DEFAULT_WINDOW_BEFORE_MS = 45 * 24 * 60 * 60 * 1000;
+export const DEFAULT_WINDOW_AFTER_MS = 2 * 24 * 60 * 60 * 1000;
+
+const ISO_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z/g;
+const LOCAL_STAMP_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} /gm;
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function inWindow(ms: number, ctx: NormalizeContext): boolean {
+  return ms >= ctx.anchorMs - ctx.windowBeforeMs && ms <= ctx.anchorMs + ctx.windowAfterMs;
+}
+
+export function normalizeText(input: string, ctx: NormalizeContext): string {
+  let s = input;
+  if (ctx.candidateName === "hx2") s = s.replace(/\bhx2\b/g, "hx");
+  for (const v of ctx.versions) {
+    if (v) s = s.replace(new RegExp(escapeRe(v), "g"), "<version>");
+  }
+  if (ctx.fortressUrl) s = s.split(ctx.fortressUrl).join("<FORTRESS>");
+  s = s.split(ctx.gatewayUrl).join("<GATEWAY>");
+  s = s.replace(/https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/g, "<LOCAL-URL>");
+  s = s.replace(/\b(?:127\.0\.0\.1|localhost):\d+/g, "<host:port>");
+  s = s.split(ctx.home).join("<HOME>");
+  s = s.split(ctx.workDir).join("<WORK>");
+  // Text has no tolerance, so a timestamp inside the window becomes a bare
+  // placeholder; JSON timestamps keep their offset and a tolerance (below).
+  s = s.replace(ISO_RE, (m) => {
+    const ms = Date.parse(m);
+    return Number.isFinite(ms) && inWindow(ms, ctx) ? "<t>" : m;
+  });
+  s = s.replace(LOCAL_STAMP_RE, "<stamp> ");
+  // toLocaleString() / toLocaleTimeString() under en-US: "10/15/2026, 9:12:34 PM", "9:12:34 PM".
+  s = s.replace(/\b\d{1,2}\/\d{1,2}\/\d{4}, \d{1,2}:\d{2}:\d{2} [AP]M\b/g, "<local-datetime>");
+  s = s.replace(/\b\d{1,2}:\d{2}:\d{2} [AP]M\b/g, "<local-time>");
+  // hx status: the connection probe.
+  s = s.replace(/up — (?:Excellent|Good|Fair|Poor) \(\d+ ms, [^)]*\)/g, "up — <quality> (<latency>, <rate>)");
+  // Daemon pids, launch tokens, session tokens, sha prefixes.
+  s = s.replace(/\bpid \d+/g, "pid <n>");
+  s = s.replace(/#k=[A-Za-z0-9_-]+/g, "#k=<token>");
+  s = s.replace(/sha256 [0-9a-f]{12}…/g, "sha256 <sha>…");
+  if (ctx.mode === "golden") {
+    s = s.replace(/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}(?:, \d{4})?\b/g, "<date>");
+    s = s.replace(/\b\d{4}-\d{2}-\d{2}\b/g, "<date>");
+  }
+  return s;
+}
+
+/** A run-relative timestamp, carried through JSON as its own object. */
+export interface RelTime {
+  $t: number;
+}
+
+export function isRelTime(v: unknown): v is RelTime {
+  return typeof v === "object" && v !== null && "$t" in v && Object.keys(v).length === 1;
+}
+
+/**
+ * Normalize a JSON value: strings through normalizeText, epoch-millisecond
+ * numbers inside the window into run-relative seconds, object keys sorted.
+ */
+export function normalizeJson(value: unknown, ctx: NormalizeContext): unknown {
+  if (typeof value === "string") return normalizeText(value, ctx);
+  if (typeof value === "number") {
+    if (Number.isFinite(value) && value > 1e12 && value < 4e12 && inWindow(value, ctx)) {
+      return ctx.mode === "golden" ? "<t>" : { $t: Math.round((value - ctx.anchorMs) / 1000) };
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((v) => normalizeJson(v, ctx));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      const nk = normalizeText(k, ctx);
+      out[nk] = normalizeJson((value as Record<string, unknown>)[k], ctx);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Top-level key order of an object, before any sorting — a soft check. */
+export function keyOrderOf(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.keys(value as Record<string, unknown>);
+}

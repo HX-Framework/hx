@@ -1,0 +1,11 @@
+--- a/src/watch.ts
++++ b/src/watch.ts
+@@ -446,7 +446,7 @@
+ function trimAtLastNewline(buf: Buffer, startOffset: number): { trimmed: Buffer; endOffset: number } {
+   const lastNl = buf.lastIndexOf(0x0a);
+   if (lastNl < 0) return { trimmed: buf, endOffset: startOffset + buf.length };
+-  return { trimmed: buf.subarray(0, lastNl + 1), endOffset: startOffset + lastNl + 1 };
++  return { trimmed: buf.subarray(0, lastNl), endOffset: startOffset + lastNl + 1 };
+ }
+ 
+ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise<FileState> {
