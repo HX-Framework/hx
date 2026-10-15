@@ -5,17 +5,23 @@ import {
   WATCHDOG_DEFAULT_MINUTES,
   WATCHDOG_MIN_MINUTES,
   buildChildParentIndex,
+  childNeedsPass,
   classifyUpstreamError,
   collectBehind,
   collectSkipped,
   contestedChildLanes,
   electChildUploaders,
+  logStuck,
   planChildLaneResets,
+  planWorkflowSync,
   reconcileChildParent,
+  resetStuckLogForTests,
   resolveWatchdogMs,
   snapshotFrom,
   watchdogVerdict,
+  workflowLaneAfterFailure,
 } from "./watch.js";
+import { FILE_BACKOFF_CAP_MS } from "./state.js";
 import { DEFAULT_SETTINGS, type HxSettings } from "./settings.js";
 import { HxHttpError } from "./uploader.js";
 import type { FileState, HxState } from "./state.js";
@@ -438,5 +444,95 @@ describe("watchdog", () => {
     const v = watchdogVerdict({ ...base, nowMs: 12 * MIN });
     assert.equal(v.busyForMs, 12 * MIN);
     assert.equal(v.quietForMs, 12 * MIN);
+  });
+});
+
+// The stuck line's dedupe key names the KIND of reason; the numbers in the
+// message (a countdown, a failure count) are not part of it. With the
+// countdown in the key the line repeated every minute per stuck file — about
+// 90% of a 443 MB stdout.log over one vault outage.
+describe("logStuck", () => {
+  const MIN = 60_000;
+  it("logs a kind of reason once per interval however its numbers change, and a new kind at once", () => {
+    resetStuckLogForTests();
+    const lines: string[] = [];
+    const log = (m: string): void => {
+      lines.push(m);
+    };
+    logStuck("/a", "backoff:vault_offline", "waiting out a retry backoff for another 1 min (1 consecutive failures, vault_offline)", log, 0);
+    logStuck("/a", "backoff:vault_offline", "waiting out a retry backoff for another 0 min (1 consecutive failures, vault_offline)", log, 40_000);
+    logStuck("/a", "backoff:vault_offline", "waiting out a retry backoff for another 1 min (2 consecutive failures, vault_offline)", log, 2 * MIN);
+    assert.equal(lines.length, 1, "the countdown and the failure count do not re-log");
+    logStuck("/a", "deleted", "session was permanently deleted on the server — it will never upload again", log, 2 * MIN + 1);
+    assert.equal(lines.length, 2, "a change of kind is reported at once");
+    logStuck("/b", "backoff:", "waiting out a retry backoff for another 3 min (1 consecutive failures)", log, 2 * MIN + 2);
+    assert.equal(lines.length, 3, "another file has its own key");
+    logStuck("/b", "backoff:", "waiting out a retry backoff for another 0 min (4 consecutive failures)", log, 2 * MIN + 2 + 30 * MIN);
+    assert.equal(lines.length, 4, "the same kind repeats once the interval has passed");
+    assert.ok(lines[0]!.startsWith("  [stuck] /a: waiting out a retry backoff"), "the message keeps its detail");
+    resetStuckLogForTests();
+  });
+});
+
+// The parent-file gate, applied to child lanes: with the catalog's walks as
+// the change detector, a lane is pooled only when it has something to do.
+describe("childNeedsPass", () => {
+  const lane = (over: Partial<DiscoveredChildFile> = {}): DiscoveredChildFile => ({
+    path: "/r/projects/-p/sid/subagents/agent-a1.jsonl",
+    size: 1000,
+    mtimeMs: 500,
+    parentSessionId: "sid",
+    agentId: "a1",
+    runId: null,
+    metaPath: null,
+    rootDir: "/r",
+    ...over,
+  });
+  const fs = (over: Partial<FileState> = {}): FileState => ({
+    path: "/r/projects/-p/sid/subagents/agent-a1.jsonl",
+    family: "claude-cli",
+    sessionId: "sid",
+    offsets: { letai: 1000 },
+    lastMtimeMs: 500,
+    lastUploadAtMs: 400,
+    ...over,
+  });
+  it("skips a delivered, quiet lane and pools everything with work to do", () => {
+    assert.equal(childNeedsPass(lane(), fs()), false, "delivered at the catalog's size and mtime");
+    assert.equal(childNeedsPass(lane(), undefined), true, "never seeded");
+    assert.equal(childNeedsPass(lane({ size: 1200 }), fs()), true, "owed bytes");
+    assert.equal(childNeedsPass(lane({ size: 800 }), fs()), true, "shrank: a heal to run");
+    assert.equal(childNeedsPass(lane({ mtimeMs: 600 }), fs()), true, "moved mtime: touch bookkeeping");
+    assert.equal(childNeedsPass(lane(), fs({ skipReason: "vault_offline" })), true, "a hold re-resolves");
+    assert.equal(childNeedsPass(lane(), fs({ consecutiveFailures: 1 })), true, "failure bookkeeping to clear");
+    assert.equal(childNeedsPass(lane(), fs({ nextAttemptAtMs: 1 })), true, "an expired backoff still pools once");
+    assert.equal(childNeedsPass(lane(), fs({ offsets: { letai: 600, orgA: 1000 } })), true, "a destination behind");
+  });
+});
+
+// Workflow sidecars: re-hash only when the run moved; after a failed upload
+// wait with the parents' schedule instead of retrying every tick.
+describe("workflow lanes", () => {
+  it("syncs a run it has never seen, then only when its mtime moves", () => {
+    assert.equal(planWorkflowSync(undefined, 100, 0), "sync");
+    const done = { hashedMtimeMs: 100, consecutiveFailures: 0, nextAttemptAtMs: 0 };
+    assert.equal(planWorkflowSync(done, 100, 1_500), "skip-unchanged");
+    assert.equal(planWorkflowSync(done, 101, 3_000), "sync", "the journal or script moved");
+  });
+
+  it("backs off after a failure, doubling from 30 s to the 30-minute cap, and retries at once after a restart", () => {
+    const l1 = workflowLaneAfterFailure(undefined, 0);
+    assert.equal(l1.consecutiveFailures, 1);
+    assert.equal(l1.nextAttemptAtMs, 30_000);
+    assert.equal(planWorkflowSync(l1, 100, 1_500), "skip-backoff");
+    assert.equal(planWorkflowSync(l1, 100, 30_000), "sync", "due: retried even though the mtime did not move");
+    const l2 = workflowLaneAfterFailure(l1, 30_000);
+    assert.equal(l2.nextAttemptAtMs, 90_000, "60 s after the second failure");
+    let lane = l2;
+    for (let i = 0; i < 12; i++) lane = workflowLaneAfterFailure(lane, lane.nextAttemptAtMs);
+    assert.equal(lane.nextAttemptAtMs - (lane.nextAttemptAtMs - FILE_BACKOFF_CAP_MS), FILE_BACKOFF_CAP_MS, "capped");
+    assert.equal(workflowLaneAfterFailure(lane, 0).nextAttemptAtMs, FILE_BACKOFF_CAP_MS, "never past the cap");
+    // Memory is per process: a restart has no lane and syncs at once.
+    assert.equal(planWorkflowSync(undefined, 100, 0), "sync");
   });
 });

@@ -1,14 +1,17 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import {
+  applyJournalEntry,
   clearBlockedFailuresFromState,
   destKey,
   offsetFor,
   migrateFileState,
   reconcileDestinationOffsets,
+  replayJournalText,
   pruneStrandedOffsetsFrom,
   type FileState,
   type HxState,
+  type JournalEntry,
 } from "./state.js";
 
 describe("destKey", () => {
@@ -200,5 +203,64 @@ describe("pruneStrandedOffsetsFrom", () => {
     const state: HxState = { files: { "/gone": entry("/gone", { letai: 1000, orgA: 0 }) } };
     assert.deepEqual(pruneStrandedOffsetsFrom(state, () => false), { keys: 0, files: 0 });
     assert.deepEqual(state.files["/gone"]!.offsets, { letai: 1000, orgA: 0 });
+  });
+});
+
+// The offsets journal (state.journal.jsonl): one line SETS one record, so a
+// replay is idempotent and order within a record is last-write-wins; a torn
+// line and an unknown kind are skipped, never a reason to fail the load.
+describe("journal replay", () => {
+  const file = (path: string, offsets: Record<string, number>): FileState =>
+    ({ path, family: "claude-cli", sessionId: "s", offsets, lastMtimeMs: 1, lastUploadAtMs: 2 }) as FileState;
+  const line = (e: JournalEntry): string => JSON.stringify(e);
+
+  it("sets each record kind and is idempotent", () => {
+    const state: HxState = { files: {} };
+    const entries: JournalEntry[] = [
+      { t: "file", path: "/a", state: file("/a", { letai: 10 }) },
+      { t: "file", path: "/a", state: file("/a", { letai: 20 }) },
+      { t: "dest", key: "orgA", record: { vaultOrgId: "orgA", status: "held", observedAtMs: 5 } },
+      { t: "artifact", key: "claude-cli:s:tasks", hash: "abc" },
+      { t: "chunkCap", key: "letai", cap: 8388608 },
+      { t: "deletedSessions", map: { "claude-cli:gone": 7 } },
+    ];
+    const text = `${entries.map(line).join("\n")}\n`;
+    assert.deepEqual(replayJournalText(state, text), { entries: 6, skipped: 0 });
+    assert.equal(state.files["/a"]!.offsets["letai"], 20, "last write wins");
+    assert.equal(state.destinations!["orgA"]!.status, "held");
+    assert.equal(state.artifacts!["claude-cli:s:tasks"], "abc");
+    assert.equal(state.chunkCaps!["letai"], 8388608);
+    assert.deepEqual(state.deletedSessions, { "claude-cli:gone": 7 });
+    // Replaying the same text over the result changes nothing.
+    const again = structuredClone(state);
+    replayJournalText(again, text);
+    assert.deepEqual(again, state);
+  });
+
+  it("skips a torn trailing line, garbage, and a kind this binary does not know", () => {
+    const state: HxState = { files: {} };
+    const text = [
+      line({ t: "file", path: "/a", state: file("/a", { letai: 1 }) }),
+      "not json at all",
+      JSON.stringify({ t: "future-kind", anything: true }),
+      '{"t":"file","path":"/b","state":{"offsets":{"let',
+    ].join("\n");
+    assert.deepEqual(replayJournalText(state, text), { entries: 1, skipped: 3 });
+    assert.deepEqual(Object.keys(state.files), ["/a"]);
+  });
+
+  it("migrates a legacy single-offset file entry on replay, like the snapshot loader does", () => {
+    const state: HxState = { files: {} };
+    const legacy = { t: "file", path: "/l", state: { path: "/l", family: "claude-cli", sessionId: "s", offset: 99, lastMtimeMs: 1, lastUploadAtMs: 2 } } as unknown as JournalEntry;
+    assert.equal(applyJournalEntry(state, legacy), true);
+    assert.deepEqual(state.files["/l"]!.offsets, { letai: 99 });
+  });
+
+  it("rejects malformed records without touching the state", () => {
+    const state: HxState = { files: {} };
+    assert.equal(applyJournalEntry(state, { t: "file", path: "", state: file("/a", {}) }), false);
+    assert.equal(applyJournalEntry(state, { t: "artifact", key: "k", hash: 5 as unknown as string }), false);
+    assert.equal(applyJournalEntry(state, { t: "chunkCap", key: "k", cap: "big" as unknown as number }), false);
+    assert.deepEqual(state, { files: {} });
   });
 });

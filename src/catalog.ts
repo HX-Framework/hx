@@ -43,6 +43,20 @@
 // ingest loop) sees the same shape it always did, and the inventory is never
 // forgotten between stats — totals cannot shrink or flicker.
 //
+// FILE EVENTS AS HINTS (fs-events.ts). The passes above are the polling
+// design: about 3,200 system calls per tick on a laptop with 727 project
+// dirs, 2,140 a second at idle. When the long-running loop enables events
+// (enableFileEvents), the catalog watches the roots recursively and runs the
+// full polling sweep only every SAFETY_SWEEP_MS as a safety net; the ticks
+// between re-check ONLY the paths events named since the last tick — a known
+// transcript is re-statted, a known project dir re-listed, a known session
+// dir re-walked, a tracker dir re-read, a codex tree re-walked — with the
+// same code and the same syscalls the full passes use, so nothing an event
+// says is believed without the stat the poll would have made. An unknown
+// path (a tool's temp file) costs one in-memory lookup. Too many hints
+// between ticks (HINT_CAP), or no working watcher at all, means the next
+// tick is a full sweep: the polling design is the fallback, never removed.
+//
 // One instance per StateScope (the --local tee runs a second watch loop).
 // computeSyncSnapshot / computeSyncReport / the canonical audit / the hourly
 // backfill / hx tick keep their own fresh discovery — the catalog serves ONLY
@@ -51,6 +65,7 @@
 import path from "node:path";
 import { readFile, readdir } from "node:fs/promises";
 import type { Dirent } from "node:fs";
+import { armFileEvents, type FileEventSource } from "./fs-events.js";
 import {
   RECENT_WINDOW_MS,
   STAT_CONCURRENCY,
@@ -83,6 +98,13 @@ const COLD_STAT_INTERVAL_MS = 60_000;
 // transcript itself is warm, in which case the mtime tier already covers it.
 const TRACKER_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
 const TRACKER_PARSE_CACHE = 512;
+/** With file events armed, the full polling sweep runs this often as the
+ *  safety net; the ticks between re-check hinted paths only. */
+export const SAFETY_SWEEP_MS = 60_000;
+/** Hints kept between two ticks before the next tick is a full sweep instead
+ *  (a catch-up writing thousands of files is cheaper to re-sweep than to
+ *  re-check path by path). */
+export const HINT_CAP = 10_000;
 
 interface FileEntry {
   file: DiscoveredFile;
@@ -206,6 +228,18 @@ export class DiscoveryCatalog {
   private childHotSessions = new Set<string>();
   private childMovementDirs = new Map<string, Set<string>>();
 
+  // File events (see the header). `wantEvents` is the daemon's log function
+  // once it asked for events; the source is armed at the next sweep, which is
+  // where the roots are known, and re-armed whenever they change.
+  private wantEvents: ((msg: string) => void) | null = null;
+  private events: FileEventSource | null = null;
+  private eventsFailed = false;
+  private hints = new Set<string>();
+  private hintOverflow = false;
+  private lastFullSweepMs = Number.NEGATIVE_INFINITY;
+  /** Running totals for the hourly perf line (watch.ts). */
+  readonly counters = { fullSweeps: 0, hintedSweeps: 0, hints: 0 };
+
   reset(): void {
     this.rootsSig = "";
     this.parents.clear();
@@ -218,6 +252,67 @@ export class DiscoveryCatalog {
     this.liveSessionIds.clear();
     this.childHotSessions.clear();
     this.childMovementDirs.clear();
+    this.events?.close();
+    this.events = null;
+    this.hints.clear();
+    this.hintOverflow = false;
+    this.lastFullSweepMs = Number.NEGATIVE_INFINITY;
+  }
+
+  // ── File events ───────────────────────────────────────────────────────────
+
+  /** Ask for file events (the long-running loop only). Armed at the next
+   *  sweep; a failure to arm is logged once and leaves polling in place. */
+  enableFileEvents(log: (msg: string) => void): void {
+    this.wantEvents = log;
+  }
+
+  /** Stop watching (stop()). The next sweep polls, as before. */
+  disableFileEvents(): void {
+    this.wantEvents = null;
+    this.events?.close();
+    this.events = null;
+  }
+
+  /** Whether events are feeding hints right now. */
+  eventsArmed(): boolean {
+    return this.events !== null;
+  }
+
+  /** Test seam — behave as if a watcher were armed (hints drive the ticks
+   *  between safety sweeps) without watching anything. */
+  pretendEventsArmedForTests(): void {
+    this.wantEvents = null;
+    this.events?.close();
+    this.events = { watched: [], missing: [], rearm: () => {}, close: () => {} };
+  }
+
+  /** Record a path an event named; the next tick re-checks it. */
+  hint(absPath: string): void {
+    if (this.hints.size >= HINT_CAP) {
+      this.hintOverflow = true;
+      return;
+    }
+    this.hints.add(absPath);
+  }
+
+  private armEvents(roots: ResolvedRoots): void {
+    this.events?.close();
+    this.events = null;
+    const log = this.wantEvents;
+    if (!log || this.eventsFailed) return;
+    const src = armFileEvents(
+      roots,
+      (p) => this.hint(p),
+      (reason) => {
+        // Arming threw, or a watcher died later: polling takes over for the
+        // rest of this process (a roots change retries once).
+        this.eventsFailed = true;
+        this.events = null;
+        log(`[hx] file events unavailable (${reason}); polling the file tree every tick`);
+      },
+    );
+    if (src) this.events = src;
   }
 
   /** The complete windowed parent inventory — a drop-in for
@@ -348,16 +443,151 @@ export class DiscoveryCatalog {
     const sig = rootsSignature(roots);
     if (sig !== this.rootsSig) {
       // Roots changed (settings edit, env) — full resweep within this tick,
-      // preserving "Watched Locations apply within one poll".
+      // preserving "Watched Locations apply within one poll". Events are
+      // re-armed on the new roots (and retried after an earlier failure).
       this.reset();
       this.rootsSig = sig;
+      this.eventsFailed = false;
+      this.armEvents(roots);
+    } else if (this.wantEvents && !this.events && !this.eventsFailed) {
+      this.armEvents(roots);
     }
-    await this.trackerPass(roots, nowMs);
-    await this.claudeDirPass(roots, nowMs);
-    await this.codexDirPass(roots, nowMs);
-    await this.fileStatPass(nowMs);
-    await this.excludedStatPass(nowMs);
-    await this.childPass(nowMs);
+    const full =
+      this.events === null || this.hintOverflow || nowMs - this.lastFullSweepMs >= SAFETY_SWEEP_MS;
+    if (full) {
+      this.hints.clear();
+      this.hintOverflow = false;
+      this.lastFullSweepMs = nowMs;
+      this.counters.fullSweeps += 1;
+      this.events?.rearm();
+      await this.trackerPass(roots, nowMs);
+      await this.claudeDirPass(roots, nowMs);
+      await this.codexDirPass(roots, nowMs);
+      await this.fileStatPass(nowMs);
+      await this.excludedStatPass(nowMs);
+      await this.childPass(nowMs);
+      return;
+    }
+    if (this.hints.size === 0) return;
+    const hinted = [...this.hints];
+    this.hints.clear();
+    this.counters.hintedSweeps += 1;
+    this.counters.hints += hinted.length;
+    await this.hintedSweep(roots, hinted, nowMs);
+  }
+
+  // ── Hinted sweep: only what events named ──────────────────────────────────
+
+  /**
+   * Re-check the paths events named since the last tick, each through the
+   * same pass that owns it in a full sweep: a known transcript is re-statted
+   * (fileStatPass), a known not-yet-admitted path too (excludedStatPass), a
+   * known session dir is re-walked (childPass), a known project dir is
+   * re-listed and a NEW one admitted (claudeDirPass), a tracker dir re-read
+   * (trackerPass), a codex tree re-walked (codexDirPass). Nothing is believed
+   * from the event itself.
+   */
+  private async hintedSweep(roots: ResolvedRoots, hinted: string[], nowMs: number): Promise<void> {
+    const parentsDue: FileEntry[] = [];
+    const excludedDue: Array<[string, ExcludedEntry]> = [];
+    const sessionDirsDue = new Set<string>();
+    const claudeDirsDue = new Map<string, string>(); // project dir → root
+    const newProjectDirs = new Map<string, string>(); // project dir → root
+    const codexDue = new Map<string, string>(); // base dir → root
+    let trackersDue = false;
+    const rootOfClaudeDir = (dirPath: string): string | null => {
+      for (const r of roots.claude) {
+        const projects = claudeProjectsDir(r.configDir);
+        if (dirPath.startsWith(projects + path.sep)) return r.configDir;
+      }
+      return null;
+    };
+    for (const p of hinted) {
+      const parent = this.parents.get(p);
+      if (parent) {
+        parentsDue.push(parent);
+        continue;
+      }
+      const ex = this.excluded.get(p);
+      if (ex) {
+        excludedDue.push([p, ex]);
+        continue;
+      }
+      // Walk up to the nearest directory the catalog knows.
+      let claimed = false;
+      for (let d = p; ; ) {
+        if (this.sessionDirs.has(d)) {
+          sessionDirsDue.add(d);
+          claimed = true;
+          break;
+        }
+        if (this.dirs.has(d)) {
+          const root = rootOfClaudeDir(d);
+          if (root) claudeDirsDue.set(d, root);
+          claimed = true;
+          break;
+        }
+        if (this.codexListings.has(d)) {
+          claimed = true;
+          codexDue.set(d, "");
+          break;
+        }
+        const up = path.dirname(d);
+        if (up === d) break;
+        d = up;
+      }
+      if (claimed) continue;
+      // Under nothing known: a new project dir, a tracker, a codex dir, or noise.
+      for (const r of roots.claude) {
+        const projects = claudeProjectsDir(r.configDir);
+        if (p.startsWith(projects + path.sep)) {
+          const name = p.slice(projects.length + 1).split(path.sep)[0] ?? "";
+          if (name && !name.startsWith(".") && name !== "memory") newProjectDirs.set(path.join(projects, name), r.configDir);
+          claimed = true;
+          break;
+        }
+        const sessions = path.join(r.configDir, "sessions");
+        if (p === sessions || p.startsWith(sessions + path.sep)) {
+          trackersDue = true;
+          claimed = true;
+          break;
+        }
+      }
+      if (claimed) continue;
+      for (const r of roots.codex) {
+        for (const base of [codexSessionsDir(r.configDir), codexArchivedDir(r.configDir)]) {
+          if (p === base || p.startsWith(base + path.sep)) {
+            codexDue.set(base, r.configDir);
+            claimed = true;
+            break;
+          }
+        }
+        if (claimed) break;
+      }
+    }
+    // Resolve the root of a known codex listing dir from the roots.
+    for (const [d, root] of [...codexDue]) {
+      if (root !== "") continue;
+      codexDue.delete(d);
+      for (const r of roots.codex) {
+        for (const base of [codexSessionsDir(r.configDir), codexArchivedDir(r.configDir)]) {
+          if (d === base || d.startsWith(base + path.sep)) codexDue.set(base, r.configDir);
+        }
+      }
+    }
+
+    if (trackersDue) await this.trackerPass(roots, nowMs);
+    for (const [dirPath, rootDir] of [...claudeDirsDue, ...newProjectDirs]) {
+      const st = await statSafe(dirPath);
+      await this.applyClaudeDirStat(dirPath, rootDir, st && st.isDir ? { mtimeMs: st.mtimeMs } : null, nowMs);
+    }
+    for (const [base, rootDir] of codexDue) await this.codexWalk(base, rootDir, nowMs, true);
+    if (parentsDue.length > 0) await this.statParents(parentsDue, nowMs);
+    if (excludedDue.length > 0) await this.statExcluded(excludedDue, nowMs);
+    for (const d of sessionDirsDue) {
+      const sd = this.sessionDirs.get(d);
+      if (sd) await this.walkSessionDir(sd, nowMs);
+    }
   }
 
   // ── Liveness ──────────────────────────────────────────────────────────────
@@ -438,23 +668,7 @@ export class DiscoveryCatalog {
       for (const dirPath of candidates) {
         const st = stats.get(dirPath);
         if (!st) continue;
-        const known = this.dirs.get(dirPath);
-        if (nowMs - st.mtimeMs > RECENT_WINDOW_MS) {
-          // Dir-mtime age-out (D-A): acts on THIS tick's fresh dir stat and
-          // drops every member regardless of member-file mtimes — exactly
-          // today's dir-level prune. The drop runs ON THE TRANSITION into
-          // aged only: an already-aged dir has nothing left to drop, and
-          // re-scanning five maps for it every tick is a per-tick cost that
-          // grows with history. The dir stays statted each tick, so a future
-          // mtime move re-admits it, as today.
-          if (known && !known.aged) this.dropDirMembers(dirPath);
-          this.dirs.set(dirPath, { mtimeMs: st.mtimeMs, aged: true });
-          continue;
-        }
-        if (!known || known.mtimeMs !== st.mtimeMs) {
-          this.dirs.set(dirPath, { mtimeMs: st.mtimeMs });
-          await this.readdirClaudeDir(dirPath, root.configDir, nowMs);
-        }
+        await this.applyClaudeDirStat(dirPath, root.configDir, st, nowMs);
       }
       // A project dir deleted outright: its entries (and session dirs) vanish.
       for (const dirPath of [...this.dirs.keys()]) {
@@ -463,6 +677,41 @@ export class DiscoveryCatalog {
           this.dirs.delete(dirPath);
         }
       }
+    }
+  }
+
+  /** Fold one fresh stat of a Claude project dir into the catalog — the
+   *  per-dir half of claudeDirPass, shared with the hinted sweep. A null stat
+   *  (the dir is gone) drops its members. */
+  private async applyClaudeDirStat(
+    dirPath: string,
+    rootDir: string,
+    st: { mtimeMs: number } | null,
+    nowMs: number,
+  ): Promise<void> {
+    const known = this.dirs.get(dirPath);
+    if (!st) {
+      if (known) {
+        this.dropDirMembers(dirPath);
+        this.dirs.delete(dirPath);
+      }
+      return;
+    }
+    if (nowMs - st.mtimeMs > RECENT_WINDOW_MS) {
+      // Dir-mtime age-out (D-A): acts on THIS tick's fresh dir stat and
+      // drops every member regardless of member-file mtimes — exactly
+      // today's dir-level prune. The drop runs ON THE TRANSITION into
+      // aged only: an already-aged dir has nothing left to drop, and
+      // re-scanning five maps for it every tick is a per-tick cost that
+      // grows with history. The dir stays statted each tick, so a future
+      // mtime move re-admits it, as today.
+      if (known && !known.aged) this.dropDirMembers(dirPath);
+      this.dirs.set(dirPath, { mtimeMs: st.mtimeMs, aged: true });
+      return;
+    }
+    if (!known || known.mtimeMs !== st.mtimeMs) {
+      this.dirs.set(dirPath, { mtimeMs: st.mtimeMs });
+      await this.readdirClaudeDir(dirPath, rootDir, nowMs);
     }
   }
 
@@ -709,6 +958,12 @@ export class DiscoveryCatalog {
       const interval = this.tierInterval(e, e.sessionId, nowMs);
       if (interval === 0 || nowMs - e.lastStatMs >= interval) due.push(e);
     }
+    await this.statParents(due, nowMs);
+  }
+
+  /** Re-stat the given parents (fileStatPass's body; the hinted sweep passes
+   *  the entries events named). */
+  private async statParents(due: FileEntry[], nowMs: number): Promise<void> {
     await mapPool(due, STAT_CONCURRENCY, async (e) => {
       const st = await statSafe(e.file.path);
       e.lastStatMs = nowMs;
@@ -757,6 +1012,12 @@ export class DiscoveryCatalog {
       const live = e.sessionId !== "" && this.isLive(e.sessionId);
       if (live || nowMs - e.lastStatMs >= COLD_STAT_INTERVAL_MS) due.push([p, e]);
     }
+    await this.statExcluded(due, nowMs);
+  }
+
+  /** Re-stat the given excluded-lane paths (excludedStatPass's body; the
+   *  hinted sweep passes the ones events named). */
+  private async statExcluded(due: Array<[string, ExcludedEntry]>, nowMs: number): Promise<void> {
     await mapPool(due, STAT_CONCURRENCY, async ([p, e]) => {
       const st = await statSafe(p);
       if (!st || st.isDir) {
@@ -794,58 +1055,65 @@ export class DiscoveryCatalog {
         this.childHotSessions.has(sd.sessionId);
       const dueAt = hot ? 0 : WARM_STAT_INTERVAL_MS;
       if (nowMs - sd.lastWalkMs < dueAt) continue;
-      sd.lastWalkMs = nowMs;
-      // Fresh arrays per DIR: scanSessionArtifacts' in-array merge only ever
-      // applies within one call here; the cross-dir merge happens centrally in
-      // listChildren() over runsByDir, so halves walked on different ticks
-      // still fold into one entry.
-      const walkChildren: DiscoveredChildFile[] = [];
-      const walkRuns: DiscoveredWorkflowRun[] = [];
-      await scanSessionArtifacts(sd.sessionDir, sd.sessionId, sd.rootDir, nowMs, walkChildren, walkRuns);
-
-      // Child movement promotes the parent to hot; a walked-and-quiet subtree
-      // ends the promotion (the walk IS the freshness proof either way).
-      // Movement covers agent jsonls AND run artifacts (journal.jsonl, meta,
-      // scripts — their mtimes fold into the run entries).
-      let movement = false;
-      for (const c of walkChildren) {
-        const prev = this.children.get(c.path);
-        if (!prev || prev.child.mtimeMs !== c.mtimeMs || prev.child.size !== c.size) {
-          movement = true;
-          break;
-        }
-      }
-      if (!movement) {
-        const prevRuns = this.runsByDir.get(sd.sessionDir) ?? [];
-        const runFp = (rs: DiscoveredWorkflowRun[]): string =>
-          rs.map((r) => `${r.runId}:${r.mtimeMs}:${r.journalPath ?? ""}:${r.scriptPath ?? ""}`).sort().join("|");
-        if (runFp(prevRuns) !== runFp(walkRuns)) movement = true;
-      }
-      // Per-DIR contribution: a session split across project dirs stays
-      // promoted while ANY of its dirs shows movement — a quiet twin dir
-      // walking later must not erase the active dir's promotion.
-      if (movement) {
-        let dirsWithMovement = this.childMovementDirs.get(sd.sessionId);
-        if (!dirsWithMovement) {
-          dirsWithMovement = new Set();
-          this.childMovementDirs.set(sd.sessionId, dirsWithMovement);
-        }
-        dirsWithMovement.add(sd.sessionDir);
-        this.childHotSessions.add(sd.sessionId);
-      } else {
-        this.releaseChildMovement(sd.sessionId, sd.sessionDir);
-      }
-
-      // The walk is authoritative for its own subtree: replace it wholesale.
-      const prefix = sd.sessionDir + path.sep;
-      const walked = new Set(walkChildren.map((c) => c.path));
-      for (const p of [...this.children.keys()]) {
-        if (p.startsWith(prefix) && !walked.has(p)) this.children.delete(p);
-      }
-      for (const c of walkChildren) this.children.set(c.path, { child: c, lastSeenMs: nowMs });
-      if (walkRuns.length > 0) this.runsByDir.set(sd.sessionDir, walkRuns);
-      else this.runsByDir.delete(sd.sessionDir);
+      await this.walkSessionDir(sd, nowMs);
     }
+  }
+
+  /** Walk one session-artifact dir and fold the result into the catalog —
+   *  childPass's body for a dir that is due, and the hinted sweep's for a dir
+   *  an event named. */
+  private async walkSessionDir(sd: SessionDirEntry, nowMs: number): Promise<void> {
+    sd.lastWalkMs = nowMs;
+    // Fresh arrays per DIR: scanSessionArtifacts' in-array merge only ever
+    // applies within one call here; the cross-dir merge happens centrally in
+    // listChildren() over runsByDir, so halves walked on different ticks
+    // still fold into one entry.
+    const walkChildren: DiscoveredChildFile[] = [];
+    const walkRuns: DiscoveredWorkflowRun[] = [];
+    await scanSessionArtifacts(sd.sessionDir, sd.sessionId, sd.rootDir, nowMs, walkChildren, walkRuns);
+
+    // Child movement promotes the parent to hot; a walked-and-quiet subtree
+    // ends the promotion (the walk IS the freshness proof either way).
+    // Movement covers agent jsonls AND run artifacts (journal.jsonl, meta,
+    // scripts — their mtimes fold into the run entries).
+    let movement = false;
+    for (const c of walkChildren) {
+      const prev = this.children.get(c.path);
+      if (!prev || prev.child.mtimeMs !== c.mtimeMs || prev.child.size !== c.size) {
+        movement = true;
+        break;
+      }
+    }
+    if (!movement) {
+      const prevRuns = this.runsByDir.get(sd.sessionDir) ?? [];
+      const runFp = (rs: DiscoveredWorkflowRun[]): string =>
+        rs.map((r) => `${r.runId}:${r.mtimeMs}:${r.journalPath ?? ""}:${r.scriptPath ?? ""}`).sort().join("|");
+      if (runFp(prevRuns) !== runFp(walkRuns)) movement = true;
+    }
+    // Per-DIR contribution: a session split across project dirs stays
+    // promoted while ANY of its dirs shows movement — a quiet twin dir
+    // walking later must not erase the active dir's promotion.
+    if (movement) {
+      let dirsWithMovement = this.childMovementDirs.get(sd.sessionId);
+      if (!dirsWithMovement) {
+        dirsWithMovement = new Set();
+        this.childMovementDirs.set(sd.sessionId, dirsWithMovement);
+      }
+      dirsWithMovement.add(sd.sessionDir);
+      this.childHotSessions.add(sd.sessionId);
+    } else {
+      this.releaseChildMovement(sd.sessionId, sd.sessionDir);
+    }
+
+    // The walk is authoritative for its own subtree: replace it wholesale.
+    const prefix = sd.sessionDir + path.sep;
+    const walked = new Set(walkChildren.map((c) => c.path));
+    for (const p of [...this.children.keys()]) {
+      if (p.startsWith(prefix) && !walked.has(p)) this.children.delete(p);
+    }
+    for (const c of walkChildren) this.children.set(c.path, { child: c, lastSeenMs: nowMs });
+    if (walkRuns.length > 0) this.runsByDir.set(sd.sessionDir, walkRuns);
+    else this.runsByDir.delete(sd.sessionDir);
   }
 }
 

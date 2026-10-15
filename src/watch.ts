@@ -1,9 +1,12 @@
-// mtime-poll watcher.
+// The watcher.
 //
-// Strategy: poll the candidate directories at ~1.5s intervals, walk the cache
-// of per-file mtimes, and trigger an upload when (mtime, size) move. fs.watch +
-// chokidar were considered and rejected — too many directories, FD pressure
-// under `~/.claude/projects/<encoded-path>/...`.
+// Strategy: a tiered catalog of the candidate files (catalog.ts) tells each
+// 1.5 s tick which files moved, and the tick uploads what (mtime, size) say
+// changed. The long-running daemon feeds the catalog FILE EVENTS as hints
+// (fs-events.ts: fs.watch, recursive) and keeps the full polling sweep as a
+// 60 s safety net; one-shot runs sweep once. Per-tick polling of every
+// directory and every hot file was the design until 77.11 — about 2,140
+// system calls a second at idle on a large laptop.
 //
 // Per-file upload pipeline:
 //   1. read bytes from `state.offset → EOF`
@@ -72,8 +75,11 @@ import {
   clearGenericBackoffs,
   armCoalescedPersistence,
   disarmCoalescedPersistence,
+  checkpointState,
   flushStateIfDirty,
-  hasDirtyState,
+  registerPartingFlush,
+  stateFlushDue,
+  FILE_BACKOFF_CAP_MS,
 } from "./state.js";
 import { catalogFor } from "./catalog.js";
 import { readCodexTitle } from "./codex-titles.js";
@@ -114,7 +120,7 @@ import {
   verifySessions,
 } from "./uploader.js";
 import { summariseChunk } from "./parse.js";
-import { getCcdRecentsByCliId } from "./ccd.js";
+import { getCcdRecentsByCliId, saveCcdIndexIfChanged } from "./ccd.js";
 import { buildGroupMirror } from "./ccd-prefs.js";
 import {
   findPlanPathInText,
@@ -201,14 +207,23 @@ const VERIFY_BATCH = 1_000;
 
 /** How often the same file may repeat a "not progressing" explanation. The
  *  tick runs every ~1.5s; without this, one stuck file would emit ~57,000 lines
- *  a day. Keyed by path+reason so a CHANGE of reason is always reported at
- *  once — the transition is the interesting part. */
+ *  a day. Keyed by path + the KIND of reason, so a CHANGE of reason is always
+ *  reported at once — the transition is the interesting part — while the
+ *  numbers inside the message (a countdown, a failure count) are not part of
+ *  the key. Until 77.11 the backoff message's countdown WAS in the key, so the
+ *  line repeated every minute per stuck file: about 90% of a 443 MB
+ *  stdout.log over one three-week vault outage. */
 const STUCK_LOG_INTERVAL_MS = 30 * 60_000;
 const stuckLogged = new Map<string, { reason: string; atMs: number }>();
 
+/** Test seam — forget what was logged. */
+export function resetStuckLogForTests(): void {
+  stuckLogged.clear();
+}
+
 /**
- * Say why a file that owes bytes is not being sent — once per reason per file
- * per interval.
+ * Say why a file that owes bytes is not being sent — once per kind of reason
+ * per file per interval. `key` names the kind; `message` carries the detail.
  *
  * The tick has several `continue`s and one `return false` that decline to
  * upload without emitting anything. That is how a device sat at "17 sessions ·
@@ -217,12 +232,17 @@ const stuckLogged = new Map<string, { reason: string; atMs: number }>();
  * Absence of output read as "nothing happening" when it meant "nothing will
  * ever happen".
  */
-function logStuck(path: string, reason: string, log: (m: string) => void): void {
+export function logStuck(
+  path: string,
+  key: string,
+  message: string,
+  log: (m: string) => void,
+  nowMs: number = Date.now(),
+): void {
   const prev = stuckLogged.get(path);
-  const now = Date.now();
-  if (prev && prev.reason === reason && now - prev.atMs < STUCK_LOG_INTERVAL_MS) return;
-  stuckLogged.set(path, { reason, atMs: now });
-  log(`  [stuck] ${path}: ${reason}`);
+  if (prev && prev.reason === key && nowMs - prev.atMs < STUCK_LOG_INTERVAL_MS) return;
+  stuckLogged.set(path, { reason: key, atMs: nowMs });
+  log(`  [stuck] ${path}: ${message}`);
 }
 
 /**
@@ -414,6 +434,54 @@ function latchChildLanePause(
       : `[hx] child-lane uploads rejected (${err.status}); pausing`,
   );
   return true;
+}
+
+// ── Workflow sidecars: the mtime gate and the retry backoff ─────────────────
+//
+// Until 77.11 every tick read every workflow run's journal and script in full
+// to hash them (the whole-file sidecar is hash-gated against state.artifacts),
+// whether or not anything had changed — and a failed upload was retried on
+// the very next tick, forever: 503,349 refused workflow uploads in 3.5 weeks
+// of one vault outage, an estimated 55 GB of rejected request bodies. Both
+// are fixed here, in memory per process (a daemon restart retries at once,
+// the same contract clearGenericBackoffs gives parent files):
+//   • the GATE: a run is re-hashed only when its newest mtime (journal or
+//     script, from discovery) moved since the last successful hash;
+//   • the BACKOFF: after a failed upload the run waits FILE_RETRY_BASE_MS,
+//     doubling per consecutive failure up to FILE_BACKOFF_CAP_MS, exactly the
+//     per-file schedule parents get from recordFileFailure. The first attempt
+//     of a process is never delayed.
+export interface WorkflowLane {
+  /** The run mtime the sidecar was last hashed at (-1: never). */
+  hashedMtimeMs: number;
+  consecutiveFailures: number;
+  nextAttemptAtMs: number;
+}
+const workflowLanes = new Map<string, WorkflowLane>();
+
+/** Test seam — forget every run's gate and backoff. */
+export function resetWorkflowLanesForTests(): void {
+  workflowLanes.clear();
+}
+
+/** Pure: what the pass does with one run, given its lane memory. */
+export function planWorkflowSync(
+  lane: WorkflowLane | undefined,
+  runMtimeMs: number,
+  nowMs: number,
+): "sync" | "skip-backoff" | "skip-unchanged" {
+  if (!lane) return "sync";
+  if (lane.nextAttemptAtMs > nowMs) return "skip-backoff";
+  if (lane.consecutiveFailures === 0 && lane.hashedMtimeMs === runMtimeMs) return "skip-unchanged";
+  return "sync";
+}
+
+/** Pure: the lane after a failed upload — the next attempt's delay doubles per
+ *  consecutive failure from FILE_RETRY_BASE_MS to FILE_BACKOFF_CAP_MS. */
+export function workflowLaneAfterFailure(lane: WorkflowLane | undefined, nowMs: number): WorkflowLane {
+  const n = (lane?.consecutiveFailures ?? 0) + 1;
+  const delay = Math.min(FILE_BACKOFF_CAP_MS, FILE_RETRY_BASE_MS * 2 ** (n - 1));
+  return { hashedMtimeMs: lane?.hashedMtimeMs ?? -1, consecutiveFailures: n, nextAttemptAtMs: nowMs + delay };
 }
 
 // Self-heal support is feature-detected once per process PER LANE (absent =
@@ -1635,6 +1703,24 @@ export function planChildLaneResets(
   return { nextMap, resetPaths, changed };
 }
 
+/**
+ * The parent-file gate, applied to a child lane: with the catalog's tiered
+ * stats as the change detector, a lane is pooled only when it has something
+ * to do — owed bytes, a moved mtime (touch bookkeeping), a hold or a backoff
+ * record to clear — mirroring the gate parents get in tickOnce. Until 77.11
+ * every elected lane was statted by the pass on every tick, whether or not its
+ * parent (or the lane) had changed: on a large laptop that was most of the
+ * 3,590 lanes in state re-statted every 1.5 s for nothing.
+ */
+export function childNeedsPass(c: DiscoveredChildFile, fs: FileState | undefined): boolean {
+  if (!fs) return true;
+  if (fs.skipReason) return true;
+  if (fs.consecutiveFailures !== undefined || fs.nextAttemptAtMs !== undefined) return true;
+  if (c.size !== minOffset(fs)) return true;
+  if (fs.lastMtimeMs !== c.mtimeMs) return true;
+  return false;
+}
+
 /** Lanes with more than one discovered candidate this tick. */
 export function contestedChildLanes(children: DiscoveredChildFile[]): Set<string> {
   const counts = new Map<string, number>();
@@ -2161,6 +2247,7 @@ export async function tickOnce(
       const mins = Math.round((pending.nextAttemptAtMs - Date.now()) / 60_000);
       logStuck(
         f.path,
+        `backoff:${pending.skipReason ?? ""}`,
         `waiting out a retry backoff for another ${mins} min (${pending.consecutiveFailures ?? 0} consecutive failures${pending.skipReason ? `, ${pending.skipReason}` : ""})`,
         log,
       );
@@ -2195,6 +2282,7 @@ export async function tickOnce(
         // good. Silent, this is indistinguishable from "still uploading".
         logStuck(
           f.path,
+          "excluded",
           `excluded by settings — personalSync=${settings.personalSync}, repoSlug=${seeded.repoSlug ?? "null"}, attributed=${seeded.attributed}`,
           log,
         );
@@ -2207,7 +2295,7 @@ export async function tickOnce(
     {
       const entry = state.files[f.path];
       if (entry && isDeletedSession(state, entry.family, entry.sessionId)) {
-        logStuck(f.path, "session was permanently deleted on the server — it will never upload again", log);
+        logStuck(f.path, "deleted", "session was permanently deleted on the server — it will never upload again", log);
         return;
       }
     }
@@ -2225,6 +2313,7 @@ export async function tickOnce(
           .join(", ");
         logStuck(
           f.path,
+          "no-plan",
           `owes bytes but the gateway planned no upload for it — ${owed || "no destinations recorded"}. The destination may no longer exist.`,
           log,
         );
@@ -2433,19 +2522,25 @@ export async function tickOnce(
         state.childUploaders = lanePlan.nextMap;
         await persistState(scope);
       }
+      // Identity repair runs for EVERY elected lane, pooled or not: a child
+      // whose canonical parent became known this pass must take its family
+      // and session id now, whether or not it has bytes to send.
+      for (const c of electedChildren) {
+        const current = state.files[c.path];
+        if (!current) continue;
+        const reconciled = reconcileChildParent(current, parentByArtifactSession.get(c.parentSessionId));
+        if (reconciled !== current) await upsertFileState(reconciled, scope);
+      }
+      // The parent-file gate for lanes (childNeedsPass): the catalog's walks
+      // are the change detector, so the pass pools only lanes with something
+      // to do. The legacy sweep has no catalog and pools everything, as it
+      // always did.
+      const pooledChildren = !catalog
+        ? electedChildren
+        : electedChildren.filter((c) => childNeedsPass(c, state.files[c.path]));
       let stopChildren = false;
       const processChild = async (c: DiscoveredChildFile): Promise<void> => {
-        let pendingChild = state.files[c.path];
-        if (pendingChild) {
-          const reconciled = reconcileChildParent(
-            pendingChild,
-            parentByArtifactSession.get(c.parentSessionId),
-          );
-          if (reconciled !== pendingChild) {
-            pendingChild = reconciled;
-            await upsertFileState(reconciled, scope);
-          }
-        }
+        const pendingChild = state.files[c.path];
         if (pendingChild?.nextAttemptAtMs && pendingChild.nextAttemptAtMs > Date.now()) return;
         // A deleted parent blocks every child lane (the stop-flag matches the
         // bare sessionId, so a stale child family can't slip past it either).
@@ -2512,11 +2607,16 @@ export async function tickOnce(
           await recordFileFailure(c.path, FILE_RETRY_BASE_MS, scope);
         }
       };
-      await runPool(electedChildren, childConcurrency, processChild, () => stopChildren);
+      await runPool(pooledChildren, childConcurrency, processChild, () => stopChildren);
       for (const r of runs) {
+        const laneKey = `${scope}:${r.parentSessionId}:${r.runId}`;
+        const lane = workflowLanes.get(laneKey);
+        if (planWorkflowSync(lane, r.mtimeMs, Date.now()) !== "sync") continue;
         try {
           await syncWorkflowRun(cfg, r, parentByArtifactSession, log);
+          workflowLanes.set(laneKey, { hashedMtimeMs: r.mtimeMs, consecutiveFailures: 0, nextAttemptAtMs: 0 });
         } catch (err) {
+          workflowLanes.set(laneKey, workflowLaneAfterFailure(lane, Date.now()));
           if (latchChildLanePause(err, scope, log)) break;
           log(`  [error] workflow ${r.runId}: ${(err as Error).message}`);
         }
@@ -2527,10 +2627,15 @@ export async function tickOnce(
   }
 
   // Flush point: end of every pass. Coalesced-mode bookkeeping (mtime
-  // touches, registry updates, backoff stamps, artifact hashes) becomes
-  // durable here; a no-op in flush-through mode (`hx tick`, `--once`, and
-  // every non-daemon caller — nothing ever marks dirty there).
+  // touches, registry updates, backoff stamps, artifact hashes) is journaled
+  // here, and the journal folds into the snapshot when a checkpoint is due —
+  // which in a one-shot pass (`hx tick`, `--once`, every non-daemon caller)
+  // is now, so the process leaves a current snapshot and an empty journal.
+  // The Claude Desktop index saves on the same beat: forced in a one-shot
+  // pass, interval-gated in the daemon.
   await flushStateIfDirty(scope);
+  if (opts.oneShot) await saveCcdIndexIfChanged(Date.now(), { force: true });
+  else void saveCcdIndexIfChanged(Date.now());
   const snapshot = snapshotFrom(files, state);
   onProgress?.(snapshot);
   return { uploaded, failed, snapshot };
@@ -2542,6 +2647,11 @@ export interface PerfCounters {
   passMs: number[];
   uploads: number;
   flushes: number;
+  /** Full polling sweeps of the catalog (every tick without file events, the
+   *  60 s safety net with them). */
+  sweeps: number;
+  /** Paths file events named that the hinted sweeps re-checked. */
+  hints: number;
 }
 
 /** The hourly `[hx] perf:` info line. Pure so the classifier golden can pin
@@ -2552,7 +2662,7 @@ export function formatPerfLine(perf: PerfCounters): string {
   const sorted = [...perf.passMs].sort((a, b) => a - b);
   const at = (q: number): number =>
     sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!) : 0;
-  return `[hx] perf: passes=${perf.passes} passMs p50=${at(0.5)} p95=${at(0.95)} max=${Math.round(sorted[sorted.length - 1] ?? 0)} uploads=${perf.uploads} stateFlushes=${perf.flushes}`;
+  return `[hx] perf: passes=${perf.passes} passMs p50=${at(0.5)} p95=${at(0.95)} max=${Math.round(sorted[sorted.length - 1] ?? 0)} uploads=${perf.uploads} stateFlushes=${perf.flushes} sweeps=${perf.sweeps} hints=${perf.hints}`;
 }
 
 // ── Progress watchdog ───────────────────────────────────────────────────────
@@ -2648,8 +2758,15 @@ export async function startWatch(
 
   // Coalesced state persistence is a LONG-RUNNING-LOOP privilege: this loop
   // owns flush points (end of pass, the timer below, flush-through commits).
-  // One-shot runs have none, so they keep flush-through mode untouched.
-  if (!opts.oneShot) armCoalescedPersistence(scopeOf(cfg));
+  // One-shot runs have none, so they keep flush-through mode untouched. The
+  // same privilege arms file events as hints for the catalog (its first sweep
+  // is a full one regardless) and saves the Claude Desktop index with the
+  // daemon's parting flush.
+  if (!opts.oneShot) {
+    armCoalescedPersistence(scopeOf(cfg));
+    catalogFor(scopeOf(cfg)).enableFileEvents(log);
+    registerPartingFlush(() => saveCcdIndexIfChanged(Date.now(), { force: true }));
+  }
 
   // A restart is a human signalling "conditions changed" — serving out stale
   // exponential penalties helps nobody. After the 2026-08-01 credential
@@ -2751,7 +2868,11 @@ export async function startWatch(
   // Perf self-observability: per-pass duration + activity counters, folded
   // into ONE hourly info line (formatPerfLine — classifier-safe by test).
   const PERF_LOG_MS = 60 * 60_000;
-  const perf: PerfCounters = { passes: 0, passMs: [], uploads: 0, flushes: 0 };
+  const perf: PerfCounters = { passes: 0, passMs: [], uploads: 0, flushes: 0, sweeps: 0, hints: 0 };
+  // The catalog's running totals, read as deltas at each perf line.
+  const sweepCounters = catalogFor(scopeOf(cfg)).counters;
+  let sweepsSeen = 0;
+  let hintsSeen = 0;
 
   // User-driven pause (settings.json, written by the UI server or a future
   // CLI). Checked every tick so a pause/resume takes effect within one poll.
@@ -2883,13 +3004,14 @@ export async function startWatch(
   const mirrorTimer = setInterval(() => void mirrorOnce(), MIRROR_SYNC_MS);
   const auditTimer = setInterval(() => void audit(), VERIFY_INTERVAL_MS);
   // Coalesced-persistence safety net: bounds how long dirty bookkeeping can
-  // sit unflushed between passes (M2's ≤5 s), and the only flush that covers
-  // a hard kill landing between pass-end flushes.
+  // sit unjournaled between passes (M2's ≤5 s), the only flush that covers a
+  // hard kill landing between pass-end flushes, and the clock that folds the
+  // journal into the snapshot when its checkpoint falls due between passes.
   const STATE_FLUSH_MS = 5_000;
   const scope = scopeOf(cfg);
   let flushFailureLogged = false;
   const flushTimer = setInterval(() => {
-    if (!hasDirtyState(scope)) return;
+    if (!stateFlushDue(scope)) return;
     perf.flushes += 1;
     // A rejected flush must never become an unhandled rejection (Bun exits
     // the process on those). flushStateIfDirty re-marked the scope dirty, so
@@ -2910,11 +3032,17 @@ export async function startWatch(
   }, STATE_FLUSH_MS);
   const perfTimer = setInterval(() => {
     if (perf.passes === 0) return;
+    perf.sweeps = sweepCounters.fullSweeps - sweepsSeen;
+    perf.hints = sweepCounters.hints - hintsSeen;
+    sweepsSeen = sweepCounters.fullSweeps;
+    hintsSeen = sweepCounters.hints;
     log(formatPerfLine(perf));
     perf.passes = 0;
     perf.passMs.length = 0;
     perf.uploads = 0;
     perf.flushes = 0;
+    perf.sweeps = 0;
+    perf.hints = 0;
   }, PERF_LOG_MS);
   // The progress watchdog (see resolveWatchdogMs / watchdogVerdict above).
   const watchdogTimer = setInterval(() => {
@@ -2930,10 +3058,10 @@ export async function startWatch(
     log(
       `[hx] watchdog: a pass has been running for ${Math.round(v.busyForMs / 60_000)} min with no log line for ${Math.round(v.quietForMs / 60_000)} min (limit ${Math.round(watchdogLimitMs / 60_000)} min); exiting ${WATCHDOG_EXIT_CODE} so the service manager restarts the daemon`,
     );
-    // Best-effort parting flush, bounded: a hung disk must not keep a hung
-    // daemon alive past this point.
+    // Best-effort parting checkpoint, bounded: a hung disk must not keep a
+    // hung daemon alive past this point.
     const bail = setTimeout(() => watchdogExit(WATCHDOG_EXIT_CODE), 5_000);
-    flushStateIfDirty(scope)
+    checkpointState(scope)
       .catch(() => {})
       .finally(() => {
         clearTimeout(bail);
@@ -2949,9 +3077,12 @@ export async function startWatch(
       clearInterval(flushTimer);
       clearInterval(perfTimer);
       clearInterval(watchdogTimer);
-      // Best-effort parting flush, then back to flush-through mode. Swallow —
-      // a rejection here would be unhandled, and stop() has no retry loop.
-      flushStateIfDirty(scope).catch(() => {});
+      // Best-effort parting checkpoint, then back to flush-through mode.
+      // Swallow — a rejection here would be unhandled, and stop() has no
+      // retry loop. Events close; the index saves once more.
+      catalogFor(scope).disableFileEvents();
+      checkpointState(scope).catch(() => {});
+      void saveCcdIndexIfChanged(Date.now(), { force: true });
       disarmCoalescedPersistence(scope);
     },
   };

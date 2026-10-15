@@ -214,21 +214,26 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
       checks.push({ name: `step ${step.name}`, ok: false, details: `missing in ${!rs ? "reference" : "candidate"}` });
       continue;
     }
-    if (step.kind === "run" || step.kind === "watch-kill") {
+    if (step.kind === "run" || step.kind === "watch-kill" || step.kind === "watch-for") {
       const codeOk = rs.exitCode === cs.exitCode && rs.signal === cs.signal;
       const sortLines = step.kind === "run" ? step.sortLines === true : true;
+      // A long-running daemon logs on its own clock: how many ticks it ran,
+      // how many times a backoff line repeated, is cadence. Its output is
+      // compared as the SET of distinct lines.
+      const distinct = step.kind === "watch-for";
       const a = normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stdout`)), ctxRef);
       const b = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stdout`)), ctxCand);
       const ea = normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stderr`)), ctxRef);
       const eb = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stderr`)), ctxCand);
-      const prep = (s: string): string => (sortLines ? s.split("\n").sort().join("\n") : s);
+      const prep = (s: string): string =>
+        distinct ? [...new Set(s.split("\n").filter((l) => l.trim()))].sort().join("\n") : sortLines ? s.split("\n").sort().join("\n") : s;
       // JSON output (hx doctor sync --json) compares structurally, with the
       // timestamp tolerance and tie-prone lists sorted. A killed run's output
       // is timing, and so is what the passes after it have left to send, so
       // end-state scenarios compare only the exit of their watch steps.
       const ja = parseJsonOrNull(readText(join(ref.dir, "steps", `${stepFile(rs)}.stdout`)));
       const jb = parseJsonOrNull(readText(join(cand.dir, "steps", `${stepFile(cs)}.stdout`)));
-      const timingOnly = step.kind === "watch-kill" || (endState && step.args[0] === "watch");
+      const timingOnly = step.kind === "watch-kill" || (endState && step.kind === "run" && step.args[0] === "watch");
       const outDiff = timingOnly
         ? []
         : ja !== null && jb !== null

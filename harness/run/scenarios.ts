@@ -241,6 +241,23 @@ export const SCENARIOS: Scenario[] = [
     compare: { requests: "per-session", tsToleranceMs: 20_000 },
   },
   {
+    name: "daemon-backoff",
+    description:
+      "The long-running daemon for 50 s: acme/repo fans out to a held vault, every workflow upload answers 503, and a transcript grows 12 s in. Held sessions retry on their 20 s backoff; the workflow sidecar retries on its own backoff (77.12) rather than every tick; the stuck line is logged once per hold, not once per countdown minute; the grown transcript uploads within the run, found by file events or the polling tick, never by a fresh process's first sweep. SIGTERM ends it; the snapshot must be current when `hx status` reads it.",
+    shape: "small",
+    seed: "daemon-backoff",
+    settings: SERIAL,
+    gateway: { routes: { "acme/repo": { vaultOrgIds: ["org-acme"] } }, heldVaults: { "org-acme": ACME_HELD }, workflowStatus: 503 },
+    steps: [
+      // sessionIndex 2 is the no-repo session (~/scratch/notes): not held, so
+      // its growth uploads at once.
+      { kind: "watch-for", name: "daemon", durationMs: 50_000, grow: { atMs: 12_000, sessionIndex: 2, bytes: 3000 } },
+      status("status1"),
+      { kind: "run", name: "doctor-json", args: ["doctor", "sync", "--json"] },
+    ],
+    compare: { requests: "per-session", tsToleranceMs: 20_000 },
+  },
+  {
     name: "paused",
     description: "settings.json pauses sync: the first pass uploads nothing and says so; resumed, the second pass uploads everything.",
     shape: "small",

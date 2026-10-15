@@ -514,10 +514,11 @@ export async function uploadWorkflowRun(
       body: JSON.stringify(dropNulls(args as unknown as Record<string, unknown>)),
       signal,
     });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`workflow upload failed: ${res.status} ${txt.slice(0, 200)}`);
-    }
+    // An HxHttpError (same message as before), so the watcher can tell a 404
+    // from a gateway that predates the endpoint — the wholesale child-lane
+    // pause — from a 5xx it should back off from. A plain Error carried the
+    // status only as text, and the pause latch never fired for workflows.
+    if (!res.ok) await throwHttp(res, "workflow upload");
     return (await res.json()) as { ok: true };
   });
 }

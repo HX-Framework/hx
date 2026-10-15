@@ -70,6 +70,10 @@ export interface GatewayConfig {
   tombstones: string[];
   /** Every endpoint answers this status (an outage), 0 = healthy. */
   outageStatus: number;
+  /** POST /sessions/workflow alone answers this status, 0 = healthy: the
+   *  shape of a vault outage that rejects workflow sidecars while transcripts
+   *  keep landing (the 503,349 refused uploads of 2026-09/10). */
+  workflowStatus: number;
   /** Milliseconds to hold each PUT before answering. */
   putDelayMs: number;
   /** Where the recording goes (JSONL, appended). Omit to keep it in memory only. */
@@ -90,6 +94,7 @@ export const DEFAULT_CONFIG: GatewayConfig = {
   vault503: {},
   tombstones: [],
   outageStatus: 0,
+  workflowStatus: 0,
   putDelayMs: 0,
   label: "cloud",
 };
@@ -497,6 +502,7 @@ export class FakeGateway {
     }
     if (method === "POST" && path === "/sessions/workflow") {
       if (!sessionKey) return json({ error: "bad_request" }, 400);
+      if (c.workflowStatus > 0) return json({ error: "service_unavailable" }, c.workflowStatus);
       this.sidecars.set(`${sessionKey}:wf:${String(b.runId)}`, JSON.stringify({ scriptName: b.scriptName, script: b.script, journal: b.journal }));
       return json({ ok: true });
     }

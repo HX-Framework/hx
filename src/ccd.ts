@@ -28,11 +28,17 @@
 // files whose stat moved. Every stat and read goes through a bounded pool. A
 // full per-file stat sweep still runs at most once per FULL_STAT interval as a
 // safety net for in-place rewrites that leave the dir mtime alone.
+//
+// And it is SAVED ACROSS RESTARTS (~/.let/hx/ccd-index.json — see the section
+// at the end): a fresh process used to rebuild it from nothing, reading every
+// one of those 35k files again (925 MB of JSON, a 351 MB allocation burst)
+// before its first pass.
 
-import { readdir, readFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { posix as posixPath, win32 as winPath } from "node:path";
 import os from "node:os";
+import { HX_DIR } from "./hx-home.js";
 import { mapPool, readdirSafe, statSafe } from "./sources.js";
 
 /**
@@ -119,6 +125,15 @@ function resetIndex(): void {
   lastRefreshAtMs = Number.NEGATIVE_INFINITY;
   lastFullStatAtMs = Number.NEGATIVE_INFINITY;
   cachedMap = null;
+  loadPromise = null;
+  savedVersion = 0;
+  lastSaveAtMs = Number.NEGATIVE_INFINITY;
+}
+
+function rebuildRecords(): void {
+  const next: CcdSessionMeta[] = [];
+  for (const e of index.values()) if (e.record) next.push(e.record);
+  records = next;
 }
 
 /** Test seam — point the session-metadata store at a fixture dir (null
@@ -284,9 +299,7 @@ async function refreshNow(nowMs: number, fullStat: boolean): Promise<void> {
   lastRefreshAtMs = nowMs;
   if (changed) {
     version += 1;
-    const next: CcdSessionMeta[] = [];
-    for (const e of index.values()) if (e.record) next.push(e.record);
-    records = next;
+    rebuildRecords();
   }
 }
 
@@ -299,6 +312,9 @@ export async function refreshCcdIndex(
   nowMs: number,
   opts: { force?: boolean } = {},
 ): Promise<number> {
+  // The saved index is loaded before the first refresh of the process, so
+  // that refresh stats where it would otherwise have read.
+  await loadSavedIndex();
   if (!opts.force && nowMs - lastRefreshAtMs < CCD_REFRESH_TTL_MS) return version;
   if (refreshInFlight) {
     await refreshInFlight;
@@ -336,4 +352,131 @@ export async function getCcdRecentsByCliId(
   }
   cachedMap = { records: current, byCli };
   return byCli;
+}
+
+// ── Saved across restarts ───────────────────────────────────────────────────
+//
+// The index is written to ~/.let/hx/ccd-index.json — per file its (size,
+// mtime) and the parsed record, per org dir its mtime and listing — and loaded
+// before the first refresh of the next process. Loading trusts nothing: that
+// first refresh is a FULL STAT (lastFullStatAtMs is reset), so every file's
+// (size, mtime) is checked once and only the files that moved while hx was
+// down are re-read. The save buys reads, not stats: 36k stats instead of 36k
+// reads and parses, and no allocation burst.
+//
+// Saved when the index changed since the last save — at most every
+// CCD_INDEX_SAVE_INTERVAL_MS in the daemon, because Claude Desktop rewrites
+// session files every few seconds while it is open and a save per change
+// would be the whole-state.json problem again — and once more, unconditionally,
+// when the daemon stops or a one-shot pass ends. Written tmp + rename, mode
+// 0600, best-effort: the file is a cache, never a source of truth, and an
+// unreadable or unversioned one is ignored and rebuilt.
+
+export const CCD_INDEX_SAVE_INTERVAL_MS = 10 * 60_000;
+const CCD_INDEX_FORMAT = 1;
+const CCD_INDEX_FILE = path.join(HX_DIR, "ccd-index.json");
+
+interface SavedCcdIndex {
+  v: number;
+  savedAtMs: number;
+  dirs: Record<string, OrgDirListing>;
+  files: Record<string, IndexedFile>;
+}
+
+let indexPathOverride: string | null = null;
+let loadPromise: Promise<void> | null = null;
+let savedVersion = 0;
+let lastSaveAtMs = Number.NEGATIVE_INFINITY;
+
+/** Test seam — where the saved index lives (null restores ~/.let/hx), and a
+ *  fresh load/save history. Pair with setCcdSessionsDirForTests. */
+export function setCcdIndexPathForTests(p: string | null): void {
+  indexPathOverride = p;
+  loadPromise = null;
+  savedVersion = 0;
+  lastSaveAtMs = Number.NEGATIVE_INFINITY;
+}
+
+/** The saved index's path for this process (null where Claude Desktop does
+ *  not ship, so nothing is ever written there). */
+export function ccdIndexPath(): string | null {
+  if (indexPathOverride !== null) return indexPathOverride;
+  return CCD_DIR === null ? null : CCD_INDEX_FILE;
+}
+
+function isSavedRecord(v: unknown): v is CcdSessionMeta {
+  if (!v || typeof v !== "object") return false;
+  const d = v as Record<string, unknown>;
+  return typeof d.ccdSessionId === "string" && (d.cliSessionId === null || typeof d.cliSessionId === "string");
+}
+
+/** Populate the maps from the saved file, once per process. Only paths under
+ *  this process's store are taken — a save from another store (a moved
+ *  directory, a test fixture) describes files this process never reads. */
+function loadSavedIndex(): Promise<void> {
+  if (loadPromise) return loadPromise;
+  // Cleared by nothing: one load per process (or per test reset). The slot is
+  // assigned from the promise, never from inside the body — see singleFlight.
+  loadPromise = (async (): Promise<void> => {
+    const file = ccdIndexPath();
+    if (file === null || CCD_DIR === null) return;
+    let saved: SavedCcdIndex;
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixed path under ~/.let/hx
+      saved = JSON.parse(await readFile(file, "utf8")) as SavedCcdIndex;
+    } catch {
+      return; // absent, torn or unreadable: rebuild from the store
+    }
+    if (!saved || saved.v !== CCD_INDEX_FORMAT || !saved.dirs || !saved.files) return;
+    if (typeof saved.dirs !== "object" || typeof saved.files !== "object") return;
+    const under = `${CCD_DIR}${path.sep}`;
+    for (const [dir, listing] of Object.entries(saved.dirs)) {
+      if (!dir.startsWith(under) || !listing || typeof listing.mtimeMs !== "number" || !Array.isArray(listing.files)) continue;
+      orgDirs.set(dir, { mtimeMs: listing.mtimeMs, files: listing.files.filter((f): f is string => typeof f === "string") });
+    }
+    for (const [p, f] of Object.entries(saved.files)) {
+      if (!p.startsWith(under) || !f || typeof f.size !== "number" || typeof f.mtimeMs !== "number") continue;
+      index.set(p, { size: f.size, mtimeMs: f.mtimeMs, record: isSavedRecord(f.record) ? f.record : null });
+    }
+    if (index.size === 0 && orgDirs.size === 0) return;
+    rebuildRecords();
+    // The loaded index is the first build of this process; the first refresh
+    // re-stats every file (the save may predate in-place rewrites).
+    version = 1;
+    savedVersion = 1;
+    lastFullStatAtMs = Number.NEGATIVE_INFINITY;
+  })();
+  return loadPromise;
+}
+
+/** Write the index if it changed since the last save. `force` skips the
+ *  interval — the daemon's parting flush and a one-shot pass's end. Returns
+ *  whether a file was written. */
+export async function saveCcdIndexIfChanged(
+  nowMs: number,
+  opts: { force?: boolean } = {},
+): Promise<boolean> {
+  const file = ccdIndexPath();
+  if (file === null || CCD_DIR === null) return false;
+  if (version === savedVersion) return false;
+  if (!opts.force && nowMs - lastSaveAtMs < CCD_INDEX_SAVE_INTERVAL_MS) return false;
+  if (index.size === 0 && orgDirs.size === 0) return false;
+  const saved: SavedCcdIndex = {
+    v: CCD_INDEX_FORMAT,
+    savedAtMs: nowMs,
+    dirs: Object.fromEntries(orgDirs),
+    files: Object.fromEntries(index),
+  };
+  const tmp = `${file}.tmp`;
+  try {
+    await mkdir(path.dirname(file), { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixed path under ~/.let/hx
+    await writeFile(tmp, JSON.stringify(saved), { mode: 0o600 });
+    await rename(tmp, file);
+  } catch {
+    return false; // a cache: the next flush point retries
+  }
+  savedVersion = version;
+  lastSaveAtMs = nowMs;
+  return true;
 }
