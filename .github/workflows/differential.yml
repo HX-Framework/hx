@@ -5,7 +5,7 @@ name: Differential harness
 # fault scenarios against a recording fake gateway, and fails on any
 # difference in what leaves the binary. See harness/README.md.
 #
-# Three jobs prove the harness itself on every pull request:
+# Four jobs run on every pull request:
 #   self          the candidate compared with itself, three runs in a row:
 #                 the harness is deterministic;
 #   differential  the reference compared with the candidate: the change
@@ -13,7 +13,11 @@ name: Differential harness
 #                 can see (or the pull request says why);
 #   caught        the reference compared with deliberately broken candidates:
 #                 the harness detects a changed chunk size, a dropped byte and
-#                 a dropped metadata field.
+#                 a dropped metadata field;
+#   measure       both binaries under rusage and strace: disk writes per pass,
+#                 file checks per second at idle, refused workflow retries,
+#                 the Claude Desktop index — the numbers behind the design
+#                 fixes (harness/run/measure.ts), attached as an artifact.
 #
 # The candidate is any binary: built from the pull request by default, or —
 # on a manual run — from another ref, or downloaded from a URL (an hx2
@@ -284,6 +288,60 @@ jobs:
         with:
           name: harness-differential-${{ matrix.os }}
           path: harness-out
+          if-no-files-found: warn
+
+  measure:
+    name: Measure the design fixes (${{ matrix.os }})
+    needs: [reference, candidate]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # strace counts the daemon's system calls at idle (file checks per
+      # second). Linux only; macOS reports CPU, RSS and block I/O from rusage.
+      - name: Install strace
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y -qq strace > /dev/null
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx-reference-${{ matrix.os }}
+          path: bin/reference
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx-candidate-${{ matrix.os }}
+          path: bin/candidate
+
+      - name: Measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bin/reference/hx bin/candidate/hx
+          bun harness/run/measure.ts \
+            --reference bin/reference/hx --candidate bin/candidate/hx \
+            --out measure-out --work "$RUNNER_TEMP/hx-measure"
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          if [ -f measure-out/measurements.md ]; then cat measure-out/measurements.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: harness-measure-${{ matrix.os }}
+          path: measure-out
           if-no-files-found: warn
 
   caught:
