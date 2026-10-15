@@ -77,12 +77,16 @@ interface Row {
 
 function usageOf(proc: ReturnType<typeof Bun.spawn>, startedAt: number, exit: string): Usage {
   const u = proc.resourceUsage();
+  // Bun 1.3 hands the CPU times back as BigInt (microseconds) although the
+  // declaration says number; every field goes through Number() so arithmetic
+  // and JSON.stringify never meet a BigInt.
+  const n = (v: unknown): number => Number(v);
   return {
     elapsedMs: Date.now() - startedAt,
-    cpuMs: u ? Math.round(u.cpuTime.total / 1000) : -1,
-    maxRssBytes: u ? u.maxRSS : -1,
-    blocksIn: u ? u.ops.in : -1,
-    blocksOut: u ? u.ops.out : -1,
+    cpuMs: u ? Math.round(n(u.cpuTime.total) / 1000) : -1,
+    maxRssBytes: u ? n(u.maxRSS) : -1,
+    blocksIn: u ? n(u.ops.in) : -1,
+    blocksOut: u ? n(u.ops.out) : -1,
     exit,
   };
 }
