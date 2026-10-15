@@ -85,7 +85,9 @@ Normalization (`lib/normalize.ts`) hides exactly: the candidate's name (`hx2`
 each binary's version string, run-relative timestamps (compared with a
 per-scenario tolerance; the fixed content timestamps are compared exactly),
 the connection probe's latency/throughput/grade, the fixture home and work
-paths, local ports, pids and launch tokens.
+paths, local ports, pids and launch tokens. Object key order is not compared
+either: the client adds a top-level key to `state.json` when it first records
+that kind of fact, so the order follows which session it ingested first.
 
 ### Goldens
 
@@ -98,7 +100,8 @@ its normalized value (keys and object lists sorted, timestamps masked), and
 calendar dates are masked too, so a golden holds for months. They are kept per
 OS because the fixture home's path is embedded in every transcript line, and
 its length shapes the byte counts the commands print. To refresh them after a
-deliberate change, download the `harness-differential-<os>` artifact and
+deliberate change in CLI output or in the fixture (the byte counts the
+commands print follow it), download the `harness-differential-<os>` artifact and
 either commit its `goldens/` directory or write them from its reference runs:
 
     bun harness/run/write-goldens.ts --out harness/golden/Linux --run <artifact>/baseline/reference

@@ -19,7 +19,7 @@ exit 1
   "generatedAt": "<t>",
   "ledger": {
     "delivered": 16,
-    "deliveredBytes": 5710562,
+    "deliveredBytes": 5710655,
     "failing": [],
     "incomplete": 0,
     "lagging": [],
@@ -54,7 +54,7 @@ exit 1
     "oldestMs": "<t>",
     "percent": 94,
     "total": 17,
-    "totalBytes": 79113490,
+    "totalBytes": 79113583,
     "uploading": 1,
     "uploadingBytes": 6294064,
     "waiting": 0,
@@ -80,7 +80,7 @@ exit 1
     "done": 16,
     "percent": 94,
     "total": 17,
-    "totalBytes": 79113490
+    "totalBytes": 79113583
   },
   "undiscovered": {
     "fileGone": 0,

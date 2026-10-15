@@ -19,7 +19,7 @@ import { join } from "node:path";
 
 import type { RecordedRequest } from "../gateway/gateway.js";
 import type { Manifest } from "../fixtures/gen-home.js";
-import { isRelTime, keyOrderOf, normalizeJson, normalizeText, type NormalizeContext, DEFAULT_WINDOW_AFTER_MS, DEFAULT_WINDOW_BEFORE_MS } from "./normalize.js";
+import { isRelTime, normalizeJson, normalizeText, type NormalizeContext, DEFAULT_WINDOW_AFTER_MS, DEFAULT_WINDOW_BEFORE_MS } from "./normalize.js";
 import type { BinaryName, CheckResult, RunMeta, Scenario, StepRecord } from "./types.js";
 
 export interface RunDir {
@@ -176,9 +176,10 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     const b = readJsonFile(join(cand.dir, "state.json"));
     const prep = (v: unknown, ctx: NormalizeContext): unknown => normalizeJson(endState ? dropRaceFields(v) : v, ctx);
     checks.push(check("state.json", deepDiff(prep(a, ctxRef), prep(b, ctxCand), tolS), endState ? "identical after normalization (heal counters and attribution flags dropped: end-state scenario)" : "identical after normalization"));
-    const ka = keyOrderOf(a).join(",");
-    const kb = keyOrderOf(b).join(",");
-    checks.push({ name: "state.json key order", ok: ka === kb, details: ka === kb ? `top-level keys: ${ka}` : `reference: ${ka}\ncandidate: ${kb}` });
+    // Key order is not compared: the client adds a top-level key (`artifacts`,
+    // `deletedSessions`) when it first records that kind of fact, so the
+    // order follows which session it ingested first, and discovery order is
+    // a race between pooled stats.
   }
 
   // activity.jsonl. A killed run appends for whatever it committed before the

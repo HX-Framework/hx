@@ -159,9 +159,3 @@ export function normalizeJson(value: unknown, ctx: NormalizeContext, opts: JsonO
 function sortKey(v: unknown): string {
   return JSON.stringify(v, (_k, x) => (isRelTime(x) ? "<t>" : x));
 }
-
-/** Top-level key order of an object, before any sorting — a soft check. */
-export function keyOrderOf(value: unknown): string[] {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-  return Object.keys(value as Record<string, unknown>);
-}
