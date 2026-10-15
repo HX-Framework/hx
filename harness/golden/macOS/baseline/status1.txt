@@ -1,0 +1,15 @@
+exit 0
+--- stdout
+Logged in as:  harness@example.test
+Gateway:       <GATEWAY>
+Daemon:        stopped — run `hx start` to resume
+Watching:      ~/.claude · ~/.codex
+Connection:    up — <quality> (<latency>, <rate>)
+Sessions:      17 on disk · 75.4 MB
+ :             17 in cloud · 69.4 MB
+Session range: <date> – <date> · 40 days
+Sync:          94% — catching up · 6.0 MB left
+  Delivered:   16 sessions · 5.4 MB
+  Uploading:   1 session · 6.0 MB left
+
+--- stderr

@@ -1,0 +1,11 @@
+--- a/src/watch.ts
++++ b/src/watch.ts
+@@ -303,7 +303,7 @@
+   chunkGrowth?: boolean;
+ }
+ 
+-const DEFAULT_CHUNK_LIMIT = 4 * 1024 * 1024;
++const DEFAULT_CHUNK_LIMIT = 3 * 1024 * 1024;
+ /** Chunks one backfilled child lane may send within a single pass. An
+  *  in-window rescue is handed to the catalog and picked up by the walk from
+  *  the next tick, but a DORMANT rescue is not (the walk is windowed), so the

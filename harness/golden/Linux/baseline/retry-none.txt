@@ -1,0 +1,5 @@
+exit 0
+--- stdout
+No blocked sessions to retry. (`hx retry --all` clears every backoff.)
+
+--- stderr

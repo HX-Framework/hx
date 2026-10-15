@@ -1,0 +1,21 @@
+exit 1
+--- stdout
+HX sync — detailed
+SESSIONS
+  Delivered       16   reached every reachable destination
+  Uploading        1   bytes still going to a reachable store
+              ──────
+                  17
+  Range       <date> → <date>  (40 days on disk)
+  Sync 94% = 16 delivered / 17 sendable (live sessions, sessions already safe elsewhere, and sessions no longer on disk are excluded — nothing you can act on)
+
+SESSIONS STILL OWING BYTES — what each one is waiting on
+  claude-cli:58621588-9b3b-4c8f-a579-4c0de0e2ea97  6.0 MB owed · 0d old · uploading
+      last upload <t> · repo acme/repo · attributed unknown
+      letai: 67,108,864 / 73,402,928 B
+Watching: ~/.claude · ~/.codex
+Blocked: none
+
+Child agent lanes: 3 tracked · 3 on disk · 0 pruned · all delivered
+
+--- stderr

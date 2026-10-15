@@ -1,0 +1,6 @@
+exit 0
+--- stdout
+This device is already connected as "harness-device".
+Run `hx disconnect` first if you want to reconnect it.
+
+--- stderr

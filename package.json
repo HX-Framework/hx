@@ -16,7 +16,10 @@
     "build:ui": "cd ui && bun install && bun run build",
     "gen:ui": "bun scripts/gen-ui-assets.ts",
     "build": "bun run build:ui && bun run gen:ui && mkdir -p ./dist && bun build ./src/cli.ts --compile --outfile ./dist/hx",
-    "install:connect": "sh install-from-source.sh"
+    "install:connect": "sh install-from-source.sh",
+    "harness": "bun harness/run/run-harness.ts",
+    "harness:scenario": "bun harness/run/run-scenario.ts",
+    "harness:fixture": "bun harness/fixtures/gen-home.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

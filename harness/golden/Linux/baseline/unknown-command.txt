@@ -1,0 +1,6 @@
+exit 64
+--- stdout
+unknown command: no-such-command
+run `hx help` for the full list.
+
+--- stderr

@@ -1,0 +1,5 @@
+{
+  "commit": "a89c7f5ed4fce013cd58607e02b395fd2787f5a9",
+  "version": "77.11.0",
+  "note": "The reference build for the differential harness: the TypeScript client every candidate (a later TypeScript build, or hx2 from the hx-2.0 branch) is compared against. Move it only when a deliberate, reviewed behavior change lands on main."
+}
