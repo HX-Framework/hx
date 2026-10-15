@@ -255,14 +255,18 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
       const sortLines = step.kind === "run" ? step.sortLines === true : true;
       // A long-running daemon logs on its own clock: how many ticks it ran,
       // how many times a backoff line or a refused retry repeated, is cadence.
-      // Its output is compared as the SET of distinct lines.
+      // Its output is compared as the SET of distinct lines, with the per-tick
+      // counters summed over the run (which tick a session's retry lands in
+      // follows the clock; the totals are the behavior) and the pass-level
+      // backoff's length masked (it doubles once per failing tick in a row,
+      // so it follows the same split).
       const distinct = step.kind === "watch-for";
       const a = normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stdout`)), ctxRef);
       const b = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stdout`)), ctxCand);
       const ea = normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stderr`)), ctxRef);
       const eb = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stderr`)), ctxCand);
       const prep = (s: string): string =>
-        distinct ? [...new Set(s.split("\n").filter((l) => l.trim()))].sort().join("\n") : sortLines ? s.split("\n").sort().join("\n") : s;
+        distinct ? [...new Set(foldDaemonTicks(s.split("\n").filter((l) => l.trim())))].sort().join("\n") : sortLines ? s.split("\n").sort().join("\n") : s;
       // JSON output (hx doctor sync --json) compares structurally, with the
       // timestamp tolerance and tie-prone lists sorted. A killed run's output
       // is timing, and so is what the passes after it have left to send, so
@@ -287,6 +291,28 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   }
 
   return checks;
+}
+
+/** Daemon-step log lines: the `[hx] tick uploaded=N failed=M` lines become
+ *  one `[hx] ticks: uploaded=ΣN failed=ΣM` line, and the pass-level backoff
+ *  loses its length. Exported for the tests. */
+export function foldDaemonTicks(lines: string[]): string[] {
+  let uploaded = 0;
+  let failed = 0;
+  let ticks = 0;
+  const out: string[] = [];
+  for (const l of lines) {
+    const m = /\[hx\] tick uploaded=(\d+) failed=(\d+)$/.exec(l);
+    if (m) {
+      uploaded += Number(m[1]);
+      failed += Number(m[2]);
+      ticks += 1;
+      continue;
+    }
+    out.push(l.replace(/\[hx\] uploads not progressing; backing off \d+s$/, "[hx] uploads not progressing; backing off <n>s"));
+  }
+  if (ticks > 0) out.push(`[hx] ticks: uploaded=${uploaded} failed=${failed}`);
+  return out;
 }
 
 function stepFile(s: StepRecord): string {

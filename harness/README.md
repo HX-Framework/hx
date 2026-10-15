@@ -81,7 +81,7 @@ fault first is not a race.
 | `state.json`, `activity.jsonl`, `config.json`, `settings.json`, `org-names.json` | Normalized deep equality; `activity.jsonl` as a multiset |
 | `state.journal.jsonl` | Empty or absent at the end of every run (candidate and reference alike): the offsets journal (77.12) is folded into `state.json` at every exit that is not a kill, so the compared `state.json` is current and no reader that ignores the journal is stale |
 | `ccd-index.json` | The saved Claude Desktop index (77.12), normalized, when the reference writes one; a reference that predates it says nothing about the candidate, a candidate that drops it while the reference writes it fails |
-| CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes; the SET of distinct lines for a long-running daemon step, whose repetition counts are cadence) |
+| CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes; for a long-running daemon step the SET of distinct lines, with the per-tick `uploaded=`/`failed=` counters summed over the run and the pass-level backoff's length masked — which tick a session's retry lands in follows the clock, and the backoff doubles once per failing tick in a row) |
 | `hx ui` | Every probe's status and normalized JSON |
 | Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); Codex titles come from `state_5.sqlite`; every discovered session reached the store |
 | Coverage | All 24 calls of the protocol appear in the reference recording |
@@ -115,6 +115,7 @@ surface identical: stored bytes, request sequences, `state.json`,
 | Lane and workflow gates | Nothing: an unchanged lane or run made no request before either | none |
 | Workflow upload backoff | Fewer refused `/sessions/workflow` attempts during an outage; a 404/401/403 now pauses the lane like the child lanes | refused workflow uploads compared as presence per run in `watch-for` steps |
 | Stuck-line dedupe key | One `[stuck]` line per hold instead of one per countdown minute | daemon stdout as distinct lines; the stuck line's numbers masked |
+| (not a fix) the daemon's clock | The held sessions' retries land in two ticks whose split varies run to run, so the per-tick counters and the pass-level backoff length vary with them — found by the candidate-vs-itself jobs of the first run | per-tick counters summed, backoff length masked, in daemon steps |
 | Saved Claude Desktop index (`ccd-index.json`) | A new cache file in `~/.let/hx` | compared when the reference writes it |
 | File events as hints | Nothing, unless watching fails: one `[hx] file events unavailable (…)` line | none (a failure to arm shows up as a diff, which is the point) |
 
