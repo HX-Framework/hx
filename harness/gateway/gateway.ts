@@ -135,7 +135,10 @@ export class FakeGateway {
   private server: Server<undefined> | null = null;
   private startedAt = 0;
   private seq = 0;
-  private chunkSeq = 0;
+  /** Per-object chunk counters: a chunk id names its session (or lane) and
+   *  its ordinal there, so two runs agree on it however the upload pool
+   *  interleaves sessions. A global counter leaked pool timing into ids. */
+  private chunkCounters = new Map<string, number>();
   private pollCount = new Map<string, number>();
   private deviceCodeSeq = 0;
   private chunks = new Map<string, StagedChunk>();
@@ -200,6 +203,12 @@ export class FakeGateway {
   /** The canonical bytes of one object, for debugging a diff. */
   canonicalBytes(key: string): Buffer | null {
     return this.canonical.get(key)?.bytes ?? null;
+  }
+
+  private nextChunkId(prefix: string, key: string): string {
+    const n = (this.chunkCounters.get(key) ?? 0) + 1;
+    this.chunkCounters.set(key, n);
+    return `${prefix}_${key.replace(/[^A-Za-z0-9._-]/g, ".")}.${String(n).padStart(4, "0")}`;
   }
 
   private note(entry: Omit<RecordedRequest, "seq" | "tMs" | "label">): void {
@@ -387,7 +396,7 @@ export class FakeGateway {
       const destinations = [null, ...vaultIds].map((vaultOrgId) => {
         const held = vaultOrgId ? c.heldVaults[vaultOrgId] : undefined;
         if (held) return { vaultOrgId, status: "held" as const, ...held };
-        const chunkId = `c${String(++this.chunkSeq).padStart(6, "0")}`;
+        const chunkId = this.nextChunkId("c", `${family}.${sessionId}.${destKey(vaultOrgId)}`);
         this.chunks.set(chunkId, { sessionKey, lane: null, vaultOrgId, bytes: null });
         return {
           vaultOrgId,
@@ -416,7 +425,7 @@ export class FakeGateway {
       if (!sessionKey || !agentId) return json({ error: "bad_request" }, 400);
       annotate.lane = agentId;
       if (tombstoned) return json({ error: "session_deleted" }, 410);
-      const chunkId = `a${String(++this.chunkSeq).padStart(6, "0")}`;
+      const chunkId = this.nextChunkId("a", `${family}.${sessionId}.${agentId}`);
       this.chunks.set(chunkId, { sessionKey, lane: agentId, vaultOrgId: null, bytes: null });
       return json({
         chunkId,

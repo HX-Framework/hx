@@ -69,6 +69,9 @@ export interface Scenario {
   compare: CompareSpec;
   /** CLI steps whose normalized output is also kept as a golden file. */
   goldens?: string[];
+  /** Whether every discovered fixture session must be in the store at the
+   *  end (false for scenarios that keep sessions back on purpose). */
+  storeComplete?: boolean;
 }
 
 export interface StepRecord {

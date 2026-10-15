@@ -44,10 +44,12 @@ interface Spawned {
   timedOut: boolean;
 }
 
-function baseEnv(home: string): Record<string, string> {
+function baseEnv(home: string, gateway?: { url: string; token: string }): Record<string, string> {
   return {
     PATH: process.env.PATH ?? "/usr/bin:/bin",
     HOME: home,
+    // For the driver's stub binary only; hx reads its gateway from config.json.
+    ...(gateway ? { HX_HARNESS_GATEWAY_URL: gateway.url, HX_HARNESS_ACCESS_TOKEN: gateway.token } : {}),
     USERPROFILE: home,
     TZ: "UTC",
     LANG: "en_US.UTF-8",
@@ -150,7 +152,7 @@ export async function runScenario(o: DriverOptions): Promise<RunMeta> {
   writeHxFile(o.home, "device-id", DEVICE_ID);
   writeHxFile(o.home, "settings.json", JSON.stringify(scenario.settings ?? {}, null, 2));
 
-  const env = baseEnv(o.home);
+  const env = baseEnv(o.home, { url: gatewayUrl, token: cloud.config.accessToken });
   const steps: StepRecord[] = [];
   const failures: string[] = [];
   const stepFile = (index: number, name: string): string => join(o.outDir, "steps", `${String(index).padStart(2, "0")}-${name}`);
@@ -265,7 +267,12 @@ async function runStep(step: Step, c: StepCtx): Promise<void> {
       return;
     case "settings": {
       const p = join(c.home, ".let", "hx", "settings.json");
-      const current = existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>) : {};
+      let current: Record<string, unknown> = {};
+      try {
+        current = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+      } catch {
+        // not written yet
+      }
       writeFileSync(p, JSON.stringify({ ...current, ...step.patch }, null, 2), { mode: 0o600 });
       return;
     }
@@ -410,8 +417,10 @@ async function runUiStep(port: number, c: StepCtx): Promise<void> {
     const folders = [...(snapshot?.folders ?? [])].sort((a, b) => a.id.localeCompare(b.id)).slice(0, 3);
     let previewPath: string | null = null;
     for (const f of folders) {
-      const sessions = (await call(`sessions ${f.id}`, "GET", `/api/sessions?folder=${encodeURIComponent(f.id)}`)) as Array<{ path: string }> | null;
-      if (!previewPath && Array.isArray(sessions) && sessions[0]) previewPath = sessions[0].path;
+      const sessions = (await call(`sessions ${f.id}`, "GET", `/api/sessions?folder=${encodeURIComponent(f.id)}`)) as Array<{ id: string; path: string }> | null;
+      // The list is ordered by last upload, a millisecond tie: pick by id.
+      const first = Array.isArray(sessions) ? [...sessions].sort((x, y) => x.id.localeCompare(y.id))[0] : undefined;
+      if (!previewPath && first) previewPath = first.path;
     }
     await call("sessions-missing-folder", "GET", "/api/sessions");
     if (previewPath) await call("session-preview", "GET", `/api/session-preview?path=${encodeURIComponent(previewPath)}`);

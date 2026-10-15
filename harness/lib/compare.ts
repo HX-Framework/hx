@@ -140,15 +140,21 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     }
   }
 
-  // Stored bytes.
-  {
-    const a = JSON.parse(readFileSync(join(ref.dir, "store.json"), "utf8")) as Record<string, unknown>;
-    const b = JSON.parse(readFileSync(join(cand.dir, "store.json"), "utf8")) as Record<string, unknown>;
-    checks.push(check("stored bytes", deepDiff(a, b, 0), `${Object.keys(a).length} objects identical`));
-    if (ref.meta.fortressUrl) {
-      const fa = JSON.parse(readFileSync(join(ref.dir, "fortress-store.json"), "utf8")) as Record<string, unknown>;
-      const fb = JSON.parse(readFileSync(join(cand.dir, "fortress-store.json"), "utf8")) as Record<string, unknown>;
-      checks.push(check("fortress stored bytes", deepDiff(fa, fb, 0), `${Object.keys(fa).length} objects identical`));
+  // Stored bytes: every object's size and sha256. How many chunks composed
+  // an object is a request-level fact, checked apart (and not after a kill,
+  // where a self-heal may recompose a file from zero).
+  const endState = opts.scenario.compare.requests === "end-state";
+  const storeFiles: Array<[string, string]> = [["store.json", "stored bytes"], ...(ref.meta.fortressUrl ? [["fortress-store.json", "fortress stored bytes"] as [string, string]] : [])];
+  for (const [file, label] of storeFiles) {
+    const a = readStore(join(ref.dir, file));
+    const b = readStore(join(cand.dir, file));
+    const bytesOnly = (m: StoreManifest): Record<string, { bytes: number; sha256: string }> =>
+      Object.fromEntries(Object.entries(m).map(([k, v]) => [k, { bytes: v.bytes, sha256: v.sha256 }]));
+    checks.push(check(label, deepDiff(bytesOnly(a), bytesOnly(b), 0), `${Object.keys(a).length} objects identical`));
+    if (!endState) {
+      const chunks = (m: StoreManifest): Record<string, number> =>
+        Object.fromEntries(Object.entries(m).filter(([, v]) => v.components !== undefined).map(([k, v]) => [k, v.components as number]));
+      checks.push(check(`${label}: composed chunks`, deepDiff(chunks(a), chunks(b), 0), "every object composed from the same number of chunks"));
     }
   }
 
@@ -160,16 +166,16 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     checks.push({ name: "requests", ok: true, details: "end-state scenario: request sequences not compared" });
   }
 
-  // state.json. After a SIGKILL, whether a chunk was committed on the gateway
-  // but not yet recorded locally is a race; the self-heal that follows
-  // leaves a heal counter on a one-chunk file. End-state scenarios drop those
-  // two fields; everything else in the state must still agree.
-  const endState = opts.scenario.compare.requests === "end-state";
+  // state.json. After a SIGKILL, which file was mid-ingest is a race: a
+  // chunk committed on the gateway but not yet recorded locally self-heals
+  // and leaves a heal counter, and a file killed before its route echo never
+  // gets its `attributed` flag until it grows. End-state scenarios drop
+  // those fields; everything else in the state must still agree.
   {
     const a = readJsonFile(join(ref.dir, "state.json"));
     const b = readJsonFile(join(cand.dir, "state.json"));
-    const prep = (v: unknown, ctx: NormalizeContext): unknown => normalizeJson(endState ? dropHealFields(v) : v, ctx);
-    checks.push(check("state.json", deepDiff(prep(a, ctxRef), prep(b, ctxCand), tolS), endState ? "identical after normalization (heal counters dropped: end-state scenario)" : "identical after normalization"));
+    const prep = (v: unknown, ctx: NormalizeContext): unknown => normalizeJson(endState ? dropRaceFields(v) : v, ctx);
+    checks.push(check("state.json", deepDiff(prep(a, ctxRef), prep(b, ctxCand), tolS), endState ? "identical after normalization (heal counters and attribution flags dropped: end-state scenario)" : "identical after normalization"));
     const ka = keyOrderOf(a).join(",");
     const kb = keyOrderOf(b).join(",");
     checks.push({ name: "state.json key order", ok: ka === kb, details: ka === kb ? `top-level keys: ${ka}` : `reference: ${ka}\ncandidate: ${kb}` });
@@ -216,22 +222,23 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
       const eb = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stderr`)), ctxCand);
       const prep = (s: string): string => (sortLines ? s.split("\n").sort().join("\n") : s);
       // JSON output (hx doctor sync --json) compares structurally, with the
-      // timestamp tolerance; a killed run's output is timing and only its exit
-      // matters.
+      // timestamp tolerance and tie-prone lists sorted. A killed run's output
+      // is timing, and so is what the passes after it have left to send, so
+      // end-state scenarios compare only the exit of their watch steps.
       const ja = parseJsonOrNull(readText(join(ref.dir, "steps", `${stepFile(rs)}.stdout`)));
       const jb = parseJsonOrNull(readText(join(cand.dir, "steps", `${stepFile(cs)}.stdout`)));
-      const outDiff =
-        step.kind === "watch-kill"
-          ? []
-          : ja !== null && jb !== null
-            ? [...deepDiff(normalizeJson(ja, ctxRef), normalizeJson(jb, ctxCand), tolS).map((d) => `${d.path}: ${d.left} ≠ ${d.right}`), ...diffText(prep(ea), prep(eb)).map((l) => `stderr ${l}`)]
-            : [...diffText(prep(a), prep(b)), ...diffText(prep(ea), prep(eb)).map((l) => `stderr ${l}`)];
+      const timingOnly = step.kind === "watch-kill" || (endState && step.args[0] === "watch");
+      const outDiff = timingOnly
+        ? []
+        : ja !== null && jb !== null
+          ? [...deepDiff(normalizeJson(ja, ctxRef, { sortObjectArrays: true }), normalizeJson(jb, ctxCand, { sortObjectArrays: true }), tolS).map((d) => `${d.path}: ${d.left} ≠ ${d.right}`), ...diffText(prep(ea), prep(eb)).map((l) => `stderr ${l}`)]
+          : [...diffText(prep(a), prep(b)), ...diffText(prep(ea), prep(eb)).map((l) => `stderr ${l}`)];
       const lines = [...(codeOk ? [] : [`exit: ${rs.exitCode ?? rs.signal} ≠ ${cs.exitCode ?? cs.signal}`]), ...outDiff];
       checks.push(check(`step ${step.name}`, lines, `exit ${rs.exitCode ?? rs.signal}, output identical`));
     } else if (step.kind === "ui") {
       const a = readJsonFile(join(ref.dir, "steps", `${stepFile(rs)}.json`));
       const b = readJsonFile(join(cand.dir, "steps", `${stepFile(cs)}.json`));
-      checks.push(check(`step ${step.name}`, deepDiff(normalizeJson(a, ctxRef), normalizeJson(b, ctxCand), tolS), "every probe identical"));
+      checks.push(check(`step ${step.name}`, deepDiff(normalizeJson(a, ctxRef, { sortObjectArrays: true }), normalizeJson(b, ctxCand, { sortObjectArrays: true }), tolS), "every probe identical"));
     }
   }
 
@@ -256,16 +263,22 @@ function parseJsonOrNull(s: string): unknown {
   }
 }
 
-function dropHealFields(v: unknown): unknown {
+function dropRaceFields(v: unknown): unknown {
   if (!v || typeof v !== "object") return v;
   const state = v as { files?: Record<string, Record<string, unknown>> };
   if (!state.files) return v;
   const files: Record<string, Record<string, unknown>> = {};
   for (const [k, f] of Object.entries(state.files)) {
-    const { healCount: _h, healPausedUntilMs: _p, ...rest } = f;
+    const { healCount: _h, healPausedUntilMs: _p, attributed: _a, ...rest } = f;
     files[k] = rest;
   }
   return { ...state, files };
+}
+
+type StoreManifest = Record<string, { bytes: number; sha256: string; components?: number }>;
+
+function readStore(p: string): StoreManifest {
+  return existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as StoreManifest) : {};
 }
 
 function readJsonFile(p: string): unknown {
@@ -380,6 +393,13 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
         if ((la.length > 0) !== (lb.length > 0)) diffs.push(`${key}: present in ${la.length > 0 ? "reference" : "candidate"} only`);
         continue;
       }
+      if (path === "/route") {
+        // Route discovery is single-flight per repo: pooled workers that
+        // overlap share one fetch, so the count follows timing. Presence is
+        // the fact, and the sequence of distinct repos asked about.
+        if ((la.length > 0) !== (lb.length > 0)) diffs.push(`${key}: present in ${la.length > 0 ? "reference" : "candidate"} only`);
+        continue;
+      }
       if (path === "/devices/sync-status") {
         // Progress reports are throttled to 1.5 s and sent without waiting:
         // which snapshots go out is timing. Presence is the fact.
@@ -398,7 +418,8 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
         for (const line of diffText(fa.join("\n"), fb.join("\n"), 8)) diffs.push(`${key} items ${line}`);
         const statuses = (l: NormalizedRequest[]): string => l.map((r) => r.status).join(",");
         if (statuses(la) !== statuses(lb)) diffs.push(`${key} statuses: ${statuses(la)} ≠ ${statuses(lb)}`);
-        const headers = (l: NormalizedRequest[]): string => (l[0] ? JSON.stringify(l[0].headers) : "");
+        // Headers apart from content-length, which follows the items' order.
+        const headers = (l: NormalizedRequest[]): string => (l[0] ? JSON.stringify({ ...l[0].headers, "content-length": undefined }) : "");
         if (headers(la) !== headers(lb)) diffs.push(`${key} headers: ${headers(la)} ≠ ${headers(lb)}`);
         continue;
       }
@@ -411,7 +432,7 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
 
 // ── Fixture expectations and coverage ──────────────────────────────────────
 
-export function fixtureExpectationChecks(run: RunDir): CheckResult[] {
+export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): CheckResult[] {
   const manifestPath = join(run.dir, "fixture.manifest.json");
   if (!existsSync(manifestPath)) return [];
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Manifest;
@@ -443,13 +464,16 @@ export function fixtureExpectationChecks(run: RunDir): CheckResult[] {
   }
   checks.push(check("fixture: codex titles from state_5.sqlite", missing, `${Object.keys(manifest.expectations.codexTitles).length} titles`));
 
-  // Every in-window session reached the store.
-  const stored = JSON.parse(readFileSync(join(run.dir, "store.json"), "utf8")) as Record<string, { bytes: number }>;
-  const notStored = manifest.sessions
-    .filter((s) => !Object.keys(stored).some((k) => k.startsWith(`${s.family}:${s.sessionId}:`)))
-    .map((s) => `${s.family}:${s.sessionId} (${s.note ?? ""})`);
-  // Twins share a session: one store object covers both manifest rows.
-  checks.push(check("fixture: every discovered session is in the store", notStored, `${manifest.sessions.length} manifest sessions`));
+  // Every in-window session reached a store (the cloud one or the fortress),
+  // unless the scenario keeps sessions back on purpose.
+  if (scenario.storeComplete !== false) {
+    const stored = { ...readStore(join(run.dir, "store.json")), ...readStore(join(run.dir, "fortress-store.json")) };
+    const notStored = manifest.sessions
+      .filter((s) => !Object.keys(stored).some((k) => k.startsWith(`${s.family}:${s.sessionId}:`)))
+      .map((s) => `${s.family}:${s.sessionId} (${s.note ?? ""})`);
+    // Twins share a session: one store object covers both manifest rows.
+    checks.push(check("fixture: every discovered session is in the store", notStored, `${manifest.sessions.length} manifest sessions`));
+  }
   return checks;
 }
 
@@ -481,7 +505,7 @@ export const PROTOCOL_CALLS: Array<{ name: string; method: string; path: RegExp 
   { name: "download/hx-<os>-<arch>.gz + .sha256", method: "GET", path: /^\/download\/hx2?-[a-z]+-[a-z0-9]+\.(gz|sha256)$/ },
 ];
 
-export function coverageCheck(runDirs: string[]): CheckResult {
+export function coverageCheck(runDirs: string[], required = true): CheckResult {
   const seen = new Map<string, number>();
   for (const dir of runDirs) {
     for (const file of ["gateway.jsonl", "fortress.jsonl"]) {
@@ -494,7 +518,8 @@ export function coverageCheck(runDirs: string[]): CheckResult {
   }
   const missing = PROTOCOL_CALLS.filter((c) => !seen.has(c.name)).map((c) => c.name);
   const lines = PROTOCOL_CALLS.map((c) => `${seen.has(c.name) ? "✓" : "✗"} ${c.name}: ${seen.get(c.name) ?? 0}`);
-  return { name: "coverage: all 24 calls recorded", ok: missing.length === 0, details: lines.join("\n") };
+  if (!required) lines.push("(advisory: not every scenario ran)");
+  return { name: "coverage: all 24 calls recorded", ok: missing.length === 0 || !required, details: lines.join("\n") };
 }
 
 /** Every step output file in a run dir, for the golden writer. */

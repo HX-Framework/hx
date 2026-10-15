@@ -169,6 +169,7 @@ export const SCENARIOS: Scenario[] = [
     seed: "tombstone",
     settings: SERIAL,
     gateway: { tombstones: ["<SESSION:0>"] },
+    storeComplete: false,
     steps: [
       once("watch1"),
       status("status1"),
@@ -187,6 +188,9 @@ export const SCENARIOS: Scenario[] = [
       { kind: "watch-kill", name: "watch-killed", killAfterCommits: 10, putDelayMs: 200 },
       once("watch1"),
       once("watch2"),
+      // A session killed between its commit and its sidecar sync keeps its
+      // tasks and plan unsent until it grows; hx backfill is the way back.
+      { kind: "run", name: "backfill", args: ["backfill"], sortLines: true, expectExit: 0 },
       status("status1"),
       { kind: "run", name: "doctor-json", args: ["doctor", "sync", "--json"] },
     ],
@@ -201,7 +205,8 @@ export const SCENARIOS: Scenario[] = [
     steps: [
       { kind: "chmod-hx-dir", name: "state-readonly", mode: 0o555 },
       once("watch1"),
-      status("status1"),
+      // status caches the whoami email in config.json, which it cannot write.
+      { kind: "run", name: "status1", args: ["status"], expectExit: 1 },
       { kind: "chmod-hx-dir", name: "state-writable", mode: 0o700 },
       once("watch2"),
       status("status2"),
@@ -257,6 +262,7 @@ export const SCENARIOS: Scenario[] = [
     seed: "excluded",
     settings: { ...SERIAL, personalSync: false, excludeRules: ["~/scratch"] },
     gateway: { routes: { "acme/repo": { attributedOrgIds: ["org-acme"] } } },
+    storeComplete: false,
     steps: [once("watch1"), { kind: "run", name: "doctor-json", args: ["doctor", "sync", "--json"] }, status("status1"), once("watch2")],
     compare: { requests: "per-session", tsToleranceMs: 20_000 },
   },

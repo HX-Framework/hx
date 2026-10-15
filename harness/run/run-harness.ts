@@ -74,8 +74,8 @@ for (const scenario of scenarios) {
   const cand = loadRun(candDir);
   const checks: CheckResult[] = [
     ...compareRuns(ref, cand, { scenario, candidateName }),
-    ...fixtureExpectationChecks(ref).map((c) => ({ ...c, name: `reference ${c.name}` })),
-    ...fixtureExpectationChecks(cand).map((c) => ({ ...c, name: `candidate ${c.name}` })),
+    ...fixtureExpectationChecks(ref, scenario).map((c) => ({ ...c, name: `reference ${c.name}` })),
+    ...fixtureExpectationChecks(cand, scenario).map((c) => ({ ...c, name: `candidate ${c.name}` })),
     ...goldenChecks(scenario, cand, candidateName, [ref.meta.version, cand.meta.version]),
   ];
   if (writeGoldensDir) writeGoldens(scenario, ref, candidateName, [ref.meta.version, cand.meta.version], writeGoldensDir);
@@ -85,7 +85,7 @@ for (const scenario of scenarios) {
   for (const c of checks.filter((x) => !x.ok)) log(`    ✗ ${c.name}\n${indent(c.details)}`);
 }
 
-const coverage = coverageCheck(referenceDirs);
+const coverage = coverageCheck(referenceDirs, (arg("scenarios", "all") ?? "all") === "all");
 const allOk = reports.every((r) => r.ok) && coverage.ok;
 const report: HarnessReport = {
   generatedAt: new Date().toISOString(),

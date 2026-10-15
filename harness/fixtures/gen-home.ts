@@ -537,6 +537,9 @@ function writeCore(ctx: Ctx): Core {
   const account = "acct_fixture";
   const org = "org_fixture";
   const localIds = { repoCli: `local_${rng.uuid()}`, repoDesktop: `local_${rng.uuid()}`, unknown: `local_${rng.uuid()}`, archived: `local_${rng.uuid()}`, noCli: `local_${rng.uuid()}` };
+  // A session Claude Desktop knows by a CLI id that has no transcript on
+  // disk: the client still resolves the group member to that CLI id.
+  const unknownCli = rng.uuid();
   const ccdFile = (localId: string, cliSessionId: string | null, title: string, titleSource: "user" | "ai", isArchived: boolean, idx: number): void => {
     write(
       ctx,
@@ -547,7 +550,7 @@ function writeCore(ctx: Ctx): Core {
   };
   ccdFile(localIds.repoCli, repoCli.sessionId, "Offsets journal design (desktop name)", "ai", false, 0);
   ccdFile(localIds.repoDesktop, repoDesktop.sessionId, "Pipeline review", "user", false, 1);
-  ccdFile(localIds.unknown, rng.uuid(), "A session with no transcript on disk", "ai", false, 2);
+  ccdFile(localIds.unknown, unknownCli, "A session with no transcript on disk", "ai", false, 2);
   ccdFile(localIds.archived, rng.uuid(), "Archived session", "user", true, 3);
   ccdFile(localIds.noCli, null, "Session without a CLI id yet", "ai", false, 4);
 
@@ -592,9 +595,9 @@ function writeCore(ctx: Ctx): Core {
     groupingEnabled: true,
     groups: [
       { id: "cg-alpha", name: "Alpha", subtitle: null, sectionName: "Work", collapsed: false, sessionIds: [repoCli.sessionId, repoDesktop.sessionId] },
-      { id: "cg-beta", name: "Beta", subtitle: "second group", sectionName: null, collapsed: true, sessionIds: [localIds.unknown, localIds.noCli] },
+      { id: "cg-beta", name: "Beta", subtitle: "second group", sectionName: null, collapsed: true, sessionIds: [unknownCli, localIds.noCli] },
     ],
-    unreadIds: [repoCli.sessionId, localIds.unknown],
+    unreadIds: [repoCli.sessionId, unknownCli],
   };
 
   return { repoCli, repoDesktop, subagentParent };

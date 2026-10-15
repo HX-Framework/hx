@@ -96,11 +96,24 @@ export function isRelTime(v: unknown): v is RelTime {
   return typeof v === "object" && v !== null && "$t" in v && Object.keys(v).length === 1;
 }
 
+/** Keys whose values are per-run secrets or measurements, never facts. */
+const TOKEN_KEYS = new Set(["sessionToken", "launchToken", "ownerKey", "serverProof"]);
+const MEASURE_KEYS = new Set(["latencyMs", "bytesPerSec"]);
+
+export interface JsonOptions {
+  /** Sort arrays of objects by their content: for lists the client orders
+   *  by a tie-prone key (hx ui folders by session count, recent uploads by
+   *  millisecond, sessions by last upload) where discovery order decides
+   *  ties. Arrays of primitives keep their order. */
+  sortObjectArrays?: boolean;
+}
+
 /**
  * Normalize a JSON value: strings through normalizeText, epoch-millisecond
- * numbers inside the window into run-relative seconds, object keys sorted.
+ * numbers inside the window into run-relative seconds, object keys sorted,
+ * per-run tokens and probe measurements replaced.
  */
-export function normalizeJson(value: unknown, ctx: NormalizeContext): unknown {
+export function normalizeJson(value: unknown, ctx: NormalizeContext, opts: JsonOptions = {}): unknown {
   if (typeof value === "string") return normalizeText(value, ctx);
   if (typeof value === "number") {
     if (Number.isFinite(value) && value > 1e12 && value < 4e12 && inWindow(value, ctx)) {
@@ -108,16 +121,32 @@ export function normalizeJson(value: unknown, ctx: NormalizeContext): unknown {
     }
     return value;
   }
-  if (Array.isArray(value)) return value.map((v) => normalizeJson(v, ctx));
+  if (Array.isArray(value)) {
+    const items = value.map((v) => normalizeJson(v, ctx, opts));
+    if (opts.sortObjectArrays && items.some((v) => v && typeof v === "object" && !isRelTime(v))) {
+      return [...items].sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : 0));
+    }
+    return items;
+  }
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const k of Object.keys(value as Record<string, unknown>).sort()) {
       const nk = normalizeText(k, ctx);
-      out[nk] = normalizeJson((value as Record<string, unknown>)[k], ctx);
+      const v = (value as Record<string, unknown>)[k];
+      if (TOKEN_KEYS.has(k) && typeof v === "string") out[nk] = "<token>";
+      else if (MEASURE_KEYS.has(k) && typeof v === "number") out[nk] = "<measured>";
+      else if (k === "quality" && typeof v === "string") out[nk] = "<quality>";
+      else out[nk] = normalizeJson(v, ctx, opts);
     }
     return out;
   }
   return value;
+}
+
+/** A stable sort key: the normalized value with run-relative times masked,
+ *  so a one-second drift cannot reorder two runs differently. */
+function sortKey(v: unknown): string {
+  return JSON.stringify(v, (_k, x) => (isRelTime(x) ? "<t>" : x));
 }
 
 /** Top-level key order of an object, before any sorting — a soft check. */
