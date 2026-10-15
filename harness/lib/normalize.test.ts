@@ -19,11 +19,18 @@ const ctx = (shift = 0): NormalizeContext => ({
 
 describe("normalizeJson with sortObjectArrays", () => {
   it("makes tie-ordered lists compare equal, even when run-relative times drift within tolerance", () => {
-    const folderA = { id: "claude-cli:~/work/acme-repo", branch: "main", sessions: 6, lastUploadAtMs: anchor + 5_000, attributed: null };
-    const folderB = { id: "claude-cli:~/work/acme-repo/.worktrees/wt1", branch: "feature", sessions: 2, lastUploadAtMs: anchor + 7_000, attributed: false };
+    interface Folder {
+      id: string;
+      branch: string;
+      sessions: number;
+      lastUploadAtMs: number;
+      attributed: boolean | null;
+    }
+    const folderA: Folder = { id: "claude-cli:~/work/acme-repo", branch: "main", sessions: 6, lastUploadAtMs: anchor + 5_000, attributed: null };
+    const folderB: Folder = { id: "claude-cli:~/work/acme-repo/.worktrees/wt1", branch: "feature", sessions: 2, lastUploadAtMs: anchor + 7_000, attributed: false };
     const runA = { probes: [{ name: "snapshot", body: { folders: [folderA, folderB], generatedAt: new Date(anchor + 9_000).toISOString() } }] };
     // The second run saw the folders the other way round and its clock 3 s later.
-    const later = (f: typeof folderA): typeof folderA => ({ ...f, lastUploadAtMs: f.lastUploadAtMs + 3_000 });
+    const later = (f: Folder): Folder => ({ ...f, lastUploadAtMs: f.lastUploadAtMs + 3_000 });
     const runB = { probes: [{ name: "snapshot", body: { folders: [later(folderB), later(folderA)], generatedAt: new Date(anchor + 12_000).toISOString() } }] };
     const a = normalizeJson(runA, ctx(0), { sortObjectArrays: true });
     const b = normalizeJson(runB, ctx(3_000), { sortObjectArrays: true });
