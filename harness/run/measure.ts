@@ -120,7 +120,8 @@ async function runDaemon(
     }
     await new Promise((r) => setTimeout(r, 50));
   }
-  proc.kill("SIGTERM");
+  // A command that ended on its own (a `timeout`-wrapped daemon) needs no stop.
+  if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGTERM");
   const stopAt = Date.now() + 20_000;
   while (Date.now() < stopAt && proc.exitCode === null && proc.signalCode === null) await new Promise((r) => setTimeout(r, 50));
   if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
@@ -243,11 +244,12 @@ async function measureWrites(binary: string): Promise<Measurement> {
 // ── idle-syscalls / idle-cpu (file events, the lane and workflow gates) ─────
 
 function parseStraceSummary(text: string): Record<string, number> {
-  // strace -c: "% time  seconds  usecs/call  calls  errors  syscall" rows.
+  // strace -c: "% time  seconds  usecs/call  calls  errors  syscall" rows,
+  // then a "total" row that must not be counted as a call.
   const counts: Record<string, number> = {};
   for (const line of text.split("\n")) {
     const m = /^\s*[\d.]+\s+[\d.]+\s+\d+\s+(\d+)\s+(?:\d+\s+)?([a-z_0-9]+)\s*$/.exec(line);
-    if (m) counts[m[2]!] = (counts[m[2]!] ?? 0) + Number(m[1]);
+    if (m && m[2] !== "total") counts[m[2]!] = (counts[m[2]!] ?? 0) + Number(m[1]);
   }
   return counts;
 }
@@ -260,13 +262,21 @@ async function measureIdle(binary: string): Promise<Measurement> {
     const result: Measurement = {};
     const IDLE_MS = 75_000;
     const strace = process.platform === "linux" ? Bun.which("strace") : null;
-    if (strace) {
+    const timeout = Bun.which("timeout");
+    if (strace && timeout) {
       const summary = join(workDir, `strace-${binary.replace(/[^a-z0-9]/gi, "_")}.txt`);
       rmSync(summary, { force: true });
-      const traced = await runDaemon([strace, "-f", "-c", "-o", summary, binary, "watch"], h.env, IDLE_MS);
+      // `timeout` is the traced parent and stops the daemon with SIGTERM after
+      // IDLE_MS; strace then exits with the summary. Stopping strace itself
+      // would only detach it and leave the daemon running.
+      const traced = await runDaemon(
+        [strace, "-f", "-c", "-o", summary, timeout, "-s", "TERM", String(IDLE_MS / 1000), binary, "watch"],
+        h.env,
+        IDLE_MS + 30_000,
+      );
       const counts = existsSync(summary) ? parseStraceSummary(readFileSync(summary, "utf8")) : {};
       const sum = (names: string[]): number => names.reduce((a, n) => a + (counts[n] ?? 0), 0);
-      const secs = traced.elapsedMs / 1000;
+      const secs = IDLE_MS / 1000;
       const stat = sum(["newfstatat", "statx", "stat", "lstat", "fstat", "fstatat64"]);
       const open = sum(["openat", "open"]);
       const dents = sum(["getdents64", "getdents"]);
@@ -274,6 +284,7 @@ async function measureIdle(binary: string): Promise<Measurement> {
       const total = Object.values(counts).reduce((a, b) => a + b, 0);
       Object.assign(result, {
         tracedSecs: Math.round(secs),
+        tracedExit: traced.exit,
         statPerSec: Math.round(stat / secs),
         openPerSec: Math.round(open / secs),
         readdirPerSec: Math.round(dents / secs),
