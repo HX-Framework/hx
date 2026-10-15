@@ -30,3 +30,4 @@ CLAUDE.local.md
 # Differential harness scratch (see harness/README.md)
 .harness-work/
 .harness-out/
+harness-out/

@@ -219,19 +219,19 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/candidate/hx --reference-name "$CANDIDATE_NAME" \
             --candidate bin/candidate/hx --candidate-name "$CANDIDATE_NAME" \
-            --scenarios "$SCENARIOS" --out .harness-out --work "$RUNNER_TEMP/hx-harness"
+            --scenarios "$SCENARIOS" --out harness-out --work "$RUNNER_TEMP/hx-harness"
 
       - name: Report
         if: always()
         shell: bash
         run: |
-          if [ -f .harness-out/report.md ]; then cat .harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f harness-out/report.md ]; then cat harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: harness-self-${{ matrix.os }}-run${{ matrix.run }}
-          path: .harness-out
+          path: harness-out
           if-no-files-found: warn
 
   differential:
@@ -270,20 +270,20 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/reference/hx \
             --candidate bin/candidate/hx --candidate-name "$CANDIDATE_NAME" \
-            --scenarios "$SCENARIOS" --out .harness-out --work "$RUNNER_TEMP/hx-harness" \
-            --goldens "harness/golden/$RUNNER_OS_NAME" --write-goldens ".harness-out/goldens/$RUNNER_OS_NAME"
+            --scenarios "$SCENARIOS" --out harness-out --work "$RUNNER_TEMP/hx-harness" \
+            --goldens "harness/golden/$RUNNER_OS_NAME" --write-goldens "harness-out/goldens/$RUNNER_OS_NAME"
 
       - name: Report
         if: always()
         shell: bash
         run: |
-          if [ -f .harness-out/report.md ]; then cat .harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f harness-out/report.md ]; then cat harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: harness-differential-${{ matrix.os }}
-          path: .harness-out
+          path: harness-out
           if-no-files-found: warn
 
   caught:
@@ -319,17 +319,17 @@ jobs:
           chmod +x bin/reference/hx bin/broken/hx
           bun harness/run/run-harness.ts \
             --reference bin/reference/hx --candidate bin/broken/hx \
-            --scenarios baseline --expect fail --out .harness-out --work "$RUNNER_TEMP/hx-harness"
+            --scenarios baseline --expect fail --out harness-out --work "$RUNNER_TEMP/hx-harness"
 
       - name: Report
         if: always()
         shell: bash
         run: |
-          if [ -f .harness-out/report.md ]; then cat .harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f harness-out/report.md ]; then cat harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: harness-caught-${{ matrix.patch }}
-          path: .harness-out/report.md
+          path: harness-out/report.md
           if-no-files-found: warn

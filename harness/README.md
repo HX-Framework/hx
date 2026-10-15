@@ -113,7 +113,7 @@ The entry points, for a CI job or a dedicated machine:
 
 ```
 bun harness/run/run-harness.ts --reference <bin> --candidate <bin> [--candidate-name hx2] \
-    [--scenarios all|a,b] [--out .harness-out] [--expect pass|fail] [--goldens harness/golden/Linux]
+    [--scenarios all|a,b] [--out harness-out] [--expect pass|fail] [--goldens harness/golden/Linux]
 bun harness/run/run-scenario.ts --binary <bin> --scenario baseline --out <dir>
 bun harness/fixtures/gen-home.ts --out <home> --shape small --seed s
 bun test harness
