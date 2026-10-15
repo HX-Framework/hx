@@ -437,9 +437,13 @@ function writeCore(ctx: Ctx): Core {
     if (s.dirMtimeOffsetMs !== undefined) dirMtime(ctx, dirRel, s.dirMtimeOffsetMs);
   }
 
-  // The twin's newer copy: the same session continued under the worktree cwd.
+  // The twin's newer copy: the same session continued under the worktree cwd,
+  // on the worktree's branch. Every session in a folder carries the same
+  // branch on purpose: hx ui shows a folder under the branch of whichever
+  // session the discovery stat pool returned first (groupFolders in
+  // src/ui/data.ts), and that order is a race no port can be held to.
   {
-    const newer = { ...twin, cwd: worktree, contentIndex: twin.contentIndex, approxBytes: 26_000 };
+    const newer = { ...twin, cwd: worktree, gitBranch: "feature", contentIndex: twin.contentIndex, approxBytes: 26_000 };
     const content = claudeTranscript(newer);
     const p = write(ctx, `.claude/projects/${encodeCwd(worktree)}/${twin.sessionId}.jsonl`, content, -1 * HOUR);
     ctx.manifest.sessions.push({

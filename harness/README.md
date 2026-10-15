@@ -44,7 +44,9 @@ their cwd, so the stored bytes must match byte for byte).
 
 Timestamps inside files are fixed; only mtimes follow the clock (set relative
 to the moment of generation), so discovery windows and tiers classify the
-files the same way whenever a run happens.
+files the same way whenever a run happens. Every session in a folder carries
+one branch: `hx ui` shows a folder under the branch of whichever session its
+stat pool returned first, an order no port can be held to.
 
 ### Scenarios
 
@@ -91,9 +93,15 @@ paths, local ports, pids and launch tokens.
 outputs (`hx status`, `hx doctor sync` text and `--json`, `hx connect`,
 `hx update`, usage errors) written from the reference run. The candidate is
 compared with them on every run, so a change in CLI output shows up even when
-the differential comparison is trivially equal. To refresh them after a
-deliberate change, download the `harness-differential-<os>` artifact's
-`goldens/` directory and commit it.
+the differential comparison is trivially equal. JSON output is rendered from
+its normalized value (keys and object lists sorted, timestamps masked), and
+calendar dates are masked too, so a golden holds for months. They are kept per
+OS because the fixture home's path is embedded in every transcript line, and
+its length shapes the byte counts the commands print. To refresh them after a
+deliberate change, download the `harness-differential-<os>` artifact and
+either commit its `goldens/` directory or write them from its reference runs:
+
+    bun harness/run/write-goldens.ts --out harness/golden/Linux --run <artifact>/baseline/reference
 
 ## Running it
 

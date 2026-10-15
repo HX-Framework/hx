@@ -1,0 +1,22 @@
+exit 0
+--- stdout
+
+  Opening your browser to approve this device…
+
+  ╭────────────────────────────────────╮
+  │                                    │
+  │   Pairing code   HXAB-CD23         │
+  │   Workbench      <host:port>   │
+  │                                    │
+  ╰────────────────────────────────────╯
+
+  Check the code matches what your browser shows, then approve there.
+
+  Browser didn't open? Visit:
+    <GATEWAY>/approve?code=HXAB-CD23
+
+  Waiting for approval… (Ctrl+C to cancel)
+
+  ✓ Connected as "harness-device".
+
+--- stderr

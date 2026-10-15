@@ -1,0 +1,92 @@
+exit 1
+--- stdout
+{
+  "blockedSessions": 0,
+  "blockers": [],
+  "childLanes": {
+    "gone": 0,
+    "onDisk": 3,
+    "owedBytes": 0,
+    "owing": 0,
+    "tracked": 3
+  },
+  "excluded": [],
+  "gaps": {
+    "localFileDeleted": 0,
+    "outsideScanWindow": 0,
+    "sessions": 0
+  },
+  "generatedAt": "<t>",
+  "ledger": {
+    "delivered": 16,
+    "deliveredBytes": 5711052,
+    "failing": [],
+    "incomplete": 0,
+    "lagging": [],
+    "live": 0,
+    "newestMs": "<t>",
+    "notDelivered": [
+      {
+        "ageDays": 0,
+        "attributed": null,
+        "bucket": "uploading",
+        "consecutiveFailures": 0,
+        "destinations": [
+          {
+            "key": "letai",
+            "label": "letai",
+            "offset": 67108864,
+            "owed": 6293288,
+            "state": "reachable"
+          }
+        ],
+        "family": "claude-cli",
+        "lastUploadAt": "<t>",
+        "nextAttemptAt": null,
+        "owedBytes": 6293288,
+        "path": "<HOME>/.claude/projects/<HOME>-work-acme-repo/58621588-9b3b-4c8f-a579-4c0de0e2ea97.jsonl",
+        "repoSlug": "acme/repo",
+        "sessionId": "58621588-9b3b-4c8f-a579-4c0de0e2ea97",
+        "sizeBytes": 73402152,
+        "skipReason": null
+      }
+    ],
+    "oldestMs": "<t>",
+    "percent": 94,
+    "total": 17,
+    "totalBytes": 79113204,
+    "uploading": 1,
+    "uploadingBytes": 6293288,
+    "waiting": 0,
+    "waitingBytes": 0,
+    "waitingUnprotected": 0
+  },
+  "ok": false,
+  "roots": [
+    {
+      "configDir": "<HOME>/.claude",
+      "exists": true,
+      "family": "claude",
+      "origin": "default"
+    },
+    {
+      "configDir": "<HOME>/.codex",
+      "exists": true,
+      "family": "codex",
+      "origin": "default"
+    }
+  ],
+  "sync": {
+    "done": 16,
+    "percent": 94,
+    "total": 17,
+    "totalBytes": 79113204
+  },
+  "undiscovered": {
+    "fileGone": 0,
+    "onDiskButUndiscovered": 0
+  },
+  "unwatchedSessions": 0
+}
+
+--- stderr

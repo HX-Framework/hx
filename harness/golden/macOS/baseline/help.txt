@@ -1,0 +1,32 @@
+exit 0
+--- stdout
+hx — laptop daemon for hx-vision
+
+Setup:
+  connect    Approve this device + start the background mirror
+  start      Install + run as a background service (run by connect)
+  stop       Pause the background service
+  restart    Reload + restart the background service
+  status     Show connection status, link quality and sync health
+             --detailed  Full ledger + why anything is waiting (--json too)
+  logs       Tail the daemon's stdout / stderr
+  ui         Open the local HX Client UI (<LOCAL-URL>; --port, --no-open)
+
+Maintenance:
+  backfill   Upload tasks + plans for sessions already on disk
+  reattribute  Re-detect + report repo attribution for uploaded sessions
+  retry --blocked  Release Fortress-held sessions and retry immediately
+  retry --all      Also clear every retry backoff (after a fixed incident)
+  update     Fetch the latest hx binary and restart the daemon
+  disconnect Forget the device token
+  uninstall  Remove daemon + binary (pass --purge to also remove ~/.let/hx/)
+
+Foreground (debug):
+  watch      Run the mirror in this terminal (Ctrl+C to stop)
+  tick       Run a single upload pass and exit
+
+  --local    connect/watch/tick: ALSO mirror sessions to the local dev
+             gateway (<LOCAL-URL>); update: fetch from it
+  --version  Print hx version
+
+--- stderr

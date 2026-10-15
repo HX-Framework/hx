@@ -12,12 +12,12 @@
 // Nothing here runs on a laptop by design: the workflow in
 // .github/workflows/differential.yml builds the binaries and runs this.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { compareRuns, coverageCheck, fixtureExpectationChecks, loadRun } from "../lib/compare.js";
-import { normalizeText, DEFAULT_WINDOW_AFTER_MS, DEFAULT_WINDOW_BEFORE_MS } from "../lib/normalize.js";
-import type { BinaryName, CheckResult, HarnessReport, RunMeta, Scenario, ScenarioReport } from "../lib/types.js";
+import { goldenChecks, writeGoldens } from "../lib/goldens.js";
+import type { BinaryName, CheckResult, HarnessReport, RunMeta, ScenarioReport } from "../lib/types.js";
 import { runScenario } from "./run-scenario.js";
 import { selectScenarios } from "./scenarios.js";
 
@@ -76,7 +76,7 @@ for (const scenario of scenarios) {
     ...compareRuns(ref, cand, { scenario, candidateName }),
     ...fixtureExpectationChecks(ref, scenario).map((c) => ({ ...c, name: `reference ${c.name}` })),
     ...fixtureExpectationChecks(cand, scenario).map((c) => ({ ...c, name: `candidate ${c.name}` })),
-    ...goldenChecks(scenario, cand, candidateName, [ref.meta.version, cand.meta.version]),
+    ...goldenChecks(scenario, cand, candidateName, [ref.meta.version, cand.meta.version], goldensDir),
   ];
   if (writeGoldensDir) writeGoldens(scenario, ref, candidateName, [ref.meta.version, cand.meta.version], writeGoldensDir);
   const ok = checks.every((c) => c.ok);
@@ -105,69 +105,6 @@ const outcomeMatches = expect === "pass" ? allOk : !reports.every((r) => r.ok);
 if (expect === "fail" && outcomeMatches) log("the candidate was caught, as expected");
 if (expect === "fail" && !outcomeMatches) log("the candidate was NOT caught: the harness cannot tell it from the reference");
 process.exit(outcomeMatches ? 0 : 1);
-
-// ── Goldens: committed expectations for the CLI surfaces ───────────────────
-
-function goldenCtx(run: ReturnType<typeof loadRun>, candidateNameForCtx: BinaryName, versions: string[]) {
-  return {
-    candidateName: candidateNameForCtx,
-    versions,
-    home: run.meta.home,
-    workDir: run.meta.workDir,
-    gatewayUrl: run.meta.gatewayUrl,
-    fortressUrl: run.meta.fortressUrl,
-    anchorMs: run.meta.startedAtMs,
-    windowBeforeMs: DEFAULT_WINDOW_BEFORE_MS,
-    windowAfterMs: DEFAULT_WINDOW_AFTER_MS,
-    mode: "golden" as const,
-  };
-}
-
-function goldenText(run: ReturnType<typeof loadRun>, stepName: string, candidateNameForCtx: BinaryName, versions: string[]): string | null {
-  const step = run.meta.steps.find((s) => s.name === stepName);
-  if (!step) return null;
-  const base = join(run.dir, "steps", `${String(step.index).padStart(2, "0")}-${step.name}`);
-  const ctx = goldenCtx(run, candidateNameForCtx, versions);
-  const read = (p: string): string => (existsSync(p) ? readFileSync(p, "utf8") : "");
-  return [`exit ${step.exitCode ?? `signal ${step.signal}`}`, "--- stdout", normalizeText(read(`${base}.stdout`), ctx), "--- stderr", normalizeText(read(`${base}.stderr`), ctx)].join("\n");
-}
-
-function goldenChecks(scenario: Scenario, cand: ReturnType<typeof loadRun>, candidateNameForCtx: BinaryName, versions: string[]): CheckResult[] {
-  if (!goldensDir || !scenario.goldens) return [];
-  const dir = join(goldensDir, scenario.name);
-  if (!existsSync(dir)) return [{ name: "goldens", ok: true, details: `no goldens committed for ${scenario.name} on this platform yet` }];
-  const checks: CheckResult[] = [];
-  for (const stepName of scenario.goldens) {
-    const p = join(dir, `${stepName}.txt`);
-    const got = goldenText(cand, stepName, candidateNameForCtx, versions);
-    if (!existsSync(p) || got === null) {
-      checks.push({ name: `golden ${stepName}`, ok: !existsSync(p) && got === null, details: existsSync(p) ? "step missing from the run" : "no golden file" });
-      continue;
-    }
-    const want = readFileSync(p, "utf8");
-    if (want === got) checks.push({ name: `golden ${stepName}`, ok: true, details: "matches the committed output" });
-    else {
-      const la = want.split("\n");
-      const lb = got.split("\n");
-      const lines: string[] = [];
-      for (let i = 0; i < Math.max(la.length, lb.length) && lines.length < 30; i++) {
-        if (la[i] !== lb[i]) lines.push(`@${i + 1}`, `- ${la[i] ?? ""}`, `+ ${lb[i] ?? ""}`);
-      }
-      checks.push({ name: `golden ${stepName}`, ok: false, details: lines.join("\n") });
-    }
-  }
-  return checks;
-}
-
-function writeGoldens(scenario: Scenario, ref: ReturnType<typeof loadRun>, candidateNameForCtx: BinaryName, versions: string[], dir: string): void {
-  if (!scenario.goldens) return;
-  const target = join(dir, scenario.name);
-  mkdirSync(target, { recursive: true });
-  for (const stepName of scenario.goldens) {
-    const text = goldenText(ref, stepName, candidateNameForCtx, versions);
-    if (text !== null) writeFileSync(join(target, `${stepName}.txt`), text);
-  }
-}
 
 // ── Report ─────────────────────────────────────────────────────────────────
 

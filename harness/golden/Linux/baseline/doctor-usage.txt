@@ -1,0 +1,5 @@
+exit 64
+--- stdout
+usage: hx doctor sync [--json]   (same as `hx status --detailed`)
+
+--- stderr

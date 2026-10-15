@@ -274,7 +274,7 @@ function normalizeProbes(v: unknown, ctx: NormalizeContext): unknown {
   };
 }
 
-function parseJsonOrNull(s: string): unknown {
+export function parseJsonOrNull(s: string): unknown {
   const t = s.trim();
   if (!t.startsWith("{") && !t.startsWith("[")) return null;
   try {

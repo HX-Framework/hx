@@ -48,6 +48,10 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function projectDirName(p: string): string {
+  return p.replace(/[/\\.]/g, "-");
+}
+
 function inWindow(ms: number, ctx: NormalizeContext): boolean {
   return ms >= ctx.anchorMs - ctx.windowBeforeMs && ms <= ctx.anchorMs + ctx.windowAfterMs;
 }
@@ -64,6 +68,10 @@ export function normalizeText(input: string, ctx: NormalizeContext): string {
   s = s.replace(/\b(?:127\.0\.0\.1|localhost):\d+/g, "<host:port>");
   s = s.split(ctx.home).join("<HOME>");
   s = s.split(ctx.workDir).join("<WORK>");
+  // Claude Code names a project dir after the cwd with every separator and
+  // dot replaced by "-", so the fixture home shows up inside such names too.
+  s = s.split(projectDirName(ctx.home)).join("<HOME>");
+  s = s.split(projectDirName(ctx.workDir)).join("<WORK>");
   // Text has no tolerance, so a timestamp inside the window becomes a bare
   // placeholder; JSON timestamps keep their offset and a tolerance (below).
   s = s.replace(ISO_RE, (m) => {
