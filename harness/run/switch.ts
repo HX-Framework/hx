@@ -12,7 +12,10 @@
 //   2. `hx2 start`   hx2 takes the slot; a transcript grows; hx2 uploads it;
 //   3. hx takes the slot back (`hx restart`, or `hx start` from 77.13.0 on,
 //      the release whose other commands leave hx2's slot alone); another
-//      transcript grows; hx uploads it.
+//      transcript grows; hx uploads it;
+//   4. with hx holding the slot, `hx2 status`, `hx2 restart`, `hx2 update`
+//      (a newer hx2 on the channel) and `hx2 stop` leave it with hx and say
+//      so, the mirror of 77.13.0: only `hx2 start` moves a device to hx2.
 //
 // The checks, from the gateway's recording and store:
 //   • every fixture session is in the store;
@@ -27,7 +30,10 @@
 //     ends with one daemon process, the phase's client's: the two never ran
 //     at once;
 //   • `status` of the phase's client says the service runs under the
-//     expected manager.
+//     expected manager;
+//   • in phase 4, hx's daemon process runs on untouched through hx2's
+//     status, restart and update, and hx2 prints what hx 77.13.0 prints
+//     for the mirrored case, with the names swapped.
 //
 //   bun harness/run/switch.ts --hx <bin> --hx2 <bin> --manager launchd|systemd|shell-hook --out <dir> --work <dir>
 //
@@ -197,10 +203,51 @@ async function phase(name: string, client: Client, command: string[], grows: num
   p.seqTo = cloud.requestCount + 1;
 }
 
+// Phase 4: with hx holding the slot, hx2's other service commands leave it
+// there and say so — the mirror of what hx 77.13.0 does for a slot that runs
+// hx2. Only `hx2 start` (and `hx2 connect`, how a device joins hx2) moves it.
+interface Probe {
+  command: string;
+  output: Spawned;
+}
+const PHASE4 = "4 · hx2 leaves hx's slot alone";
+const phase4 = { ran: false, seqFrom: 0, seqTo: 0, before: { hx: [], hx2: [] } as Record<Client, number[]>, after: { hx: [], hx2: [] } as Record<Client, number[]>, probes: [] as Probe[] };
+
+async function probe(args: string[]): Promise<Spawned> {
+  const output = await run([bins.hx2, ...args], env);
+  phase4.probes.push({ command: `hx2 ${args.join(" ")}`, output });
+  log(`── ${PHASE4}: hx2 ${args.join(" ")} → exit ${output.code}\n${output.stdout.trimEnd()}${output.stderr.trim() ? `\n${output.stderr.trimEnd()}` : ""}`);
+  return output;
+}
+
+function bumpPatch(version: string): string {
+  const [a, b, c] = version.split(".").map(Number);
+  return `${a}.${b}.${(c ?? 0) + 1}`;
+}
+
+async function leaveAlonePhase(): Promise<void> {
+  phase4.ran = true;
+  phase4.seqFrom = cloud.requestCount + 1;
+  phase4.before = await watchProcesses();
+  await probe(["status"]);
+  await probe(["restart"]);
+  // A newer hx2 on the update channel: the binary is swapped (for the same
+  // bytes), and the service is not touched.
+  cloud.update({ version: bumpPatch(versions.hx2), releaseBinary: bins.hx2 });
+  await probe(["update"]);
+  cloud.update({ version: "0.0.0", releaseBinary: undefined });
+  await sleep(3_000);
+  phase4.after = await watchProcesses();
+  await probe(["stop"]);
+  await probe(["status"]);
+  phase4.seqTo = cloud.requestCount + 1;
+}
+
 try {
   await phase("1 · hx takes the slot", "hx", ["start"], null, () => waitSynced());
   await phase("2 · hx2 takes the slot", "hx2", ["start"], 0, () => waitStoredWhole(0));
   await phase("3 · hx takes it back", "hx", [wayBack], 2, () => waitStoredWhole(2));
+  await leaveAlonePhase();
 } finally {
   const hxDir = join(home, ".let", "hx");
   for (const f of ["stdout.log", "stderr.log", "state.json", "watch-run.json", "watch-exits.json", "bootstrap.sh"]) {
@@ -318,6 +365,63 @@ for (const p of phases) {
   check("the two clients never ran at once", problems, stretches.map((s) => `${s.client}: requests ${s.from}–${s.to} (${s.count})`).join("<br>"));
 }
 
+// Phase 4: hx2's other service commands leave hx's slot alone.
+if (!phase4.ran) {
+  checks.push({ name: `${PHASE4}: ran`, ok: false, details: "an earlier phase stopped the run" });
+} else {
+  const output = (command: string, nth = 0): Spawned | undefined => phase4.probes.filter((p) => p.command === command)[nth]?.output;
+  const daemonRow = (s: Spawned | undefined): string => /^Daemon:\s+(.*)$/m.exec(s?.stdout ?? "")?.[1] ?? "(no Daemon row)";
+  const says = (s: Spawned | undefined, want: string[], unwanted: string[] = []): string[] => {
+    if (!s) return ["not run"];
+    const problems: string[] = [];
+    if (s.code !== 0) problems.push(`exit ${s.code}`);
+    for (const w of want) if (!s.stdout.includes(w)) problems.push(`missing: ${w}`);
+    for (const u of unwanted) if (s.stdout.includes(u)) problems.push(`unexpected: ${u}`);
+    return problems;
+  };
+  const shown = (s: Spawned | undefined): string => s?.stdout.trim() ?? "(not run)";
+
+  const running = daemonRow(output("hx2 status"));
+  check(`${PHASE4}: \`hx2 status\` names hx`, running.startsWith(`running hx (${MANAGER_NAME[manager]}, pid `) ? [] : [`Daemon: ${running}`], `Daemon: ${running}`);
+  const restart = output("hx2 restart");
+  check(
+    `${PHASE4}: \`hx2 restart\` leaves it alone`,
+    says(restart, ["hx runs the background service on this device, so hx2 left it alone.", "Run `hx restart` to restart it, or `hx2 start` to move this device to hx2."]),
+    shown(restart),
+  );
+  const update = output("hx2 update");
+  check(
+    `${PHASE4}: \`hx2 update\` swaps hx2's binary and leaves the service alone`,
+    says(update, ["hx2 updated to latest", "hx runs the background service on this device, so hx2 left it alone.", "Run `hx2 start` to move this device to hx2."], ["daemon restarted."]),
+    shown(update),
+  );
+  // Through status, restart and update hx's daemon ran on: the same process,
+  // no hx2 daemon, and nothing only a daemon sends came from hx2.
+  const fromHx2 = requests.filter(
+    (r) =>
+      r.seq >= phase4.seqFrom &&
+      r.seq < phase4.seqTo &&
+      clientOfUserAgent(r.headers["user-agent"]) === "hx2" &&
+      (r.method === "PUT" || r.path.startsWith("/sessions/") || r.path === "/devices/heartbeat" || r.path === "/devices/sync-status"),
+  );
+  const untouched = phase4.before.hx.length === 1 && phase4.before.hx.join() === phase4.after.hx.join() && phase4.after.hx2.length === 0;
+  check(
+    `${PHASE4}: hx's daemon ran on, untouched`,
+    [
+      ...(untouched ? [] : [`hx watch before: ${phase4.before.hx.join(", ") || "none"}; after: ${phase4.after.hx.join(", ") || "none"}; hx2 watch after: ${phase4.after.hx2.join(", ") || "none"}`]),
+      ...fromHx2.slice(0, 5).map((r) => `hx2 sent ${r.method} ${r.path}`),
+    ],
+    `hx watch, pid ${phase4.after.hx.join(", ")} before and after; no hx2 daemon; no daemon request from hx2`,
+  );
+  const stop = output("hx2 stop");
+  const stopped = daemonRow(output("hx2 status", 1));
+  check(
+    `${PHASE4}: \`hx2 stop\` stops hx's service and says whose it is`,
+    [...says(stop, ["hx stopped (", "Run `hx start` to resume it, or `hx2 start` to move this device to hx2."]), ...(/^hx (stopped|loaded, not running)/.test(stopped) ? [] : [`then Daemon: ${stopped}`])],
+    `${shown(stop)}\nthen Daemon: ${stopped}`,
+  );
+}
+
 const ok = checks.every((c) => c.ok);
 const lines: string[] = [];
 lines.push(`## Moving the slot hx → hx2 → hx (${manager}): ${ok ? "nothing lost, nothing sent twice" : "FAILED"}`);
@@ -334,6 +438,12 @@ for (const p of phases) {
   lines.push(p.output.stdout.trimEnd() || "(no output)");
   lines.push("```");
 }
+if (phase4.ran) {
+  lines.push(`#### ${PHASE4}`);
+  lines.push("```");
+  for (const p of phase4.probes) lines.push(`$ ${p.command}`, p.output.stdout.trimEnd() || "(no output)");
+  lines.push("```");
+}
 writeFileSync(join(out, "report.md"), `${lines.join("\n")}\n`);
 writeFileSync(
   join(out, "report.json"),
@@ -344,6 +454,7 @@ writeFileSync(
       versions,
       checks,
       phases: phases.map((p) => ({ name: p.name, client: p.client, command: p.command, seqFrom: p.seqFrom, seqTo: p.seqTo, exit: p.output.code, stdout: p.output.stdout, status: p.status?.stdout, processes: p.processes })),
+      leaveAlone: phase4,
     },
     null,
     2,
