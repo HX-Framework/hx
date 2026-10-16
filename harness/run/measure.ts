@@ -62,12 +62,13 @@
 // runs it in the `measure` jobs and attaches measurements.json / .md, the
 // per-second memory samples, the strace summaries and the smaps of the peak.
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { release as osRelease, totalmem } from "node:os";
 import { join } from "node:path";
 
 import { FakeGateway } from "../gateway/gateway.js";
-import { generateHome, type Manifest } from "../fixtures/gen-home.js";
+import { CCD_DIR_MTIME_SEC, ccdMtimeSec, generateHome, type Manifest } from "../fixtures/gen-home.js";
+import { ccdIndexByteDiffs } from "../lib/compare.js";
 import { Prng } from "../lib/prng.js";
 import type { BinaryName } from "../lib/types.js";
 import { appendTranscriptLines, binaryVersion, clientEnv, runScenario, writeClientFiles } from "./run-scenario.js";
@@ -818,7 +819,10 @@ async function measureBackoff(binary: string, who: Who): Promise<Measurement> {
 
 // ── ccd-index (the saved Claude Desktop index; macOS only) ──────────────────
 
-async function measureCcdIndex(binary: string): Promise<Measurement> {
+/** Each binary's saved index, kept for the byte comparison in the report. */
+const savedCcdIndex: Partial<Record<Who, string>> = {};
+
+async function measureCcdIndex(binary: string, who: Who): Promise<Measurement> {
   const h = await prepareHome(binary, "ccd", "small");
   try {
     const org = join(h.home, "Library", "Application Support", "Claude", "claude-code-sessions", "acct_measure", "org_measure");
@@ -827,14 +831,19 @@ async function measureCcdIndex(binary: string): Promise<Measurement> {
     const N = 10_000;
     for (let i = 0; i < N; i++) {
       const sid = rng.uuid();
-      writeFileSync(
-        join(org, `local_${sid}.json`),
-        JSON.stringify({ sessionId: `local_${sid}`, cliSessionId: rng.uuid(), title: rng.sentence(6), titleSource: i % 2 ? "user" : "ai", isArchived: false, lastActivityAt: 1_750_000_000_000 + i * 1000, cwd: `/work/${rng.alnum(5)}` }),
-      );
+      const p = join(org, `local_${sid}.json`);
+      writeFileSync(p, JSON.stringify({ sessionId: `local_${sid}`, cliSessionId: rng.uuid(), title: rng.sentence(6), titleSource: i % 2 ? "user" : "ai", isArchived: false, lastActivityAt: 1_750_000_000_000 + i * 1000, cwd: `/work/${rng.alnum(5)}` }));
+      // Fixed stamps, as the fixture's own Claude Desktop files have: with
+      // the clock's, each binary's saved index printed its own 10,000
+      // fractional mtimes, and the two files differed in size by chance.
+      utimesSync(p, ccdMtimeSec(1_000 + i), ccdMtimeSec(1_000 + i));
     }
+    utimesSync(org, CCD_DIR_MTIME_SEC, CCD_DIR_MTIME_SEC);
     const first = await runOnce([binary, "watch", "--once"], h.env, 600_000);
     const second = await runOnce([binary, "watch", "--once"], h.env, 600_000);
     const indexPath = join(h.home, ".let", "hx", "ccd-index.json");
+    const saved = existsSync(indexPath) ? readFileSync(indexPath, "utf8") : "";
+    savedCcdIndex[who] = saved;
     return {
       ccdFiles: N,
       firstPassElapsedMs: first.elapsedMs,
@@ -844,7 +853,7 @@ async function measureCcdIndex(binary: string): Promise<Measurement> {
       secondPassCpuMs: second.cpuMs,
       secondPassMaxRss: second.maxRssBytes,
       secondPassReads: bytesIn(second),
-      savedIndexBytes: existsSync(indexPath) ? Buffer.byteLength(readFileSync(indexPath, "utf8")) : 0,
+      savedIndexBytes: Buffer.byteLength(saved),
     };
   } finally {
     h.gateway.stop();
@@ -946,7 +955,7 @@ if (only.has("idle") && (process.platform === "linux" || process.platform === "d
 }
 if (only.has("idle-hot")) await both("idle-hot", (b, who) => measureIdle(b, who, "hot-claude-like", "idle-hot"));
 if (only.has("backoff")) await both("backoff", (b, who) => measureBackoff(b, who));
-if (only.has("ccd-index") && process.platform === "darwin") await both("ccd-index", (b) => measureCcdIndex(b));
+if (only.has("ccd-index") && process.platform === "darwin") await both("ccd-index", (b, who) => measureCcdIndex(b, who));
 if (only.has("founder")) await both("founder", (b, who) => measureFounder(b, who));
 if (process.platform === "linux" && only.has("idle")) {
   log("\n=== rusage-check (last)");
@@ -1043,6 +1052,22 @@ if (C) {
   row("ccd-index", "second pass maximum RSS", "bytes", C.reference.secondPassMaxRss!, C.candidate.secondPassMaxRss!);
   row("ccd-index", "second pass wall time", "ms", C.reference.secondPassElapsedMs!, C.candidate.secondPassElapsedMs!);
   row("ccd-index", "saved index", "bytes", C.reference.savedIndexBytes!, C.candidate.savedIndexBytes!);
+  // The same check the differential runs on every scenario's saved index:
+  // each file is exactly what JSON.stringify writes for its own content, and
+  // every entry is byte-identical to the reference's for the same path (the
+  // order of the entries is the reference's read race, savedAtMs its clock).
+  const refSaved = savedCcdIndex.reference ?? "";
+  const candSaved = savedCcdIndex.candidate ?? "";
+  if (refSaved && candSaved) {
+    const entries = (text: string): number => {
+      const v = JSON.parse(text) as { dirs?: object; files?: object };
+      return Object.keys(v.dirs ?? {}).length + Object.keys(v.files ?? {}).length;
+    };
+    const diffs = ccdIndexByteDiffs(refSaved, candSaved, (k) => k.split(workDir).join("<WORK>"));
+    row("ccd-index", "saved index: entries (dirs and files)", "entries", entries(refSaved), entries(candSaved));
+    row("ccd-index", "saved index: differences from the reference, byte for byte per entry (first 40 listed in the log)", "differences", 0, diffs.length);
+    for (const d of diffs) log(`    ccd-index bytes: ${d}`);
+  }
 }
 const F = results["founder"];
 if (F) {
