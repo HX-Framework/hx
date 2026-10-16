@@ -252,6 +252,10 @@ interface MemSample {
   anonKb: number;
   fileKb: number;
   anonHugeKb: number;
+  /** LazyFree: pages the process gave back with madvise(MADV_FREE) that the
+   *  kernel has not reclaimed yet. They still count in VmRSS until it does,
+   *  so a Linux RSS can hold memory nothing in the process uses. -1 off Linux. */
+  lazyFreeKb: number;
   threads: number;
   /** inotify instances the process holds, and the watches across them. */
   inotifyInstances: number;
@@ -312,6 +316,7 @@ function sampleLinux(pid: number, atMs: number): MemSample | null {
     anonKb: procNumber(status, "RssAnon"),
     fileKb: procNumber(status, "RssFile"),
     anonHugeKb: procNumber(rollup, "AnonHugePages"),
+    lazyFreeKb: procNumber(rollup, "LazyFree"),
     threads: procNumber(status, "Threads"),
     inotifyInstances,
     inotifyWatches,
@@ -332,7 +337,7 @@ function sampleDarwin(pid: number, atMs: number): MemSample | null {
   const kids = Bun.spawnSync(["pgrep", "-P", String(pid)]).stdout.toString().trim().split(/\s+/).filter(Boolean);
   let childRssKb = 0;
   for (const child of kids) childRssKb = Math.max(childRssKb, psRssKb(child));
-  return { atMs, rssKb, hwmKb: -1, anonKb: -1, fileKb: -1, anonHugeKb: -1, threads: -1, inotifyInstances: -1, inotifyWatches: -1, children: kids.length, childRssKb };
+  return { atMs, rssKb, hwmKb: -1, anonKb: -1, fileKb: -1, anonHugeKb: -1, lazyFreeKb: -1, threads: -1, inotifyInstances: -1, inotifyWatches: -1, children: kids.length, childRssKb };
 }
 
 function sampleProcess(pid: number, atMs: number): MemSample | null {
@@ -381,6 +386,8 @@ function summarizeSamples(samples: MemSample[]): Measurement {
     anonEndKb: last.anonKb,
     fileEndKb: last.fileKb,
     anonHugeEndKb: last.anonHugeKb,
+    lazyFreeEndKb: last.lazyFreeKb,
+    lazyFreePeakKb: Math.max(...samples.map((s) => s.lazyFreeKb)),
     threadsEnd: last.threads,
     inotifyInstancesEnd: last.inotifyInstances,
     inotifyWatchesEnd: last.inotifyWatches,
@@ -696,6 +703,8 @@ if (I.reference.memSamples !== undefined && Number(I.reference.memSamples) > 0) 
     row("idle-memory", "RssAnon at the end", "kB", I.reference.anonEndKb!, I.candidate.anonEndKb!, vOf("anonEndKb"));
     row("idle-memory", "RssFile at the end", "kB", I.reference.fileEndKb!, I.candidate.fileEndKb!, vOf("fileEndKb"));
     row("idle-memory", "AnonHugePages at the end", "kB", I.reference.anonHugeEndKb!, I.candidate.anonHugeEndKb!, vOf("anonHugeEndKb"));
+    row("idle-memory", "LazyFree at the end (MADV_FREE pages still counted in RSS)", "kB", I.reference.lazyFreeEndKb!, I.candidate.lazyFreeEndKb!, vOf("lazyFreeEndKb"));
+    row("idle-memory", "LazyFree, highest sample", "kB", I.reference.lazyFreePeakKb!, I.candidate.lazyFreePeakKb!, vOf("lazyFreePeakKb"));
     row("idle-memory", "threads at the end", "threads", I.reference.threadsEnd!, I.candidate.threadsEnd!, vOf("threadsEnd"));
     row("idle-memory", "inotify instances at the end", "instances", I.reference.inotifyInstancesEnd!, I.candidate.inotifyInstancesEnd!, vOf("inotifyInstancesEnd"));
     row("idle-memory", "inotify watches at the end", "watches", I.reference.inotifyWatchesEnd!, I.candidate.inotifyWatchesEnd!, vOf("inotifyWatchesEnd"));
@@ -757,12 +766,12 @@ mem.push("");
 for (const [label, d] of Object.entries(memoryDetails)) {
   mem.push(`## ${label}`);
   mem.push("");
-  mem.push("| t (s) | RSS kB | VmHWM kB | RssAnon kB | RssFile kB | AnonHugePages kB | threads | inotify instances / watches | children (largest kB) |");
-  mem.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  mem.push("| t (s) | RSS kB | VmHWM kB | RssAnon kB | RssFile kB | AnonHugePages kB | LazyFree kB | threads | inotify instances / watches | children (largest kB) |");
+  mem.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const s of d.samples) {
     const sec = Math.round(s.atMs / 1000);
     if (s.atMs > 10_000 && sec % 5 !== 0) continue;
-    mem.push(`| ${sec} | ${fmt(s.rssKb)} | ${fmt(s.hwmKb)} | ${fmt(s.anonKb)} | ${fmt(s.fileKb)} | ${fmt(s.anonHugeKb)} | ${s.threads} | ${s.inotifyInstances} / ${fmt(s.inotifyWatches)} | ${s.children} (${fmt(s.childRssKb)}) |`);
+    mem.push(`| ${sec} | ${fmt(s.rssKb)} | ${fmt(s.hwmKb)} | ${fmt(s.anonKb)} | ${fmt(s.fileKb)} | ${fmt(s.anonHugeKb)} | ${fmt(s.lazyFreeKb)} | ${s.threads} | ${s.inotifyInstances} / ${fmt(s.inotifyWatches)} | ${s.children} (${fmt(s.childRssKb)}) |`);
   }
   if (d.peakMappings.length > 0) {
     const peak = d.samples.reduce((a, b) => (b.rssKb > a.rssKb ? b : a));
