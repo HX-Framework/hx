@@ -378,8 +378,44 @@ export function scenarioByName(name: string): Scenario {
 /** The scenarios of the hot-path surface, in order. */
 export const HOT_PATH_SCENARIOS = ["hot-baseline", "hot-claude-like", "hot-10k", "hot-outage", "hot-unreachable", "hot-kill9", "hot-daemon"];
 
+/** Every scenario but the hot-path ones: what the TypeScript jobs run on
+ *  their own, so the hot shapes (hot-10k above all) get a job of their own. */
+export const MAIN_SCENARIOS = SCENARIOS.filter((s) => !HOT_PATH_SCENARIOS.includes(s.name)).map((s) => s.name);
+
+// ── The daemon surface (hx2, M4) ──────────────────────────────────────────
+// After M4 the Rust port answers every step of every scenario except the
+// ones the next card owns: the hx ui API, `hx update`, `hx connect` and
+// `hx disconnect`. `--scenarios daemon` runs the full catalog with those
+// steps removed (and the goldens of the removed steps dropped), on both
+// binaries alike, so a baseline run compares the daemon, the status and
+// doctor reports, tick, backfill, reattribute and retry on every shape. The
+// four protocol calls only those steps make (pairing, disconnect, the update
+// channel) are excluded from the coverage check for this selection.
+const M5_COMMANDS = new Set(["update", "connect", "disconnect"]);
+
+/** The protocol calls only the M5 steps make. */
+export const M5_PROTOCOL_CALLS = ["devices/code", "devices/poll", "devices/disconnect", "download/hx-version", "download/hx-<os>-<arch>.gz + .sha256"];
+
+function isDaemonStep(step: Scenario["steps"][number]): boolean {
+  if (step.kind === "ui") return false;
+  if (step.kind === "run" && M5_COMMANDS.has(step.args[0] ?? "")) return false;
+  return true;
+}
+
+/** Every scenario with its M5 steps removed. */
+export function daemonScenarios(): Scenario[] {
+  return SCENARIOS.map((s) => {
+    const steps = s.steps.filter(isDaemonStep);
+    if (steps.length === s.steps.length) return s;
+    const kept = new Set(steps.map((st) => st.name));
+    return { ...s, steps, goldens: s.goldens?.filter((g) => kept.has(g)) };
+  });
+}
+
 export function selectScenarios(spec: string | undefined): Scenario[] {
   if (!spec || spec === "all") return SCENARIOS;
+  if (spec === "main") return MAIN_SCENARIOS.map((n) => scenarioByName(n));
   if (spec === "hot-path") return HOT_PATH_SCENARIOS.map((n) => scenarioByName(n));
+  if (spec === "daemon") return daemonScenarios();
   return spec.split(",").map((n) => scenarioByName(n.trim()));
 }

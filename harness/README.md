@@ -151,15 +151,42 @@ lanes, no sidecars), with the steps hx2 answers:
 
 `--scenarios hot-path` selects them. Every comparison above applies to them
 unchanged; hx2 is passed as `--candidate-name hx2`, so its name is a
-normalization rule and not a diff. What the hot shapes leave out is what the
-next card ports (Codex and its SQLite titles, the Claude Desktop index and
-leveldb scan, child lanes and sidecars, verify and self-heal beyond the
-audit the daemon already runs, reattribute and retitle, the group and team
-mirrors beyond the empty ones a store-less machine uploads); once those land,
-hx2 runs the full scenario list. A fourth shape, `founder`, is the
+normalization rule and not a diff. A fourth shape, `founder`, is the
 measurement tree: 4,800 transcripts over 700 project directories and 36,000
 Claude Desktop session files, the size of the founder's laptop
 (`measure.ts --only founder`).
+
+The hot shapes have jobs of their own for the TypeScript binaries too
+(`self-hot`, `differential-hot`): on Linux the runner shut the combined jobs
+down 16 to 21 minutes in, during or after `hot-10k` ("The runner has
+received a shutdown signal"), so the hot jobs run apart from the rest
+(`--scenarios main` is every scenario but the hot ones) and sample the
+machine's memory every 10 s into the step log and `harness-out/memory.log`.
+
+### The daemon surface (hx2, M4)
+
+After M4 hx2 carries the rest of the daemon: Codex rollouts and their
+SQLite titles, the Claude Desktop session-metadata index (saved as
+`ccd-index.json`) and the leveldb scan behind the group mirror, child lanes
+and workflow sidecars, tasks and plans, verify and self-heal, reattribute
+and the codex title sweep, the ledger and `hx status` / `hx status
+--detailed` / `hx doctor sync`, `hx tick`, `hx backfill`, `hx reattribute`,
+`hx retry` and the `--local` tee. What it does not carry yet is the next
+card's: the hx ui API, `hx update`, `hx connect`, `hx disconnect` and the
+service commands.
+
+`--scenarios daemon` runs the full catalog with exactly those steps removed
+(the `ui` steps and the `run` steps of `update`, `connect` and `disconnect`),
+on both binaries alike, and drops the goldens of the removed steps. The
+coverage check then requires every protocol call but the four only those
+steps make (`devices/code`, `devices/poll`, `devices/disconnect`, the
+`/download/…` pair). The `hx2-differential` and `hx2-self` jobs run this
+selection; `hx2-measure` runs `--only founder,idle,idle-hot,ccd-index`.
+
+`measure.ts` reports the macOS daemon's `phys_footprint` beside its `ps` RSS
+(`harness/run/phys-footprint.c`, compiled once per run with `cc`): RSS counts
+pages the allocator has handed back through `malloc_zone_pressure_relief`,
+the footprint does not.
 
 ### Goldens
 

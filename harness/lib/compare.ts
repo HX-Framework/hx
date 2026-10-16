@@ -642,7 +642,10 @@ export const PROTOCOL_CALLS: Array<{ name: string; method: string; path: RegExp 
   { name: "download/hx-<os>-<arch>.gz + .sha256", method: "GET", path: /^\/download\/hx2?-[a-z]+-[a-z0-9]+\.(gz|sha256)$/ },
 ];
 
-export function coverageCheck(runDirs: string[], required = true): CheckResult {
+/** Every protocol call seen at least once across the runs. `excluded` names
+ *  the calls a selection cannot make (the M5 steps' calls under
+ *  `--scenarios daemon`); they are listed but not required. */
+export function coverageCheck(runDirs: string[], required = true, excluded: readonly string[] = []): CheckResult {
   const seen = new Map<string, number>();
   for (const dir of runDirs) {
     for (const file of ["gateway.jsonl", "fortress.jsonl"]) {
@@ -653,10 +656,11 @@ export function coverageCheck(runDirs: string[], required = true): CheckResult {
       }
     }
   }
-  const missing = PROTOCOL_CALLS.filter((c) => !seen.has(c.name)).map((c) => c.name);
-  const lines = PROTOCOL_CALLS.map((c) => `${seen.has(c.name) ? "✓" : "✗"} ${c.name}: ${seen.get(c.name) ?? 0}`);
+  const calls = PROTOCOL_CALLS.filter((c) => !excluded.includes(c.name));
+  const missing = calls.filter((c) => !seen.has(c.name)).map((c) => c.name);
+  const lines = PROTOCOL_CALLS.map((c) => `${seen.has(c.name) ? "✓" : excluded.includes(c.name) ? "–" : "✗"} ${c.name}: ${seen.get(c.name) ?? 0}${excluded.includes(c.name) ? " (not part of this selection)" : ""}`);
   if (!required) lines.push("(advisory: not every scenario ran)");
-  return { name: "coverage: all 24 calls recorded", ok: missing.length === 0 || !required, details: lines.join("\n") };
+  return { name: `coverage: all ${calls.length} calls recorded`, ok: missing.length === 0 || !required, details: lines.join("\n") };
 }
 
 /** Every step output file in a run dir, for the golden writer. */

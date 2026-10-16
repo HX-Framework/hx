@@ -2,7 +2,7 @@
 // with the candidate, compare the two runs, and write a report.
 //
 //   bun harness/run/run-harness.ts --reference <bin> --candidate <bin> [--candidate-name hx2]
-//       [--scenarios all|a,b] [--out <dir>] [--work <dir>] [--expect pass|fail]
+//       [--scenarios all|main|hot-path|daemon|a,b] [--out <dir>] [--work <dir>] [--expect pass|fail]
 //       [--goldens <dir>] [--write-goldens <dir>]
 //
 // Exit code 0 means the outcome matched --expect: with "pass" (the default),
@@ -19,7 +19,7 @@ import { compareRuns, coverageCheck, fixtureExpectationChecks, loadRun } from ".
 import { goldenChecks, writeGoldens } from "../lib/goldens.js";
 import type { BinaryName, CheckResult, HarnessReport, RunMeta, ScenarioReport } from "../lib/types.js";
 import { runScenario } from "./run-scenario.js";
-import { selectScenarios } from "./scenarios.js";
+import { M5_PROTOCOL_CALLS, selectScenarios } from "./scenarios.js";
 
 function arg(name: string, fallback?: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -43,7 +43,8 @@ const out = arg("out", join(process.cwd(), ".harness-out")) ?? "";
 const workDir = arg("work", join(process.cwd(), ".harness-work")) ?? "";
 const goldensDir = arg("goldens");
 const writeGoldensDir = arg("write-goldens");
-const scenarios = selectScenarios(arg("scenarios", "all"));
+const spec = arg("scenarios", "all") ?? "all";
+const scenarios = selectScenarios(spec);
 const verbose = has("verbose");
 
 mkdirSync(out, { recursive: true });
@@ -85,7 +86,10 @@ for (const scenario of scenarios) {
   for (const c of checks.filter((x) => !x.ok)) log(`    ✗ ${c.name}\n${indent(c.details)}`);
 }
 
-const coverage = coverageCheck(referenceDirs, (arg("scenarios", "all") ?? "all") === "all");
+// Coverage is required when the selection can reach every call: `all`,
+// `main` (all but the hot shapes, which add no call) and `daemon` (all but
+// the M5 steps, whose four calls are excluded).
+const coverage = coverageCheck(referenceDirs, spec === "all" || spec === "main" || spec === "daemon", spec === "daemon" ? M5_PROTOCOL_CALLS : []);
 const allOk = reports.every((r) => r.ok) && coverage.ok;
 const report: HarnessReport = {
   generatedAt: new Date().toISOString(),

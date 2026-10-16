@@ -5,12 +5,19 @@ name: Differential harness
 # fault scenarios against a recording fake gateway, and fails on any
 # difference in what leaves the binary. See harness/README.md.
 #
-# Four jobs run on every pull request:
+# Six jobs run on every pull request:
 #   self          the candidate compared with itself, three runs in a row:
-#                 the harness is deterministic;
+#                 the harness is deterministic (every scenario but the
+#                 hot-path shapes);
 #   differential  the reference compared with the candidate: the change
 #                 under review alters nothing a server, a person or the hx ui
 #                 can see (or the pull request says why);
+#   self-hot, differential-hot
+#                 the same two on the hot-path shapes (hot-10k above all),
+#                 in jobs of their own: on Linux the runner has shut the
+#                 TypeScript jobs down 16 to 21 minutes in while hot-10k ran
+#                 ("The runner has received a shutdown signal"), so these
+#                 sample the machine's memory every 10 s into the step log;
 #   caught        the reference compared with deliberately broken candidates:
 #                 the harness detects a changed chunk size, a dropped byte and
 #                 a dropped metadata field;
@@ -28,17 +35,19 @@ name: Differential harness
 # on a manual run — from another ref, or downloaded from a URL (an hx2
 # release asset, say) with `candidate_name: hx2`.
 #
-# On the hx-2.0 branch four more jobs run the Rust port (hx2/, the hot path)
+# On the hx-2.0 branch four more jobs run the Rust port (hx2/, the daemon)
 # against the same reference:
 #   hx2-build         cargo build --release on both runners;
-#   hx2-differential  the reference compared with hx2 on the hot-path
-#                     scenarios (harness/run/scenarios.ts, HOT_PATH_SCENARIOS),
-#                     passed as `candidate_name: hx2`;
+#   hx2-differential  the reference compared with hx2 on the daemon surface:
+#                     every scenario with the steps of the next card (the hx
+#                     ui API, update, connect, disconnect) removed
+#                     (harness/run/scenarios.ts, daemonScenarios), passed as
+#                     `candidate_name: hx2`, with the goldens;
 #   hx2-self          hx2 compared with itself on the same scenarios;
 #   hx2-measure       harness/run/measure.ts with hx2 as the candidate:
 #                     the founder-sized tree (4,800 transcripts, 36,000
-#                     Claude Desktop files) for memory and idle CPU, and the
-#                     hot-path idle shape under strace.
+#                     Claude Desktop files) for memory and idle CPU, the idle
+#                     shapes under strace, and the Claude Desktop index.
 
 on:
   pull_request:
@@ -67,7 +76,7 @@ on:
         required: false
         default: ""
       scenarios:
-        description: "Comma-separated scenario names, or all"
+        description: "Comma-separated scenario names, or all | main | hot-path | daemon"
         required: false
         default: "all"
 
@@ -237,10 +246,12 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x bin/candidate/hx
+          # The hot-path shapes run in self-hot; "all" means everything else here.
+          scen="$SCENARIOS"; [ "$scen" = all ] && scen=main
           bun harness/run/run-harness.ts \
             --reference bin/candidate/hx --reference-name "$CANDIDATE_NAME" \
             --candidate bin/candidate/hx --candidate-name "$CANDIDATE_NAME" \
-            --scenarios "$SCENARIOS" --out harness-out --work "$RUNNER_TEMP/hx-harness"
+            --scenarios "$scen" --out harness-out --work "$RUNNER_TEMP/hx-harness"
 
       - name: Report
         if: always()
@@ -288,10 +299,12 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x bin/reference/hx bin/candidate/hx
+          # The hot-path shapes run in differential-hot; "all" means everything else here.
+          scen="$SCENARIOS"; [ "$scen" = all ] && scen=main
           bun harness/run/run-harness.ts \
             --reference bin/reference/hx \
             --candidate bin/candidate/hx --candidate-name "$CANDIDATE_NAME" \
-            --scenarios "$SCENARIOS" --out harness-out --work "$RUNNER_TEMP/hx-harness" \
+            --scenarios "$scen" --out harness-out --work "$RUNNER_TEMP/hx-harness" \
             --goldens "harness/golden/$RUNNER_OS_NAME" --write-goldens "harness-out/goldens/$RUNNER_OS_NAME"
 
       - name: Report
@@ -304,6 +317,146 @@ jobs:
         if: always()
         with:
           name: harness-differential-${{ matrix.os }}
+          path: harness-out
+          if-no-files-found: warn
+
+  self-hot:
+    name: Candidate vs itself, hot path, run ${{ matrix.run }} (${{ matrix.os }})
+    needs: candidate
+    if: ${{ (github.event.inputs.scenarios || 'all') == 'all' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        run: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx-candidate-${{ matrix.os }}
+          path: bin/candidate
+
+      - name: Run the harness on the hot-path scenarios, sampling memory
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bin/candidate/hx
+          mkdir -p harness-out
+          # On Linux the runner shut the TypeScript hot-path jobs down 16 to
+          # 21 minutes in, during or after hot-10k ("The runner has received
+          # a shutdown signal"). Sample the machine every 10 s into the step
+          # log (live, so it survives a shutdown) and into memory.log.
+          sample() {
+            while true; do
+              echo "--- memory $(date -u +%FT%TZ)"
+              if [ "$RUNNER_OS" = Linux ]; then
+                free -m | sed -n '1,3p'
+                ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -6
+              else
+                vm_stat | sed -n '1,8p'
+                ps -eo pid,rss,pcpu,etime,comm -r | head -6
+              fi
+              df -h "$RUNNER_TEMP" | tail -1
+              sleep 10
+            done
+          }
+          ( sample 2>&1 | tee harness-out/memory.log ) &
+          sampler=$!
+          trap 'kill $sampler 2>/dev/null || true' EXIT
+          bun harness/run/run-harness.ts \
+            --reference bin/candidate/hx --reference-name "$CANDIDATE_NAME" \
+            --candidate bin/candidate/hx --candidate-name "$CANDIDATE_NAME" \
+            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx-harness"
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          if [ -f harness-out/report.md ]; then cat harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: harness-self-hot-${{ matrix.os }}-run${{ matrix.run }}
+          path: harness-out
+          if-no-files-found: warn
+
+  differential-hot:
+    name: Reference vs candidate, hot path (${{ matrix.os }})
+    needs: [reference, candidate]
+    if: ${{ (github.event.inputs.scenarios || 'all') == 'all' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx-reference-${{ matrix.os }}
+          path: bin/reference
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx-candidate-${{ matrix.os }}
+          path: bin/candidate
+
+      - name: Run the harness on the hot-path scenarios, sampling memory
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bin/reference/hx bin/candidate/hx
+          mkdir -p harness-out
+          # On Linux the runner shut the TypeScript hot-path jobs down 16 to
+          # 21 minutes in, during or after hot-10k ("The runner has received
+          # a shutdown signal"). Sample the machine every 10 s into the step
+          # log (live, so it survives a shutdown) and into memory.log.
+          sample() {
+            while true; do
+              echo "--- memory $(date -u +%FT%TZ)"
+              if [ "$RUNNER_OS" = Linux ]; then
+                free -m | sed -n '1,3p'
+                ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -6
+              else
+                vm_stat | sed -n '1,8p'
+                ps -eo pid,rss,pcpu,etime,comm -r | head -6
+              fi
+              df -h "$RUNNER_TEMP" | tail -1
+              sleep 10
+            done
+          }
+          ( sample 2>&1 | tee harness-out/memory.log ) &
+          sampler=$!
+          trap 'kill $sampler 2>/dev/null || true' EXIT
+          bun harness/run/run-harness.ts \
+            --reference bin/reference/hx \
+            --candidate bin/candidate/hx --candidate-name "$CANDIDATE_NAME" \
+            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx-harness"
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          if [ -f harness-out/report.md ]; then cat harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: harness-differential-hot-${{ matrix.os }}
           path: harness-out
           if-no-files-found: warn
 
@@ -472,7 +625,7 @@ jobs:
           if-no-files-found: error
 
   hx2-differential:
-    name: Reference vs hx2, hot path (${{ matrix.os }})
+    name: Reference vs hx2, daemon surface (${{ matrix.os }})
     needs: [reference, hx2-build]
     strategy:
       fail-fast: false
@@ -497,15 +650,18 @@ jobs:
           name: hx2-${{ matrix.os }}
           path: bin/hx2
 
-      - name: Run the harness on the hot-path scenarios
+      - name: Run the harness on the daemon surface
         shell: bash
+        env:
+          RUNNER_OS_NAME: ${{ runner.os }}
         run: |
           set -euo pipefail
           chmod +x bin/reference/hx bin/hx2/hx2
           bun harness/run/run-harness.ts \
             --reference bin/reference/hx \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx2-harness"
+            --scenarios daemon --out harness-out --work "$RUNNER_TEMP/hx2-harness" \
+            --goldens "harness/golden/$RUNNER_OS_NAME" --write-goldens "harness-out/goldens/$RUNNER_OS_NAME"
 
       - name: Report
         if: always()
@@ -521,7 +677,7 @@ jobs:
           if-no-files-found: warn
 
   hx2-self:
-    name: hx2 vs itself, hot path (${{ matrix.os }})
+    name: hx2 vs itself, daemon surface (${{ matrix.os }})
     needs: hx2-build
     strategy:
       fail-fast: false
@@ -549,7 +705,7 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/hx2/hx2 --reference-name hx2 \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx2-harness"
+            --scenarios daemon --out harness-out --work "$RUNNER_TEMP/hx2-harness"
 
       - name: Report
         if: always()
@@ -601,7 +757,7 @@ jobs:
           chmod +x bin/reference/hx bin/hx2/hx2
           bun harness/run/measure.ts \
             --reference bin/reference/hx --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --only founder,idle-hot \
+            --only founder,idle,idle-hot,ccd-index \
             --out measure-out --work "$RUNNER_TEMP/hx2-measure"
 
       - name: Report
