@@ -286,7 +286,6 @@ async function phase(name: string, client: Client, command: string[], grows: num
   p.seqTo = cloud.requestCount + 1;
 }
 
-let cleanup: Spawned | null = null;
 try {
   await phase("1 · hx takes the slot", "hx", ["start"], null, () => waitSynced());
   await phase("2 · hx2 takes the slot", "hx2", ["start"], 0, () => waitStoredWhole(0));
@@ -298,8 +297,9 @@ try {
     if (existsSync(p)) cpSync(p, join(out, f));
   }
   // The reference takes the service down for good, whichever client holds it.
-  cleanup = await run([bins.hx, "uninstall", "--purge"], env);
+  const cleanup = await run([bins.hx, "uninstall", "--purge"], env);
   log(`── cleanup: hx uninstall --purge → exit ${cleanup.code}\n${cleanup.stdout.trimEnd()}`);
+  writeFileSync(join(out, "cleanup.txt"), `exit ${cleanup.code}\n${cleanup.stdout}${cleanup.stderr}`);
   const left = await watchProcesses();
   for (const pid of [...left.hx, ...left.hx2]) {
     try {
@@ -447,7 +447,6 @@ writeFileSync(
       versions,
       checks,
       phases: phases.map((p) => ({ name: p.name, client: p.client, command: p.command, seqFrom: p.seqFrom, seqTo: p.seqTo, exit: p.output.code, stdout: p.output.stdout, status: p.status?.stdout, processes: p.processes })),
-      cleanup: cleanup ? { exit: cleanup.code, stdout: cleanup.stdout } : null,
     },
     null,
     2,
