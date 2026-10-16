@@ -687,11 +687,15 @@ function parseStraceSummary(text: string): Record<string, number> {
   return counts;
 }
 
+/** The second idle daemon of the idle measurements, traced with every
+ *  stat-family and readlink call's path; its first PATH_TRACE_STARTUP_MS
+ *  hold the start-up pass. */
+const PATH_TRACE_MS = 45_000;
+const PATH_TRACE_STARTUP_MS = 15_000;
+
 /** The idle daemon on one shape: `label` names the measurement (its home,
  *  its strace summary and memory samples), so `idle` and `idle-hot` keep
  *  their files apart. */
-const PATH_TRACE_MS = 45_000;
-const PATH_TRACE_STARTUP_MS = 15_000;
 async function measureIdle(binary: string, who: Who, shape: Manifest["shape"], label: string): Promise<Measurement> {
   const h = await prepareHome(binary, label, shape);
   try {
