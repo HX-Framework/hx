@@ -38,6 +38,9 @@ function sessionJson(ccd: string, cli: string, title: string): string {
   });
 }
 
+const T0 = 1_000_000;
+const PINNED = new Date(1_700_000_000_000);
+
 function setup(): void {
   root = mkdtempSync(join(tmpdir(), "hx-ccd-index-"));
   const sessions = join(root, "claude-code-sessions");
@@ -45,6 +48,13 @@ function setup(): void {
   mkdirSync(org, { recursive: true });
   writeFileSync(join(org, "local_a.json"), sessionJson("local_a", "cli-a", "A"));
   writeFileSync(join(org, "local_b.json"), sessionJson("local_b", "cli-b", "B"));
+  // The org dir last changed long ago, as on a machine whose index is already
+  // built, so a file the test creates, renames or deletes moves the dir's
+  // mtime: that move is what the dir-mtime gate looks for. Without the pin it
+  // can stay put. On the Windows CI runner a dir's mtime advances in steps up
+  // to 16 ms apart, and a change made about a millisecond after the writes
+  // above left it unchanged in 29% to 68% of attempts.
+  utimesSync(org, PINNED, PINNED);
   setCcdSessionsDirForTests(sessions);
 }
 
@@ -55,9 +65,6 @@ function renameWrite(p: string, content: string): void {
   writeFileSync(tmp, content);
   renameSync(tmp, p);
 }
-
-const T0 = 1_000_000;
-const PINNED = new Date(1_700_000_000_000);
 
 afterEach(() => {
   setCcdSessionsDirForTests(null);
