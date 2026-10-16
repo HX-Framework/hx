@@ -518,14 +518,14 @@ struct TitleMeta {
 /// `deriveTitleMeta`: Claude Desktop's title, else the chunk's, else Codex's,
 /// else the rollout head's; a synthesized label on a from-zero upload.
 fn derive_title_meta(summary: &ChunkSummary, head: &HeadMeta, step_offset: u64, ccd: Option<&CcdSessionMeta>, codex: Option<&CodexTitle>) -> TitleMeta {
-    let ccd_title: Option<JsStr> = ccd.and_then(|m| m.title.clone()).filter(|t| !t.is_empty());
+    let ccd_title: Option<JsStr> = ccd.and_then(|m| m.title_units()).filter(|t| !t.is_empty());
     let mut title: Option<JsStr> = ccd_title
         .clone()
         .or_else(|| summary.title.clone())
         .or_else(|| codex.map(|c| c.title.clone()))
         .or_else(|| head.title.clone());
     let mut source: Option<&'static str> = if ccd_title.is_some() {
-        ccd.and_then(|m| m.title_source)
+        ccd.and_then(|m| m.title_source())
     } else if summary.title.is_some() {
         summary.title_source
     } else if codex.is_some() {
@@ -588,7 +588,7 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
     }
 
     // Claude Desktop's title and group id, and Codex's own title: byte-independent, resolved once.
-    let ccd_meta: Option<CcdSessionMeta> = get_ccd_recents_by_cli_id(now_ms()).get(&session_id).cloned();
+    let ccd_meta: Option<Arc<CcdSessionMeta>> = get_ccd_recents_by_cli_id(now_ms()).get(&session_id).cloned();
     let codex_title: Option<CodexTitle> = if file.source == "codex" { read_codex_title(&file.root_dir, &session_id) } else { None };
 
     let mut any_progress = false;
@@ -694,13 +694,13 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                             }
                         }
                     }
-                    let tm = derive_title_meta(&summary, &head, step_offset, ccd_meta.as_ref(), codex_title.as_ref());
+                    let tm = derive_title_meta(&summary, &head, step_offset, ccd_meta.as_deref(), codex_title.as_ref());
                     let cwd_meta: Json = if ctx.cfg.evidence_upload == Some(false) { Json::Null } else { opt_js(&head.cwd) };
                     let meta = obj(vec![
                         ("sourcePath", Json::str(&file.path)),
                         ("title", opt_js(&tm.title)),
                         ("titleSource", Json::opt_str(tm.title_source)),
-                        ("ccdSessionId", ccd_meta.as_ref().map(|m| Json::str(&m.ccd_session_id)).unwrap_or(Json::Null)),
+                        ("ccdSessionId", ccd_meta.as_ref().map(|m| Json::Str(m.ccd_session_id_units())).unwrap_or(Json::Null)),
                         ("cwd", cwd_meta),
                         ("gitBranch", opt_js(&head.git_branch)),
                         ("repoSlug", Json::opt_str(repo_slug.as_deref())),

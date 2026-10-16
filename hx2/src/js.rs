@@ -132,7 +132,12 @@ pub fn collapse_spaces(s: &[u16]) -> JsStr {
     out
 }
 
-/// `Number.prototype.toString` / `JSON.stringify` for a finite number.
+/// `Number.prototype.toString` / `JSON.stringify` for a finite number: the
+/// shortest digits that read back as the same double, laid out the way the
+/// specification lays them out — plainly from 1e-6 up to 1e21 (Rust's
+/// `Display` writes those exactly so), in exponent form outside, where
+/// JavaScript writes `1e+21` and `1.5e-7` and `Display` would write every
+/// zero.
 pub fn num_to_string(v: f64) -> String {
     if v.is_nan() || v.is_infinite() {
         return "null".to_string();
@@ -140,10 +145,22 @@ pub fn num_to_string(v: f64) -> String {
     if v == 0.0 {
         return "0".to_string();
     }
-    if v.fract() == 0.0 && v.abs() < 1e21 {
-        return format!("{}", v as i128);
+    let a = v.abs();
+    if (1e-6..1e21).contains(&a) {
+        return format!("{}", v);
     }
-    format!("{}", v)
+    // `{:e}` gives the same shortest digits as d.ddd and an exponent.
+    let sci = format!("{:e}", a);
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let sign = if exp < 0 { '-' } else { '+' };
+    let body = if digits.len() == 1 { format!("{}e{}{}", digits, sign, exp.abs()) } else { format!("{}.{}e{}{}", &digits[..1], &digits[1..], sign, exp.abs()) };
+    if v < 0.0 {
+        format!("-{}", body)
+    } else {
+        body
+    }
 }
 
 /// `Math.round`: halves round toward positive infinity.
@@ -285,4 +302,39 @@ pub fn to_locale_time_string_en_us(ms: f64) -> String {
     };
     let (pm, h12) = d.hour12();
     format!("{}:{:02}:{:02} {}", h12, d.minute(), d.second(), if pm { "PM" } else { "AM" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers_print_as_javascript_prints_them() {
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.0, "1"),
+            (-1.5, "-1.5"),
+            (123.456, "123.456"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1_792_180_674_494.235_8, "1792180674494.2358"),
+            (1e-6, "0.000001"),
+            (1.5e-6, "0.0000015"),
+            (1.5e-7, "1.5e-7"),
+            (1e-7, "1e-7"),
+            (5e-324, "5e-324"),
+            (1e20, "100000000000000000000"),
+            (1e21, "1e+21"),
+            (1.5e21, "1.5e+21"),
+            (-2.5e300, "-2.5e+300"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (9_007_199_254_740_993.0, "9007199254740992"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(num_to_string(*v), *want, "{:e}", v);
+            let mut out = String::new();
+            crate::json::write_num(&mut out, *v);
+            assert_eq!(out, *want, "write_num {:e}", v);
+        }
+    }
 }
