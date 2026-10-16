@@ -46,7 +46,7 @@
 // on CI runners only: harness/run/service-home.ts.
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, cpSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { FakeGateway, type RecordedRequest } from "../gateway/gateway.js";
@@ -68,6 +68,7 @@ if (!hxArg || !hx2Arg || !out || !work || !manager || !MANAGERS.includes(manager
   process.exit(64);
 }
 const bins: Record<Client, string> = { hx: resolve(hxArg), hx2: resolve(hx2Arg) };
+const workDir: string = work;
 
 const log = (line: string): void => {
   process.stderr.write(`${line}\n`);
@@ -218,8 +219,8 @@ interface Probe {
 const LEAVE_ALONE = "6 · hx2 leaves hx's slot alone";
 const leaveAlone = { ran: false, seqFrom: 0, seqTo: 0, before: { hx: [], hx2: [] } as Record<Client, number[]>, after: { hx: [], hx2: [] } as Record<Client, number[]>, probes: [] as Probe[] };
 
-async function probe(args: string[]): Promise<Spawned> {
-  const output = await run([bins.hx2, ...args], env);
+async function probe(args: string[], bin = bins.hx2): Promise<Spawned> {
+  const output = await run([bin, ...args], env);
   leaveAlone.probes.push({ command: `hx2 ${args.join(" ")}`, output });
   log(`── ${LEAVE_ALONE}: hx2 ${args.join(" ")} → exit ${output.code}\n${output.stdout.trimEnd()}${output.stderr.trim() ? `\n${output.stderr.trimEnd()}` : ""}`);
   return output;
@@ -236,10 +237,20 @@ async function leaveAlonePhase(): Promise<void> {
   leaveAlone.before = await watchProcesses();
   await probe(["status"]);
   await probe(["restart"]);
-  // A newer hx2 on the update channel: the binary is swapped (for the same
-  // bytes), and the service is not touched.
-  cloud.update({ version: bumpPatch(versions.hx2), releaseBinary: bins.hx2 });
-  await probe(["update"]);
+  // A newer hx2 on the update channel, swapped in and the service left alone.
+  // Byte-identical bytes would stop at the no-op guard ("already on the
+  // latest version"), so the release is a small wrapper script, and a copy
+  // of hx2 runs the update so the binary under test stays as it is.
+  const updateDir = join(workDir, "hx2-update");
+  rmSync(updateDir, { recursive: true, force: true });
+  mkdirSync(updateDir, { recursive: true });
+  const copy = join(updateDir, "hx2");
+  copyFileSync(bins.hx2, copy);
+  chmodSync(copy, 0o755);
+  const release = join(updateDir, "release");
+  writeFileSync(release, `#!/bin/sh\nexec '${bins.hx2}' "$@"\n`, { mode: 0o755 });
+  cloud.update({ version: bumpPatch(versions.hx2), releaseBinary: release });
+  await probe(["update"], copy);
   cloud.update({ version: "0.0.0", releaseBinary: undefined });
   await sleep(3_000);
   leaveAlone.after = await watchProcesses();
