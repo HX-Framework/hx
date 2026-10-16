@@ -226,10 +226,15 @@ no commit replaced an object the store already held); that each grown
 transcript is stored byte for byte and went up through the client that held
 the slot; that the recording is one stretch of hx, one of hx2, one of hx (by
 User-Agent) and each phase ends with exactly one `watch` process, the right
-client's; and that `status` names the expected manager. launchd and systemd
-run the service with the user's own HOME, so on the runner the fixture is
-linked into it (`~/.claude`, `~/.codex`, Claude Desktop's folder), and the
-script refuses to run outside CI or over an existing path.
+client's; and that `status` names the expected manager. The same job then
+runs `harness/run/service-commands.ts`: each client in turn runs `start`,
+`status`, `restart`, `stop` (twice), `start`, `logs` (ended with SIGINT) and
+`uninstall` through the same manager from the same starting state, and every
+step's exit code, normalized output and number of `watch` processes must be
+identical (`status` on its Daemon row). launchd and systemd run the service
+with the user's own HOME, so on the runner the fixture is linked into it
+(`~/.claude`, `~/.codex`, Claude Desktop's folder), and both scripts refuse
+to run outside CI or over an existing path (`harness/run/service-home.ts`).
 
 `measure.ts` reports the macOS daemon's `phys_footprint` beside its `ps` RSS
 (`harness/run/phys-footprint.c`, compiled once per run with `cc`): RSS counts

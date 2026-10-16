@@ -55,7 +55,9 @@ name: Differential harness
 #   hx2-switch        a device moves its one service slot from hx to hx2 and
 #                     back through launchd, systemd and the container shell
 #                     hook, and loses nothing and uploads nothing twice
-#                     (harness/run/switch.ts).
+#                     (harness/run/switch.ts); then both clients run the
+#                     service commands through the same manager, compared
+#                     after normalization (harness/run/service-commands.ts).
 
 on:
   pull_request:
@@ -1003,13 +1005,16 @@ jobs:
           path: measure-out
           if-no-files-found: warn
 
-  # The exit check of the program's "Build hx2" step: hx and hx2 share one
-  # service slot, and a device that moves it from hx to hx2 and back loses
-  # nothing and uploads nothing twice. launchd and systemd run the service
-  # with the runner's own HOME, so the fixture is linked into it there; the
-  # container shell hook runs with the fixture as HOME.
+  # The background service through a real service manager, which the
+  # harness's scenarios never install. First the exit check of the program's
+  # "Build hx2" step: hx and hx2 share one service slot, and a device that
+  # moves it from hx to hx2 and back loses nothing and uploads nothing twice
+  # (harness/run/switch.ts). Then the service commands of both clients side
+  # by side (harness/run/service-commands.ts). launchd and systemd run the
+  # service with the runner's own HOME, so the fixture is linked into it
+  # there; the container shell hook runs with the fixture as HOME.
   hx2-switch:
-    name: Move the service hx → hx2 → hx (${{ matrix.manager }})
+    name: The service, hx and hx2 (${{ matrix.manager }})
     needs: [reference, hx2-build]
     strategy:
       fail-fast: false
@@ -1057,17 +1062,29 @@ jobs:
           set -euo pipefail
           chmod +x bin/reference/hx bin/hx2/hx2
           bun harness/run/switch.ts --hx bin/reference/hx --hx2 bin/hx2/hx2 \
-            --manager ${{ matrix.manager }} --out switch-out --work "$RUNNER_TEMP/hx-switch"
+            --manager ${{ matrix.manager }} --out service-out/switch --work "$RUNNER_TEMP/hx-switch"
+
+      # start, status, restart, stop, logs and uninstall, run by each client
+      # in turn through the same manager and compared after normalization.
+      - name: Compare the service commands
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun harness/run/service-commands.ts --hx bin/reference/hx --hx2 bin/hx2/hx2 \
+            --manager ${{ matrix.manager }} --out service-out/commands --work "$RUNNER_TEMP/hx-service-commands"
 
       - name: Report
         if: always()
         shell: bash
         run: |
-          if [ -f switch-out/report.md ]; then cat switch-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+          for f in service-out/switch/report.md service-out/commands/report.md; do
+            if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: harness-hx2-switch-${{ matrix.manager }}
-          path: switch-out
+          name: harness-hx2-service-${{ matrix.manager }}
+          path: service-out
           if-no-files-found: warn

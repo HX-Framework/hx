@@ -31,24 +31,16 @@
 //
 //   bun harness/run/switch.ts --hx <bin> --hx2 <bin> --manager launchd|systemd|shell-hook --out <dir> --work <dir>
 //
-// launchd and systemd start the service with the user's own HOME, not the
-// caller's, so for them the fixture is linked into the real home (~/.claude,
-// ~/.codex, and Claude Desktop's folder on macOS) and the client's files are
-// written to the real ~/.let/hx. That runs on CI runners only, and refuses to
-// start when any of those paths already exists. The shell hook (a container's
-// backend) runs with the fixture as HOME.
+// Where the fixture lives for each manager, and why launchd and systemd run
+// on CI runners only: harness/run/service-home.ts.
 
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync, cpSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, cpSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 import { FakeGateway, type RecordedRequest } from "../gateway/gateway.js";
-import { generateHome, type Manifest } from "../fixtures/gen-home.js";
-import { appendTranscriptLines, CLOUD_PORT, clientEnv, writeClientFiles } from "./run-scenario.js";
-
-type Client = "hx" | "hx2";
-type Manager = "launchd" | "systemd" | "shell-hook";
+import { appendTranscriptLines, CLOUD_PORT } from "./run-scenario.js";
+import { type Client, killWatchProcesses, type Manager, MANAGER_NAME, MANAGERS, prepareServiceHome, run, type Spawned, versionOf, watchProcesses } from "./service-home.js";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -60,37 +52,16 @@ const hx2Arg = arg("hx2");
 const manager = arg("manager") as Manager | undefined;
 const out = arg("out");
 const work = arg("work");
-if (!hxArg || !hx2Arg || !out || !work || !manager || !["launchd", "systemd", "shell-hook"].includes(manager)) {
+if (!hxArg || !hx2Arg || !out || !work || !manager || !MANAGERS.includes(manager)) {
   console.error("usage: switch.ts --hx <bin> --hx2 <bin> --manager launchd|systemd|shell-hook --out <dir> --work <dir>");
   process.exit(64);
 }
 const bins: Record<Client, string> = { hx: resolve(hxArg), hx2: resolve(hx2Arg) };
-const realHome = manager !== "shell-hook";
-if (realHome && process.env.GITHUB_ACTIONS !== "true") {
-  console.error(`--manager ${manager} runs the service in this user's real home: CI runners only`);
-  process.exit(64);
-}
-const MANAGER_NAME: Record<Manager, string> = { launchd: "launchd", systemd: "systemd (user)", "shell-hook": "shell hook (container)" };
 
 const log = (line: string): void => {
   process.stderr.write(`${line}\n`);
 };
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-interface Spawned {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-}
-
-async function run(cmd: string[], env: Record<string, string>, timeoutMs = 120_000): Promise<Spawned> {
-  const proc = Bun.spawn(cmd, { env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);
-  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-  const code = await proc.exited;
-  clearTimeout(timer);
-  return { code, stdout, stderr };
-}
 
 function sha256File(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -102,75 +73,15 @@ function clientOfUserAgent(ua: string | undefined): Client | "other" {
   return "other";
 }
 
-/** `<hx|hx2> watch` processes running now, by client. */
-async function watchProcesses(): Promise<Record<Client, number[]>> {
-  const r = await run(["ps", "-A", "-o", "pid=,args="], { PATH: process.env.PATH ?? "/usr/bin:/bin" });
-  const found: Record<Client, number[]> = { hx: [], hx2: [] };
-  for (const line of r.stdout.split("\n")) {
-    const m = /^\s*(\d+)\s+(\S+)\s+watch(\s|$)/.exec(line);
-    if (!m) continue;
-    const name = basename(m[2]!);
-    if (name === "hx" || name === "hx2") found[name].push(Number(m[1]));
-  }
-  return found;
-}
-
 // ── The home ────────────────────────────────────────────────────────────────
 
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
-mkdirSync(work, { recursive: true });
-const genDir = join(work, "switch-home");
-const home = realHome ? homedir() : genDir;
-const LINKED = [".claude", ".codex", join("Library", "Application Support", "Claude")];
-const linked: string[] = [];
-
-if (realHome) {
-  for (const rel of [...LINKED, join(".let", "hx")]) {
-    let present = false;
-    try {
-      lstatSync(join(home, rel));
-      present = true;
-    } catch {
-      // absent, as it must be
-    }
-    if (present) {
-      console.error(`refusing to run: ${join(home, rel)} already exists`);
-      process.exit(64);
-    }
-  }
-}
-const manifest: Manifest = generateHome({ out: genDir, shape: "small", seed: "switch" });
-if (realHome) {
-  for (const rel of LINKED) {
-    const source = join(genDir, rel);
-    if (!existsSync(source)) continue;
-    const target = join(home, rel);
-    mkdirSync(dirname(target), { recursive: true });
-    symlinkSync(source, target);
-    linked.push(target);
-  }
-}
-
+const svc = prepareServiceHome({ manager, work, name: "switch-home", shape: "small", seed: "switch" });
+const { home, manifest, env } = svc;
 const cloud = new FakeGateway({ version: "0.0.0", recordPath: join(out, "gateway.jsonl"), label: "cloud" });
 const gatewayUrl = cloud.start(CLOUD_PORT);
-writeClientFiles(home, cloud, gatewayUrl, {});
-const env: Record<string, string> = clientEnv(home);
-// systemctl --user finds the user manager through these two; without them it
-// fails, and the clients pick the shell hook.
-if (manager === "systemd") {
-  for (const k of ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]) {
-    const v = process.env[k];
-    if (v) env[k] = v;
-  }
-}
-
-async function versionOf(client: Client): Promise<string> {
-  const r = await run([bins[client], "--version"], env);
-  const m = /version: (\d+\.\d+\.\d+)/.exec(r.stdout);
-  if (!m) throw new Error(`no version from ${bins[client]}: ${r.stdout}${r.stderr}`);
-  return m[1]!;
-}
+svc.connect(cloud, gatewayUrl);
 
 function atLeast(version: string, min: string): boolean {
   const a = version.split(".").map(Number);
@@ -179,7 +90,7 @@ function atLeast(version: string, min: string): boolean {
   return true;
 }
 
-const versions: Record<Client, string> = { hx: await versionOf("hx"), hx2: await versionOf("hx2") };
+const versions: Record<Client, string> = { hx: await versionOf(bins.hx, env), hx2: await versionOf(bins.hx2, env) };
 const wayBack = atLeast(versions.hx, "77.13.0") ? "start" : "restart";
 log(`hx ${versions.hx} (${bins.hx}), hx2 ${versions.hx2} (${bins.hx2}); ${manager}; home ${home}`);
 
@@ -300,22 +211,8 @@ try {
   const cleanup = await run([bins.hx, "uninstall", "--purge"], env);
   log(`── cleanup: hx uninstall --purge → exit ${cleanup.code}\n${cleanup.stdout.trimEnd()}`);
   writeFileSync(join(out, "cleanup.txt"), `exit ${cleanup.code}\n${cleanup.stdout}${cleanup.stderr}`);
-  const left = await watchProcesses();
-  for (const pid of [...left.hx, ...left.hx2]) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // gone
-    }
-  }
-  for (const l of linked) {
-    try {
-      unlinkSync(l);
-    } catch {
-      // gone
-    }
-  }
-  if (realHome) rmSync(hxDir, { recursive: true, force: true });
+  await killWatchProcesses();
+  svc.release();
   writeFileSync(join(out, "store.json"), JSON.stringify(cloud.manifest(), null, 2));
   cloud.stop();
 }
@@ -425,7 +322,7 @@ const ok = checks.every((c) => c.ok);
 const lines: string[] = [];
 lines.push(`## Moving the slot hx → hx2 → hx (${manager}): ${ok ? "nothing lost, nothing sent twice" : "FAILED"}`);
 lines.push("");
-lines.push(`${process.platform}-${process.arch} · hx ${versions.hx} · hx2 ${versions.hx2} · ${realHome ? "the user's own HOME, fixture linked in" : "the fixture as HOME"} · ${manifest.sessions.length} fixture sessions · ${requests.length} requests`);
+lines.push(`${process.platform}-${process.arch} · hx ${versions.hx} · hx2 ${versions.hx2} · ${manager === "shell-hook" ? "the fixture as HOME" : "the user's own HOME, fixture linked in"} · ${manifest.sessions.length} fixture sessions · ${requests.length} requests`);
 lines.push("");
 lines.push("| Check | Result | Details |");
 lines.push("| --- | --- | --- |");
