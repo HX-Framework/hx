@@ -7,12 +7,20 @@
 //! deletions and renames within one tick. With file events armed (fsevents.rs)
 //! the full polling sweep runs only every SAFETY_SWEEP_MS as the safety net,
 //! and the ticks between re-check only the paths events named.
+//!
+//! The inventory keeps DISCOVERY order, as the TypeScript client's Maps do:
+//! a pass hands files to the upload pool in the order the catalog lists them,
+//! and which files a pass reaches first is visible to a gateway that is
+//! refusing them (the two-file rule stops the pass after two failures).
+//! A re-admitted path goes to the end, exactly where a `Map` puts it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use indexmap::IndexMap;
 
 use crate::fsevents::FileEventSource;
 use crate::fsutil::{basename, dirname, join, readdir_safe, stat_safe};
@@ -88,10 +96,10 @@ fn pid_alive(pid: i64) -> bool {
 
 pub struct DiscoveryCatalog {
     roots_sig: String,
-    parents: BTreeMap<String, FileEntry>,
-    excluded: BTreeMap<String, ExcludedEntry>,
-    dirs: HashMap<String, DirInfo>,
-    tracker_cache: HashMap<String, TrackerRecord>,
+    parents: IndexMap<String, FileEntry>,
+    excluded: IndexMap<String, ExcludedEntry>,
+    dirs: IndexMap<String, DirInfo>,
+    tracker_cache: IndexMap<String, TrackerRecord>,
     live_session_ids: HashSet<String>,
     want_events: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     events: Option<FileEventSource>,
@@ -111,10 +119,10 @@ impl DiscoveryCatalog {
     pub fn new() -> DiscoveryCatalog {
         DiscoveryCatalog {
             roots_sig: String::new(),
-            parents: BTreeMap::new(),
-            excluded: BTreeMap::new(),
-            dirs: HashMap::new(),
-            tracker_cache: HashMap::new(),
+            parents: IndexMap::new(),
+            excluded: IndexMap::new(),
+            dirs: IndexMap::new(),
+            tracker_cache: IndexMap::new(),
             live_session_ids: HashSet::new(),
             want_events: None,
             events: None,
@@ -389,7 +397,7 @@ impl DiscoveryCatalog {
                         let drop_n = self.tracker_cache.len() / 2;
                         let keys: Vec<String> = self.tracker_cache.keys().take(drop_n).cloned().collect();
                         for k in keys {
-                            self.tracker_cache.remove(&k);
+                            self.tracker_cache.shift_remove(&k);
                         }
                     }
                     self.tracker_cache.insert(p.clone(), rec);
@@ -440,7 +448,7 @@ impl DiscoveryCatalog {
             let gone: Vec<String> = self.dirs.keys().filter(|d| d.starts_with(&prefix) && !seen.contains(*d)).cloned().collect();
             for dir_path in gone {
                 self.drop_dir_members(&dir_path);
-                self.dirs.remove(&dir_path);
+                self.dirs.shift_remove(&dir_path);
             }
         }
     }
@@ -452,7 +460,7 @@ impl DiscoveryCatalog {
             None => {
                 if known_mtime.is_some() {
                     self.drop_dir_members(dir_path);
-                    self.dirs.remove(dir_path);
+                    self.dirs.shift_remove(dir_path);
                 }
                 return;
             }
@@ -516,11 +524,11 @@ impl DiscoveryCatalog {
         // Deletions and renames inside this dir drop now.
         let gone: Vec<String> = self.parents.keys().filter(|p| dirname(p) == dir_path && !present.contains(*p)).cloned().collect();
         for p in gone {
-            self.parents.remove(&p);
+            self.parents.shift_remove(&p);
         }
         let gone: Vec<String> = self.excluded.keys().filter(|p| dirname(p) == dir_path && !present.contains(*p)).cloned().collect();
         for p in gone {
-            self.excluded.remove(&p);
+            self.excluded.shift_remove(&p);
         }
     }
 
@@ -574,17 +582,17 @@ impl DiscoveryCatalog {
             }
             match st {
                 None => {
-                    self.parents.remove(p);
+                    self.parents.shift_remove(p);
                 }
                 Some(s) if s.is_dir => {
-                    self.parents.remove(p);
+                    self.parents.shift_remove(p);
                 }
                 Some(s) if s.size == 0 => {
-                    self.parents.remove(p);
+                    self.parents.shift_remove(p);
                     self.excluded.insert(p.clone(), ExcludedEntry { source, root_dir, last_stat_ms: now_ms, session_id });
                 }
                 Some(s) if now_ms - s.mtime_ms > RECENT_WINDOW_MS => {
-                    self.parents.remove(p);
+                    self.parents.shift_remove(p);
                     self.excluded.insert(p.clone(), ExcludedEntry { source, root_dir, last_stat_ms: now_ms, session_id });
                 }
                 Some(s) => {
@@ -619,7 +627,7 @@ impl DiscoveryCatalog {
             let st = match stat_safe(Path::new(p)) {
                 Some(s) if !s.is_dir => s,
                 _ => {
-                    self.excluded.remove(p);
+                    self.excluded.shift_remove(p);
                     continue;
                 }
             };
@@ -627,7 +635,7 @@ impl DiscoveryCatalog {
                 e.last_stat_ms = now_ms;
             }
             if st.size > 0 && now_ms - st.mtime_ms <= RECENT_WINDOW_MS {
-                self.excluded.remove(p);
+                self.excluded.shift_remove(p);
                 self.insert_parent(p, st.size, st.mtime_ms, source, &root_dir, now_ms);
                 if let Some(e) = self.parents.get_mut(p) {
                     e.last_stat_ms = now_ms;

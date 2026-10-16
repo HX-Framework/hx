@@ -23,6 +23,9 @@ sha1 = "0.10"
 # SIGTERM / SIGINT: fold the journal, then end the way the default handler would.
 signal-hook = "0.3"
 libc = "0.2"
+# The catalog's maps keep discovery order, as the TypeScript client's Maps do:
+# the order a pass hands files to the upload pool is visible to a refusing gateway.
+indexmap = "2"
 
 [profile.release]
 opt-level = 3
