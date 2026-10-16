@@ -978,18 +978,21 @@ impl DaemonOps {
             Kind::Systemd => fs::read_to_string(systemd_unit_path()).ok().and_then(|c| definition_bin_path(ServiceKind::Systemd, &c)),
             Kind::ShellHook => fs::read_to_string(bootstrap_path()).ok().and_then(|c| bootstrap_bin_path(&c)),
             Kind::TaskScheduler => {
-                let r = spawn_sync("schtasks", &["/Query", "/TN", WIN_TASK_NAME, "/XML"]);
-                if !r.ok() {
+                // The program of the task's first action, from the scheduler's COM service.
+                let r = spawn_sync("powershell", &["-NoProfile", "-NonInteractive", "-Command", WIN_TASK_BINARY_PS]);
+                let out = r.stdout.trim();
+                if !r.ok() || out.is_empty() {
                     return None;
                 }
-                let start = r.stdout.find("<Command>")? + "<Command>".len();
-                let end = r.stdout[start..].find("</Command>")? + start;
-                Some(unescape_xml(r.stdout[start..end].trim()))
+                Some(out.to_string())
             }
             Kind::None => None,
         }
     }
 }
+
+/// What `slot_binary` asks Task Scheduler (src/daemon.ts WIN_TASK_BINARY_PS).
+const WIN_TASK_BINARY_PS: &str = "$ErrorActionPreference='SilentlyContinue'; $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); $t = $svc.GetFolder('\\').GetTask('hx-vision'); if ($t) { ($t.Definition.Actions | Select-Object -First 1).Path }";
 
 /// The client a binary path belongs to: "hx2" for `hx2`, `hx2.exe` or
 /// `hx2-svc.exe`, "hx" for `hx`, `hx.exe` or `hx-svc.exe`, else None.

@@ -438,6 +438,11 @@ pub fn auto_start_daemon(args: &[String], token_refreshed: bool) {
         let other = if before.loaded { slot_runs_other_client(&ops) } else { None };
         if !before.loaded || other.is_some() {
             let consent = resolve_dotfile_consent(&ops, args);
+            if other.is_some() {
+                // Moving the slot: stop the other client first. A container's
+                // install alone leaves a supervisor that is already running.
+                ops.stop()?;
+            }
             ops.install(&bin_path, consent)?;
             let after = ops.state();
             report_started(&ops, &after, consent);
@@ -617,12 +622,22 @@ pub fn cmd_disconnect(args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
-/// `hx start`: install and run the background service.
+/// `hx start`: install and run the background service. When the shared slot
+/// runs the other client, this is the command that moves the device: the
+/// other client is stopped first, so a container's running supervisor is
+/// replaced too.
 pub fn cmd_start(name: &str, args: &[String]) -> Result<i32, String> {
     ensure_config(name);
     let ops = get_daemon_ops();
     let consent = resolve_dotfile_consent(&ops, args);
+    let other = slot_runs_other_client(&ops);
+    if other.is_some() {
+        ops.stop()?;
+    }
     ops.install(&exec_path(), consent)?;
+    if let Some(o) = other {
+        say(&format!("Moved the background service from {} to {}.", o, name));
+    }
     let ds = ops.state();
     report_started(&ops, &ds, consent);
     say(&format!("logs:   {} logs", name));
