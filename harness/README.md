@@ -18,7 +18,10 @@ harness/
                   fixture), normalization rules, comparators, shared types
   run/            scenarios.ts (the catalog), run-scenario.ts (drive one
                   binary), run-harness.ts (reference vs candidate + report),
-                  measure.ts (the design-fix numbers: rusage + strace)
+                  measure.ts (the design-fix numbers: rusage, strace, sampled
+                  memory), watch-only.ts (a bare fs.watch, for measure.ts)
+  variants/       patches that change one design choice for a measurement
+                  (no-file-events: the daemon polls, as 77.11 did)
   golden/<os>/    committed, normalized CLI outputs per scenario step
   broken/         patches that make a candidate differ on purpose
   ci/build.sh     one binary from one source checkout, as release.yml does it
@@ -149,10 +152,27 @@ A fourth job, `measure`, runs `harness/run/measure.ts` with both binaries
 on each OS and attaches `measurements.json` and `measurements.md`: disk
 writes per one-shot pass and per 45 s of daemon with a 5 MB state and growing
 transcripts, file checks per second of an idle daemon under `strace -c`
-(Linux), its CPU and RSS, refused workflow uploads and `[stuck]` lines in the
+(Linux, the per-syscall summaries attached as `idle-<run>-strace.txt`), its
+CPU and RSS, refused workflow uploads and `[stuck]` lines in the
 `daemon-backoff` run, and (macOS) the second pass over 10,000 Claude Desktop
 files. Every number is the operating system's view of the process (rusage,
-strace); nothing is instrumented inside the binary.
+strace, /proc, ps); nothing is instrumented inside the binary.
+
+The idle daemon's resident memory is also sampled once a second from outside
+the process (`idle-memory` rows; `/proc/<pid>/status` and `smaps_rollup` on
+Linux, `ps` on macOS): VmRSS at the end and at its highest, VmHWM, RssAnon,
+RssFile, AnonHugePages, threads, inotify instances and watches, and any child
+process, with every sample in `<run>-memory.jsonl`, the mappings behind the
+peak in `<run>-smaps-peak.txt` and `memory.md`, and the runner's kernel,
+transparent-hugepage setting and inotify limits recorded with the numbers.
+`ru_maxrss` is kilobytes on Linux and bytes on macOS; the `maximum RSS` rows
+are scaled to bytes on both. On Linux a third binary joins the idle
+measurements: the candidate built with `harness/variants/no-file-events.patch`
+applied (the daemon never arms file events, so it polls as 77.11 did), in a
+third column, so the memory of the recursive watch is read off the table. A
+`watch-only` row runs `harness/run/watch-only.ts`, a bare Bun script holding
+`fs.watch(recursive)` on the same tree for 20 s, with and without the watch:
+the runtime's watcher by itself, apart from anything hx does with the events.
 
 To test any binary — an hx2 release asset, say — start the workflow by hand
 (`Actions › Differential harness › Run workflow`) with `candidate_url_linux`
