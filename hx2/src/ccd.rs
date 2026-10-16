@@ -13,13 +13,15 @@
 //!
 //! A long-lived machine has 35,000 or more session files, so the index is
 //! kept compact: a record is its three strings in one WTF-8 buffer (wtf8.rs)
-//! and its flags; a path is its directory, interned, and its file name,
-//! shared between the index and the directory's listing; a record is shared
-//! between the index, the record list and the cli-id lookup. The session
-//! files and the saved index are read by scanning (jscan.rs), not into a
-//! JSON tree, and the saved index is written straight into its text. Every
-//! byte of that text is what the client writes for the same index: the
-//! harness compares the two files entry by entry.
+//! and its flags, each id that is a canonical UUID packed to its 16 bytes; a
+//! path is its directory, interned, and its file name (`local_<uuid>.json`
+//! packed the same way), shared between the index and the directory's
+//! listing; a record is shared between the index, the record list and the
+//! cli-id lookup. The session files and the saved index are read by
+//! scanning (jscan.rs), not into a JSON tree, the saved index from the file
+//! mapped into memory, and it is written straight into its text. Every byte
+//! of that text is what the client writes for the same index: the harness
+//! compares the two files entry by entry.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -29,7 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use indexmap::{IndexMap, IndexSet};
 
-use crate::fsutil::{join, readdir_safe, stat_safe, write_atomic_0600};
+use crate::fsutil::{join, readdir_safe, release_freed_memory, stat_safe, write_atomic_0600};
 use crate::home::{homedir, hx_dir};
 use crate::js::JsStr;
 use crate::jscan::{Scanner, Val};
@@ -519,6 +521,65 @@ impl DirTable {
     }
 }
 
+// ── The saved file's bytes ──────────────────────────────────────────────────
+
+/// The saved index's bytes for one parse. Where the platform can, they are
+/// the file mapped read-only: its tens of megabytes on a long-lived machine
+/// are then the file's own clean pages, gone the moment the map is, never a
+/// heap buffer the allocator may keep after the load. hx and hx2 replace the
+/// file by writing a temporary one and renaming it, never in place, so the
+/// mapped file cannot shrink under the parse.
+enum SavedBytes {
+    #[cfg(unix)]
+    Mapped { ptr: *mut libc::c_void, len: usize },
+    Read(Vec<u8>),
+}
+
+impl SavedBytes {
+    fn open(path: &Path) -> Option<SavedBytes> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Ok(f) = fs::File::open(path) {
+                if let Ok(m) = f.metadata() {
+                    let len = m.len() as usize;
+                    if m.is_file() && len > 0 {
+                        // SAFETY: a fresh read-only private mapping of an open
+                        // file; unmapped once, in drop.
+                        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+                        if ptr != libc::MAP_FAILED {
+                            return Some(SavedBytes::Mapped { ptr, len });
+                        }
+                    }
+                }
+            }
+        }
+        fs::read(path).ok().map(SavedBytes::Read)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            #[cfg(unix)]
+            // SAFETY: the mapping is `len` readable bytes until drop.
+            SavedBytes::Mapped { ptr, len } => unsafe { std::slice::from_raw_parts(*ptr as *const u8, *len) },
+            SavedBytes::Read(v) => v.as_slice(),
+        }
+    }
+}
+
+impl Drop for SavedBytes {
+    fn drop(&mut self) {
+        match self {
+            #[cfg(unix)]
+            // SAFETY: the mapping made in open, unmapped once.
+            SavedBytes::Mapped { ptr, len } => unsafe {
+                libc::munmap(*ptr, *len);
+            },
+            SavedBytes::Read(_) => {}
+        }
+    }
+}
+
 // ── The index ───────────────────────────────────────────────────────────────
 
 struct IndexedFile {
@@ -659,35 +720,46 @@ impl CcdIndex {
             (Some(f), Some(d)) => (f, d),
             _ => return,
         };
-        let raw = match fs::read(&file) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        let under = format!("{}{}", dir, SEP as char);
-        let saved = match parse_saved_index(&raw, under.as_bytes(), &mut self.paths) {
-            Some(s) => s,
+        let bytes = match SavedBytes::open(&file) {
+            Some(b) => b,
             None => return,
         };
-        // The maps are empty here: the load comes before the first refresh.
+        let under = format!("{}{}", dir, SEP as char);
+        let saved = parse_saved_index(bytes.bytes(), under.as_bytes(), &mut self.paths);
+        let len = bytes.bytes().len();
+        drop(bytes);
+        if let Some(saved) = saved {
+            self.adopt_saved(saved, len);
+        }
+        // The load's scratch — the parse's maps, the strings it decoded —
+        // goes back to the system now, not whenever the allocator gets to it.
+        release_freed_memory();
+    }
+
+    /// The parsed saved index as this process's index. The maps are empty
+    /// here: the load comes before the first refresh.
+    fn adopt_saved(&mut self, saved: SavedIndex, len: usize) {
         for (id, listing) in saved.dirs {
             if let Some(l) = listing {
                 self.org_dirs.insert(id, l);
             }
         }
+        let n = saved.files.values().filter(|f| f.is_some()).count();
+        let mut index: IndexMap<PathKey, IndexedFile> = IndexMap::with_capacity(n);
         for (p, f) in saved.files {
             if let Some(f) = f {
-                self.index.insert(p, f);
+                index.insert(p, f);
             }
         }
+        self.index = index;
         if self.index.is_empty() && self.org_dirs.is_empty() {
             return;
         }
-        self.index.shrink_to_fit();
         self.rebuild_records();
         self.version = 1;
         self.saved_version = 1;
         self.last_full_stat_ms = f64::NEG_INFINITY;
-        self.last_save_len = raw.len();
+        self.last_save_len = len;
     }
 
     fn refresh_now(&mut self, now_ms: f64, full_stat: bool) {
@@ -886,7 +958,8 @@ fn parse_saved_index(raw: &[u8], under: &[u8], paths: &mut DirTable) -> Option<S
             Ok(())
         }
         b"files" => {
-            files = saved_files(s, under, paths)?;
+            // A saved entry is a few hundred bytes: size the map once.
+            files = saved_files(s, under, paths, raw.len() / 512)?;
             Ok(())
         }
         _ => s.skip_value(),
@@ -960,13 +1033,13 @@ fn saved_listing(s: &mut Scanner<'_>, paths: &mut DirTable) -> Result<Option<Org
     })
 }
 
-fn saved_files(s: &mut Scanner<'_>, under: &[u8], paths: &mut DirTable) -> Result<Option<IndexMap<PathKey, Option<IndexedFile>>>, ()> {
+fn saved_files(s: &mut Scanner<'_>, under: &[u8], paths: &mut DirTable, capacity: usize) -> Result<Option<IndexMap<PathKey, Option<IndexedFile>>>, ()> {
     match s.peek() {
         Some(b'{') => {}
         Some(b'[') => return s.skip_value().map(|_| Some(IndexMap::new())),
         _ => return s.skip_value().map(|_| None),
     }
-    let mut out: IndexMap<PathKey, Option<IndexedFile>> = IndexMap::new();
+    let mut out: IndexMap<PathKey, Option<IndexedFile>> = IndexMap::with_capacity(capacity);
     s.object(|s, key| {
         if !key.starts_with(under) {
             return s.skip_value();
@@ -1210,6 +1283,19 @@ mod tests {
         assert_eq!(record_json("[{\"sessionId\":\"x\"}]"), None);
         assert_eq!(record_json("{\"sessionId\":\"x\"} trailing"), None);
         assert_eq!(record_json("{\"sessionId\":\"x\",}"), None);
+    }
+
+    #[test]
+    fn the_saved_file_is_read_whole() {
+        let dir = std::env::temp_dir().join(format!("hx2-ccd-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ccd-index.json");
+        fs::write(&p, SAVED).unwrap();
+        assert_eq!(SavedBytes::open(&p).map(|b| b.bytes().to_vec()), Some(SAVED.as_bytes().to_vec()));
+        fs::write(&p, "").unwrap();
+        assert_eq!(SavedBytes::open(&p).map(|b| b.bytes().len()), Some(0));
+        assert!(SavedBytes::open(&dir.join("absent.json")).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

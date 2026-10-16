@@ -25,7 +25,7 @@ use crate::children::{
 };
 use crate::codex_titles::{read_codex_title, CodexTitle};
 use crate::config::HxConfig;
-use crate::fsutil::{basename, node_error, now_ms, relative, stat_safe};
+use crate::fsutil::{basename, node_error, now_ms, relative, release_freed_memory, stat_safe};
 use crate::home::homedir;
 use crate::js::{math_round, num_to_string, to_locale_time_string_en_us, JsStr};
 use crate::json::{obj, Json, OMap};
@@ -1846,25 +1846,4 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
     save_ccd_index_if_changed(now_ms(), true);
     ctx.store.disarm_coalesced();
     ctx.store.drain();
-}
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    /// malloc/malloc.h: hand freed pages back to the system (every zone when NULL).
-    fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-}
-
-/// Hand the allocator's freed pages back to the system after a pass that
-/// allocated: the catch-up's read buffers and the snapshot text must not sit
-/// in the daemon's resident size for the rest of the day. The allocator
-/// keeps them otherwise; nothing the servers see changes.
-fn release_freed_memory() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
-    #[cfg(target_os = "macos")]
-    unsafe {
-        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-    }
 }
