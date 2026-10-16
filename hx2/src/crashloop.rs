@@ -37,12 +37,7 @@ pub struct WatchRun {
 }
 
 fn pid_alive(pid: i64) -> bool {
-    // SAFETY: kill with signal 0 only probes the process.
-    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if r == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    matches!(crate::platform::probe_pid(pid), crate::platform::PidProbe::Alive | crate::platform::PidProbe::NotPermitted)
 }
 
 fn read_marker(path: &Path) -> Option<Json> {

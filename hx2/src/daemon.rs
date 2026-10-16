@@ -5,11 +5,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(unix)]
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
+#[cfg(unix)]
 use signal_hook::iterator::Signals;
 
+#[cfg(unix)]
 use crate::ccd::save_ccd_index_if_changed;
 use crate::crashloop::WatchRun;
+#[cfg(unix)]
 use crate::fsutil::now_ms;
 use crate::watch::{Ctx, DaemonHooks};
 
@@ -37,6 +41,7 @@ pub fn exit_with(code: i32) -> ! {
 /// SIGTERM exactly as the TypeScript daemon does; on SIGINT the loop logs,
 /// folds and exits 0 (cmdWatch's handler). Returns the hooks of the main lane
 /// and of the `--local` lane when one runs.
+#[cfg(unix)]
 pub fn install_signal_thread(ctx: Arc<Ctx>, local: Option<Arc<Ctx>>, run: Arc<WatchRun>) -> (DaemonHooks, Option<DaemonHooks>) {
     let stop_requested = Arc::new(AtomicBool::new(false));
     let hooks = DaemonHooks { stop_requested: stop_requested.clone() };
@@ -70,5 +75,30 @@ pub fn install_signal_thread(ctx: Arc<Ctx>, local: Option<Arc<Ctx>>, run: Arc<Wa
             }
         })
         .ok();
+    (hooks, local_hooks)
+}
+
+/// Windows: Bun turns Ctrl+C in the console into SIGINT and never delivers
+/// SIGTERM, and state.ts installs no signal flush there (installSignalFlush
+/// returns on win32). Ctrl+C runs hookWatchRunToProcess's clean-stop mark and
+/// cmdWatch's handler: log, stop both lanes, checkpoint both scopes, exit 0.
+/// The Claude Desktop index is not saved on the way out, because the client's
+/// parting flush never runs on Windows. The windowless service build has no
+/// console, so nothing reaches it.
+#[cfg(windows)]
+pub fn install_signal_thread(ctx: Arc<Ctx>, local: Option<Arc<Ctx>>, run: Arc<WatchRun>) -> (DaemonHooks, Option<DaemonHooks>) {
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let hooks = DaemonHooks { stop_requested: stop_requested.clone() };
+    let local_hooks = local.as_ref().map(|_| DaemonHooks { stop_requested: stop_requested.clone() });
+    let _ = crate::platform::on_ctrl_c(Box::new(move || {
+        run.mark_clean_stop();
+        stop_requested.store(true, Ordering::SeqCst);
+        ctx.log.log("\n[hx] stopping…");
+        let _ = ctx.store.checkpoint_state();
+        if let Some(l) = &local {
+            let _ = l.store.checkpoint_state();
+        }
+        std::process::exit(0);
+    }));
     (hooks, local_hooks)
 }

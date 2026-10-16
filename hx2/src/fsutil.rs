@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,8 +16,24 @@ pub struct StatInfo {
     pub is_file: bool,
 }
 
+#[cfg(unix)]
 pub fn mtime_ms_of(m: &fs::Metadata) -> f64 {
     (m.mtime() as f64) * 1000.0 + (m.mtime_nsec() as f64) / 1_000_000.0
+}
+
+/// Windows keeps the time in 100 ns steps since 1601; libuv turns it into
+/// seconds and nanoseconds since 1970, and Bun's mtimeMs adds them up as
+/// above.
+#[cfg(windows)]
+pub fn mtime_ms_of(m: &fs::Metadata) -> f64 {
+    let ms = |d: std::time::Duration| (d.as_secs() as f64) * 1000.0 + (d.subsec_nanos() as f64) / 1_000_000.0;
+    match m.modified() {
+        Ok(t) => match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => ms(d),
+            Err(e) => -ms(e.duration()),
+        },
+        Err(_) => 0.0,
+    }
 }
 
 /// `statSafe`: follows symlinks; None on any error.
@@ -42,16 +59,25 @@ pub fn exists(p: &Path) -> bool {
     fs::metadata(p).is_ok()
 }
 
+/// Owner read and write for a file this client creates. Windows has no mode
+/// bits: Node applies a mode there only as the read-only attribute, which
+/// 0o600 leaves off, so the file is created as any other.
+fn mode_0600(o: &mut fs::OpenOptions) -> &mut fs::OpenOptions {
+    #[cfg(unix)]
+    o.mode(0o600);
+    o
+}
+
 /// `writeFile(path, text, { mode: 0o600 })`: created with the mode, truncated when present.
 pub fn write_file_0600(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
+    let mut f = mode_0600(fs::OpenOptions::new().write(true).create(true).truncate(true)).open(p)?;
     f.write_all(bytes)?;
     Ok(())
 }
 
 /// `appendFile(path, text, { mode: 0o600 })`.
 pub fn append_file_0600(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new().append(true).create(true).mode(0o600).open(p)?;
+    let mut f = mode_0600(fs::OpenOptions::new().append(true).create(true)).open(p)?;
     f.write_all(bytes)?;
     Ok(())
 }
@@ -63,8 +89,20 @@ pub fn write_atomic_0600(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::rename(&tmp, p)
 }
 
+#[cfg(unix)]
 pub fn chmod(p: &Path, mode: u32) {
     let _ = fs::set_permissions(p, fs::Permissions::from_mode(mode));
+}
+
+/// `fs.chmod` on Windows sets the read-only attribute when the owner write
+/// bit is off and clears it when it is on (libuv); nothing else applies.
+#[cfg(windows)]
+pub fn chmod(p: &Path, mode: u32) {
+    if let Ok(m) = fs::metadata(p) {
+        let mut perms = m.permissions();
+        perms.set_readonly(mode & 0o200 == 0);
+        let _ = fs::set_permissions(p, perms);
+    }
 }
 
 /// `path.dirname`.
@@ -96,7 +134,29 @@ pub fn join(a: &str, b: &str) -> String {
     Path::new(a).join(b).to_string_lossy().into_owned()
 }
 
+/// The platform's path separator, `path.sep`.
+pub const SEP: &str = std::path::MAIN_SEPARATOR_STR;
+
+/// `path.isAbsolute`.
+pub fn is_absolute(p: &str) -> bool {
+    #[cfg(windows)]
+    {
+        crate::winpath::is_absolute(p)
+    }
+    #[cfg(not(windows))]
+    {
+        p.starts_with('/')
+    }
+}
+
+/// `path.relative(from, to)`; on Windows `path.win32.relative`.
+#[cfg(windows)]
+pub fn relative(from: &str, to: &str) -> String {
+    crate::winpath::relative(from, to)
+}
+
 /// `path.relative(from, to)` for absolute POSIX paths.
+#[cfg(not(windows))]
 pub fn relative(from: &str, to: &str) -> String {
     let f: Vec<&str> = from.split('/').filter(|s| !s.is_empty()).collect();
     let t: Vec<&str> = to.split('/').filter(|s| !s.is_empty()).collect();
@@ -114,8 +174,15 @@ pub fn relative(from: &str, to: &str) -> String {
     parts.join("/")
 }
 
+/// `path.resolve(base, target)`; on Windows `path.win32.resolve`.
+#[cfg(windows)]
+pub fn resolve(base: &str, target: &str) -> String {
+    crate::winpath::resolve(&[base, target])
+}
+
 /// `path.resolve(base, target)` for POSIX: absolute target wins, else join and
 /// collapse `.` and `..` segments lexically.
+#[cfg(not(windows))]
 pub fn resolve(base: &str, target: &str) -> String {
     let joined = if target.starts_with('/') { target.to_string() } else { format!("{}/{}", base, target) };
     normalize_posix(&joined)
@@ -150,6 +217,7 @@ pub fn normalize_posix(p: &str) -> String {
 
 /// The `E…` name and the text Node prints for an errno, for the messages the
 /// client logs when a write fails (`EACCES: permission denied, open '…'`).
+#[cfg(unix)]
 fn errno_name_text(code: i32) -> (String, String) {
     let known: &[(i32, &str, &str)] = &[
         (libc::EPERM, "EPERM", "operation not permitted"),
@@ -176,6 +244,51 @@ fn errno_name_text(code: i32) -> (String, String) {
         }
     }
     (format!("E{}", code), std::io::Error::from_raw_os_error(code).to_string().to_lowercase())
+}
+
+/// On Windows a failed call carries a Win32 error code. The runtime turns it
+/// into an errno the way libuv's uv_translate_sys_error does, then prints that
+/// errno's name and text as on POSIX; a code with no errno is UNKNOWN.
+#[cfg(windows)]
+fn errno_name_text(code: i32) -> (String, String) {
+    let name = match code as u32 {
+        2 | 3 | 15 | 123 | 161 | 203 | 267 | 4392 | 126 => "ENOENT",
+        5 | 1314 => "EPERM",
+        998 | 740 | 1920 => "EACCES",
+        32 | 33 | 231 => "EBUSY",
+        80 | 183 => "EEXIST",
+        145 => "ENOTEMPTY",
+        17 => "EXDEV",
+        39 | 112 | 82 | 255 | 1100 => "ENOSPC",
+        19 => "EROFS",
+        4 => "EMFILE",
+        206 => "ENAMETOOLONG",
+        6 | 1004 => "EBADF",
+        87 | 122 | 13 | 1464 => "EINVAL",
+        1 => "EISDIR",
+        1921 => "ELOOP",
+        23 | 31 | 110 | 156 | 205 | 1101 | 1102 | 1103 | 1104 | 1106 | 1111 | 1117 | 1129 | 1165 | 1166 | 1393 => "EIO",
+        _ => return ("UNKNOWN".to_string(), "unknown error".to_string()),
+    };
+    let text = match name {
+        "ENOENT" => "no such file or directory",
+        "EPERM" => "operation not permitted",
+        "EACCES" => "permission denied",
+        "EBUSY" => "resource busy or locked",
+        "EEXIST" => "file already exists",
+        "ENOTEMPTY" => "directory not empty",
+        "EXDEV" => "cross-device link not permitted",
+        "ENOSPC" => "no space left on device",
+        "EROFS" => "read-only file system",
+        "EMFILE" => "too many open files",
+        "ENAMETOOLONG" => "name too long",
+        "EBADF" => "bad file descriptor",
+        "EINVAL" => "invalid argument",
+        "EISDIR" => "illegal operation on a directory",
+        "ELOOP" => "too many symbolic links encountered",
+        _ => "i/o error",
+    };
+    (name.to_string(), text.to_string())
 }
 
 /// A failed file operation the way the TypeScript runtime reports it:

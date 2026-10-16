@@ -7,18 +7,32 @@ use std::sync::OnceLock;
 static HOME: OnceLock<PathBuf> = OnceLock::new();
 static HX_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// `os.homedir()`: $HOME when set, else the password database.
+/// `os.homedir()`: $HOME when set, else the password database. On Windows
+/// %USERPROFILE%, else the user's profile directory, as libuv reads it.
 pub fn homedir() -> &'static Path {
     HOME.get_or_init(|| {
-        if let Ok(h) = std::env::var("HOME") {
-            if !h.is_empty() {
+        #[cfg(windows)]
+        {
+            if let Some(h) = std::env::var_os("USERPROFILE") {
                 return PathBuf::from(h);
             }
+            #[allow(deprecated)]
+            let profile = std::env::home_dir();
+            return profile.unwrap_or_else(|| PathBuf::from("C:\\"));
         }
-        passwd_home().unwrap_or_else(|| PathBuf::from("/"))
+        #[cfg(not(windows))]
+        {
+            if let Ok(h) = std::env::var("HOME") {
+                if !h.is_empty() {
+                    return PathBuf::from(h);
+                }
+            }
+            passwd_home().unwrap_or_else(|| PathBuf::from("/"))
+        }
     })
 }
 
+#[cfg(not(windows))]
 fn passwd_home() -> Option<PathBuf> {
     // SAFETY: getpwuid returns a pointer to static storage; we copy the
     // directory string out before returning.
@@ -50,4 +64,33 @@ pub fn ensure_hx_home() {
         let _ = fs::rename(&legacy, dir);
     }
     let _ = fs::create_dir_all(dir);
+    #[cfg(windows)]
+    harden_windows_acl(dir);
+}
+
+/// hx-home.ts `hardenWindowsAcl`: narrow `~/.let/hx` to its owner once, with
+/// icacls. Creating the marker is the check, so two processes never both run
+/// it, and a failed icacls removes the marker so the next run tries again.
+#[cfg(windows)]
+fn harden_windows_acl(dir: &Path) {
+    let user = match std::env::var("USERNAME") {
+        Ok(u) if !u.is_empty() => u,
+        _ => return,
+    };
+    let marker = dir.join(".acl-v1");
+    if fs::OpenOptions::new().write(true).create_new(true).open(&marker).is_err() {
+        return;
+    }
+    let ok = std::process::Command::new("icacls")
+        .arg(dir)
+        .args(["/inheritance:r", "/grant:r", &format!("{}:(OI)(CI)F", user)])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        let _ = fs::remove_file(&marker);
+    }
 }

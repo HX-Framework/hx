@@ -1,0 +1,463 @@
+name: Release hx2
+
+# Builds hx2, the Rust port of the hx client (hx2/), for every platform hx
+# ships; checks each build; installs it with let.ai's installers on a runner of
+# its own platform; and publishes it when asked.
+#
+# The files are the ones let.ai's download proxy serves for hx2 and
+# install-hx2.sh / install-hx2.ps1 fetch:
+#   hx2-<os>-<arch>.gz + .sha256   darwin and linux (arm64, x64), windows (x64,
+#                                  arm64), and on Windows also the windowless
+#                                  hx2-windows-<arch>-svc build that the
+#                                  scheduled task runs;
+#   hx2-version                    the version, one line.
+# Each .sha256 is taken over the decompressed binary and names the file
+# without .gz, as release.yml does for hx.
+#
+# When it runs:
+#   a pull request into hx-2.0, a push to hx-2.0
+#       build, check and install; the files are uploaded as a workflow
+#       artifact only (a dry run);
+#   workflow_dispatch on hx-2.0
+#       the same, then `publish` decides:
+#         none     nothing more;
+#         build    the rolling builds/hx2-<version> release, replaced when it
+#                  exists. `install-hx2.sh?channel=build` installs it;
+#         release  the immutable releases/hx2-<version> release. The first one
+#                  makes let.ai's Connect dialog offer hx2 to every user
+#                  (general availability), so it also needs confirm_version
+#                  set to the version.
+#
+# Platform floors are hx's own: glibc 2.17 on Linux (hx2 builds in a
+# manylinux2014 image and check-binaries.py checks every symbol version),
+# macOS 13.0 at most (hx2 targets 11.0), Windows 10 1809 (install-hx2.ps1
+# refuses older). Windows builds link the C runtime statically, as a clean
+# Windows has no Visual C++ runtime.
+
+on:
+  pull_request:
+    branches: ["hx-2.0"]
+    paths:
+      - "hx2/**"
+      - "ui/**"
+      - "scripts/pe-subsystem.ts"
+      - ".github/workflows/release-hx2.yml"
+  push:
+    branches: ["hx-2.0"]
+    paths:
+      - "hx2/**"
+      - "ui/**"
+      - "scripts/pe-subsystem.ts"
+      - ".github/workflows/release-hx2.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "none: build and check only. build: publish builds/hx2-<version>. release: publish releases/hx2-<version> (general availability)"
+        type: choice
+        options: [none, build, release]
+        default: none
+      confirm_version:
+        description: "publish=release only: the version being released, typed again"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hx2-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  BUN_VERSION: "1.3.14"
+
+jobs:
+  prepare:
+    name: Version, lockfile and web UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Read the hx2 version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' hx2/Cargo.toml | head -n 1)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "hx2/Cargo.toml version must be a stable semver: '$version'" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "hx2 $version"
+
+      # One dependency resolution for every platform's build, so the six
+      # binaries of a release use the same crate versions (a committed
+      # hx2/Cargo.lock wins when there is one).
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Resolve dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f hx2/Cargo.lock ]; then
+            cargo generate-lockfile --manifest-path hx2/Cargo.toml
+          fi
+          cargo tree --manifest-path hx2/Cargo.toml --target all --edges normal --depth 1
+
+      # Built once, as release.yml builds it once for every target: a build
+      # that embeds ui/dist carries the same web UI on every platform.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Build the web UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          cd ui
+          bun install --frozen-lockfile
+          bun run build
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hx2-inputs
+          path: |
+            hx2/Cargo.lock
+            ui/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: hx2-darwin-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            image: ""
+            rustflags: ""
+            test: true
+          # Cross-compiled on Apple silicon; the install job runs it on an
+          # Intel Mac.
+          - asset: hx2-darwin-x64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            image: ""
+            rustflags: ""
+            test: false
+          # manylinux2014 (CentOS 7, glibc 2.17), 2026.10.10-1.
+          - asset: hx2-linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux2014_x86_64@sha256:f6a6f153c9cf45470507ebbc27013e5db14ce21331b62fd2c540561f25e5f0a5
+            rustflags: ""
+            test: true
+          - asset: hx2-linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux2014_aarch64@sha256:c10b5d2ce68a4426011b5b9b8492f01037b9d0fd2187ed1956b346aa42faeb17
+            rustflags: ""
+            test: true
+          - asset: hx2-windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            image: ""
+            rustflags: "-C target-feature=+crt-static"
+            test: true
+          - asset: hx2-windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            image: ""
+            rustflags: "-C target-feature=+crt-static"
+            test: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      TARGET: ${{ matrix.target }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx2-inputs
+          path: .
+
+      - if: matrix.image == ''
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.image == ''
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: hx2
+          key: ${{ matrix.target }}
+
+      - name: Build
+        if: matrix.image == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -V
+          cargo build --release --locked --manifest-path hx2/Cargo.toml --target "$TARGET"
+
+      - name: Unit tests
+        if: matrix.image == '' && matrix.test
+        shell: bash
+        run: cargo test --release --locked --manifest-path hx2/Cargo.toml --target "$TARGET"
+
+      # Docker runs here on the hosted runner, never on a laptop. The image is
+      # pinned by digest; rustup installs the stable toolchain inside it.
+      - name: Build and test in the glibc 2.17 image
+        if: matrix.image != ''
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/io" -w /io -e TARGET -e CARGO_TERM_COLOR "$IMAGE" bash -euo pipefail -c '
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+            . "$HOME/.cargo/env"
+            rustc -V
+            ldd --version | head -n 1
+            cargo build --release --locked --manifest-path hx2/Cargo.toml --target "$TARGET"
+            cargo test --release --locked --manifest-path hx2/Cargo.toml --target "$TARGET"
+          '
+
+      - name: Collect and run
+        shell: bash
+        env:
+          ASSET: ${{ matrix.asset }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ext=""
+          case "$TARGET" in *windows*) ext=".exe" ;; esac
+          bin="hx2/target/$TARGET/release/hx2$ext"
+          mkdir -p out
+          cp "$bin" "out/$ASSET"
+          ls -l "out/$ASSET"
+          want="hx2 version: $VERSION"
+          if [ "$ASSET" = hx2-darwin-x64 ]; then
+            # Runs only where Rosetta is installed; the install job runs it natively.
+            if arch -x86_64 /usr/bin/true 2>/dev/null; then got="$(arch -x86_64 "$bin" --version)"; else got="$want"; echo "no Rosetta here"; fi
+          else
+            got="$("$bin" --version)"
+          fi
+          if [ "$got" != "$want" ]; then
+            echo "::error::$ASSET --version printed '$got', not '$want'"
+            exit 1
+          fi
+          echo "$got"
+          if [[ "$TARGET" == *apple-darwin ]]; then
+            minos="$(otool -l "$bin" | awk '/LC_BUILD_VERSION/ { f = 1 } f && $1 == "minos" { print $2; exit }')"
+            echo "minimum macOS: $minos"
+            if [ -z "$minos" ] || [ "${minos%%.*}" -gt 13 ]; then
+              echo "::error::$ASSET needs macOS $minos; hx runs on 13.0"
+              exit 1
+            fi
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Package hx2 ${{ needs.prepare.outputs.version }}
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: bins
+
+      # scripts/pe-subsystem.ts flips the copy's subsystem from console to
+      # windowless, as release.yml does for hx-svc.exe.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for a in hx2-darwin-arm64 hx2-darwin-x64 hx2-linux-arm64 hx2-linux-x64 hx2-windows-x64 hx2-windows-arm64; do
+            cp "bins/$a" "dist/$a"
+          done
+          for arch in x64 arm64; do
+            cp "dist/hx2-windows-$arch" "dist/hx2-windows-$arch-svc"
+            bun scripts/pe-subsystem.ts "dist/hx2-windows-$arch-svc"
+          done
+          python3 -I hx2/release/check-binaries.py dist
+          cd dist
+          printf '%s\n' "$VERSION" > hx2-version
+          {
+            echo "### hx2 $VERSION"
+            echo ""
+            echo "| File | Size | Gzipped | sha256 of the binary |"
+            echo "| --- | ---: | ---: | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in hx2-darwin-arm64 hx2-darwin-x64 hx2-linux-arm64 hx2-linux-x64 hx2-windows-x64 hx2-windows-x64-svc hx2-windows-arm64 hx2-windows-arm64-svc; do
+            size="$(wc -c < "$f" | tr -d ' ')"
+            sha256sum "$f" | awk -v name="$f" '{print $1"  "name}' > "$f.sha256"
+            gzip -9 -f "$f"
+            echo "| $f | $size | $(wc -c < "$f.gz" | tr -d ' ') | \`$(cut -d' ' -f1 "$f.sha256")\` |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          ls -l
+          # Exactly the names let.ai's download proxy serves for hx2
+          # (downloads.ts releaseTargetForAsset), nothing missing, nothing extra.
+          re='^(hx2-(darwin|linux)-(arm64|x64)|hx2-windows-(x64|arm64)(-svc)?)(\.gz|\.sha256|\.sig)?$|^hx2-version$'
+          for f in *; do
+            if ! [[ "$f" =~ $re ]]; then
+              echo "::error::$f is not a name the download proxy serves"
+              exit 1
+            fi
+          done
+          count="$(ls | wc -l | tr -d ' ')"
+          if [ "$count" -ne 17 ]; then
+            echo "::error::expected 17 files (8 binaries, 8 checksums, hx2-version), found $count"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hx2-${{ needs.prepare.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+  install:
+    name: Install ${{ matrix.asset }}
+    needs: [prepare, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: hx2-linux-x64
+            runner: ubuntu-latest
+          - asset: hx2-linux-arm64
+            runner: ubuntu-24.04-arm
+          - asset: hx2-darwin-arm64
+            runner: macos-latest
+          - asset: hx2-darwin-x64
+            runner: macos-15-intel
+          - asset: hx2-windows-x64
+            runner: windows-latest
+          - asset: hx2-windows-arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ASSET: ${{ matrix.asset }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx2-${{ needs.prepare.outputs.version }}
+          path: release
+
+      - name: install-hx2.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh hx2/release/check-install.sh "$PWD/release" "$VERSION" "$RUNNER_TEMP/hx2-install" "$ASSET"
+
+      - if: runner.os == 'Windows'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # The installer runs in a fresh Windows PowerShell 5.1, the one every
+      # Windows has, and then in PowerShell 7.
+      - name: install-hx2.ps1 in Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./hx2/release/check-install.ps1 -ReleaseDir "$PWD/release" -Version $env:VERSION -Work "$env:RUNNER_TEMP/hx2-install" -Engine powershell -ExpectAsset $env:ASSET
+
+      - name: install-hx2.ps1 in PowerShell 7
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./hx2/release/check-install.ps1 -ReleaseDir "$PWD/release" -Version $env:VERSION -Work "$env:RUNNER_TEMP/hx2-install" -Engine pwsh
+
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: install-log-${{ matrix.asset }}
+          path: ${{ runner.temp }}/hx2-install/*.*
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish:
+    name: Publish ${{ inputs.publish }} hx2 ${{ needs.prepare.outputs.version }}
+    needs: [prepare, package, install]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish != 'none' && github.ref == 'refs/heads/hx-2.0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx2-${{ needs.prepare.outputs.version }}
+          path: release
+
+      - name: Publish the rolling build
+        if: inputs.publish == 'build'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="builds/hx2-${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --yes --cleanup-tag
+          fi
+          gh release create "$tag" release/* \
+            --target "$GITHUB_SHA" \
+            --title "hx2 build v$VERSION" \
+            --notes "Build from ${GITHUB_SHA:0:8} (hx2 v$VERSION)." \
+            --prerelease=false \
+            --latest=false
+
+      - name: Publish the release
+        if: inputs.publish == 'release'
+        shell: bash
+        env:
+          CONFIRM: ${{ inputs.confirm_version }}
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRM" != "$VERSION" ]; then
+            echo "::error::releases/hx2-$VERSION makes hx2 generally available; set confirm_version to $VERSION to publish it"
+            exit 1
+          fi
+          tag="releases/hx2-${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists; skipping"
+            exit 0
+          fi
+          gh release create "$tag" release/* \
+            --target "$GITHUB_SHA" \
+            --title "hx2 v$VERSION" \
+            --notes "Published from ${GITHUB_SHA:0:8}." \
+            --latest=false

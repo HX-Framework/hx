@@ -344,7 +344,7 @@ pub fn detect_repo_slug(start_dir: &str) -> Option<String> {
         let pointer: Option<String> = match fs::read_to_string(&git_path) {
             Ok(p) => Some(p),
             Err(e) => {
-                if e.raw_os_error() == Some(libc::EISDIR) {
+                if crate::platform::is_dir_read_error(&e, Path::new(&git_path)) {
                     return read_origin_slug(&join(&git_path, "config"));
                 }
                 None
@@ -355,7 +355,7 @@ pub fn detect_repo_slug(start_dir: &str) -> Option<String> {
                 .lines()
                 .find_map(|l| l.strip_prefix("gitdir:").map(|t| t.trim().to_string()));
             if let Some(target) = target {
-                let gitdir = if target.starts_with('/') { target } else { resolve(&dir, &target) };
+                let gitdir = if crate::fsutil::is_absolute(&target) { target } else { resolve(&dir, &target) };
                 let mut config_path = join(&gitdir, "config");
                 if fs::metadata(&config_path).is_err() {
                     if let Ok(common) = fs::read_to_string(join(&gitdir, "commondir")) {
