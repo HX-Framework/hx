@@ -165,8 +165,13 @@ RssFile, AnonHugePages, threads, inotify instances and watches, and any child
 process, with every sample in `<run>-memory.jsonl`, the mappings behind the
 peak in `<run>-smaps-peak.txt` and `memory.md`, and the runner's kernel,
 transparent-hugepage setting and inotify limits recorded with the numbers.
-`ru_maxrss` is kilobytes on Linux and bytes on macOS; the `maximum RSS` rows
-are scaled to bytes on both. On Linux a third binary joins the idle
+On Linux the `maximum RSS` rows are the process's `VmHWM`, read from
+`/proc/<pid>/status` every 50 ms while it runs: `ru_maxrss` as Bun's
+`resourceUsage()` returns it there is not the child's figure (it grows with
+the measuring process's own life; the `rusage-check` rows, a bare child that
+touches 300 MB beside what Bun reports for it, show the gap on every run), and
+the field is kilobytes on Linux and bytes on macOS besides. macOS keeps
+`ru_maxrss`, which `ps` agrees with. On Linux a third binary joins the idle
 measurements: the candidate built with `harness/variants/no-file-events.patch`
 applied (the daemon never arms file events, so it polls as 77.11 did), in a
 third column, so the memory of the recursive watch is read off the table. A
