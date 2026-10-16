@@ -13,8 +13,10 @@
 //! TypeScript client allows without TLS; HTTPS to the hosted gateway is the
 //! next card's work (the TLS stack is not part of the hot-path spike).
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::js::{js, lossy, slice};
@@ -231,7 +233,37 @@ impl Response {
     }
 }
 
-/// One HTTP/1.1 request on a fresh connection, under a deadline.
+/// Idle keep-alive connections by host:port — what Bun's fetch keeps between
+/// requests, so a pass over thousands of sessions reuses a handful of
+/// connections instead of opening four per session. (A fresh connection per
+/// request exhausted macOS's 16k ephemeral ports after about 4,000 sessions
+/// of the 10,000-session scenario; the port range and TIME_WAIT are not the
+/// servers' business, the connection count is Bun's behavior.)
+fn idle_pool() -> &'static Mutex<HashMap<String, Vec<TcpStream>>> {
+    static POOL: OnceLock<Mutex<HashMap<String, Vec<TcpStream>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Idle connections kept per host beyond which a returned one is closed.
+const IDLE_PER_HOST: usize = 16;
+
+fn take_idle(key: &str) -> Option<TcpStream> {
+    let mut p = idle_pool().lock().unwrap_or_else(|e| e.into_inner());
+    p.get_mut(key).and_then(|v| v.pop())
+}
+
+fn put_idle(key: &str, s: TcpStream) {
+    let mut p = idle_pool().lock().unwrap_or_else(|e| e.into_inner());
+    let v = p.entry(key.to_string()).or_default();
+    if v.len() < IDLE_PER_HOST {
+        v.push(s);
+    }
+}
+
+/// One HTTP/1.1 request under a deadline, on a kept-alive connection when
+/// the pool has one for the host, else on a fresh one. A pooled connection
+/// the peer closed while it sat idle fails before any response byte
+/// arrives; the request is then sent once more on a fresh connection.
 pub fn request(
     label: &str,
     method: &str,
@@ -246,32 +278,30 @@ pub fn request(
     }
     let deadline = Duration::from_millis(timeout_ms);
     let timed_out = || NetError::Other(format!("{} timed out after {}s", label, crate::js::math_round(timeout_ms as f64 / 1000.0) as i64));
-    let addrs = (u.host.as_str(), u.port).to_socket_addrs().map_err(|_| NetError::Other(UNABLE_TO_CONNECT.to_string()))?;
-    let mut stream: Option<TcpStream> = None;
-    let mut last_err: Option<std::io::Error> = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, deadline) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(e) => last_err = Some(e),
-        }
-    }
-    let mut stream = match stream {
-        Some(s) => s,
-        None => {
-            return Err(match last_err {
-                Some(e) if e.kind() == std::io::ErrorKind::TimedOut => timed_out(),
-                _ => NetError::Other(UNABLE_TO_CONNECT.to_string()),
-            })
+    let io_err = |e: std::io::Error| -> NetError {
+        match e.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => timed_out(),
+            std::io::ErrorKind::ConnectionRefused => NetError::Other(UNABLE_TO_CONNECT.to_string()),
+            _ => NetError::Other(CONNECTION_CLOSED.to_string()),
         }
     };
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(deadline));
-    let _ = stream.set_write_timeout(Some(deadline));
+    let connect = || -> Result<TcpStream, NetError> {
+        let addrs = (u.host.as_str(), u.port).to_socket_addrs().map_err(|_| NetError::Other(UNABLE_TO_CONNECT.to_string()))?;
+        let mut last_err: Option<std::io::Error> = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, deadline) {
+                Ok(s) => return Ok(s),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(match last_err {
+            Some(e) if e.kind() == std::io::ErrorKind::TimedOut => timed_out(),
+            _ => NetError::Other(UNABLE_TO_CONNECT.to_string()),
+        })
+    };
 
     let host_header = if u.port == 80 { u.host.clone() } else { format!("{}:{}", u.host, u.port) };
+    let key = format!("{}:{}", u.host, u.port);
     let mut head = String::new();
     head.push_str(&format!("{} {} HTTP/1.1\r\n", method, u.target));
     head.push_str(&format!("host: {}\r\n", host_header));
@@ -287,89 +317,122 @@ pub fn request(
     }
     head.push_str("\r\n");
 
-    let io_err = |e: std::io::Error| -> NetError {
-        match e.kind() {
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => timed_out(),
-            std::io::ErrorKind::ConnectionRefused => NetError::Other(UNABLE_TO_CONNECT.to_string()),
-            _ => NetError::Other(CONNECTION_CLOSED.to_string()),
+    // The exchange on one connection: the request, then the whole response.
+    // Ok((response, keep)): keep says the connection may serve another
+    // request. Err((error, started)): started says response bytes had
+    // arrived, so the peer may have acted on the request.
+    let exchange = |stream: &mut TcpStream| -> Result<(Response, bool), (NetError, bool)> {
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(deadline));
+        let _ = stream.set_write_timeout(Some(deadline));
+        stream.write_all(head.as_bytes()).map_err(|e| (io_err(e), false))?;
+        if let Some(b) = body {
+            stream.write_all(b).map_err(|e| (io_err(e), false))?;
         }
-    };
-    stream.write_all(head.as_bytes()).map_err(io_err)?;
-    if let Some(b) = body {
-        stream.write_all(b).map_err(io_err)?;
-    }
-    stream.flush().map_err(io_err)?;
+        stream.flush().map_err(|e| (io_err(e), false))?;
 
-    // Read the whole response: headers, then the body by content-length or
-    // chunked transfer coding, else until the peer closes.
-    let mut buf: Vec<u8> = Vec::with_capacity(8192);
-    let mut tmp = [0u8; 16384];
-    let header_end;
-    loop {
-        if let Some(i) = find_header_end(&buf) {
-            header_end = i;
-            break;
-        }
-        let n = stream.read(&mut tmp).map_err(io_err)?;
-        if n == 0 {
-            return Err(NetError::Other(CONNECTION_CLOSED.to_string()));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    let head_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-    let mut lines = head_text.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            let k = k.trim().to_lowercase();
-            let v = v.trim();
-            if k == "content-length" {
-                content_length = v.parse().ok();
-            } else if k == "transfer-encoding" && v.to_lowercase().contains("chunked") {
-                chunked = true;
-            }
-        }
-    }
-    let mut rest: Vec<u8> = buf[header_end + 4..].to_vec();
-    let body_bytes: Vec<u8> = if method == "HEAD" || status == 204 || status == 304 {
-        Vec::new()
-    } else if chunked {
+        // Headers, then the body by content-length or chunked transfer
+        // coding, else until the peer closes (which ends the connection).
+        let mut buf: Vec<u8> = Vec::with_capacity(8192);
+        let mut tmp = [0u8; 16384];
+        let header_end;
         loop {
-            if let Some(decoded) = decode_chunked(&rest) {
-                break decoded;
+            if let Some(i) = find_header_end(&buf) {
+                header_end = i;
+                break;
             }
-            let n = stream.read(&mut tmp).map_err(io_err)?;
+            let n = stream.read(&mut tmp).map_err(|e| (io_err(e), !buf.is_empty()))?;
             if n == 0 {
-                return Err(NetError::Other(CONNECTION_CLOSED.to_string()));
+                return Err((NetError::Other(CONNECTION_CLOSED.to_string()), !buf.is_empty()));
             }
-            rest.extend_from_slice(&tmp[..n]);
+            buf.extend_from_slice(&tmp[..n]);
         }
-    } else if let Some(len) = content_length {
-        while rest.len() < len {
-            let n = stream.read(&mut tmp).map_err(io_err)?;
-            if n == 0 {
-                return Err(NetError::Other(CONNECTION_CLOSED.to_string()));
+        let head_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let mut lines = head_text.split("\r\n");
+        let status_line = lines.next().unwrap_or("");
+        let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let mut keep = !status_line.starts_with("HTTP/1.0");
+        let mut content_length: Option<usize> = None;
+        let mut chunked = false;
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                let k = k.trim().to_lowercase();
+                let v = v.trim();
+                if k == "content-length" {
+                    content_length = v.parse().ok();
+                } else if k == "transfer-encoding" && v.to_lowercase().contains("chunked") {
+                    chunked = true;
+                } else if k == "connection" {
+                    let v = v.to_lowercase();
+                    if v.contains("close") {
+                        keep = false;
+                    } else if v.contains("keep-alive") {
+                        keep = true;
+                    }
+                }
             }
-            rest.extend_from_slice(&tmp[..n]);
         }
-        rest.truncate(len);
-        rest
-    } else {
-        loop {
-            let n = match stream.read(&mut tmp) {
-                Ok(n) => n,
-                Err(e) => return Err(io_err(e)),
-            };
-            if n == 0 {
-                break rest;
+        let mut rest: Vec<u8> = buf[header_end + 4..].to_vec();
+        let body_bytes: Vec<u8> = if method == "HEAD" || status == 204 || status == 304 {
+            Vec::new()
+        } else if chunked {
+            loop {
+                if let Some(decoded) = decode_chunked(&rest) {
+                    break decoded;
+                }
+                let n = stream.read(&mut tmp).map_err(|e| (io_err(e), true))?;
+                if n == 0 {
+                    return Err((NetError::Other(CONNECTION_CLOSED.to_string()), true));
+                }
+                rest.extend_from_slice(&tmp[..n]);
             }
-            rest.extend_from_slice(&tmp[..n]);
-        }
+        } else if let Some(len) = content_length {
+            while rest.len() < len {
+                let n = stream.read(&mut tmp).map_err(|e| (io_err(e), true))?;
+                if n == 0 {
+                    return Err((NetError::Other(CONNECTION_CLOSED.to_string()), true));
+                }
+                rest.extend_from_slice(&tmp[..n]);
+            }
+            rest.truncate(len);
+            rest
+        } else {
+            keep = false;
+            loop {
+                let n = match stream.read(&mut tmp) {
+                    Ok(n) => n,
+                    Err(e) => return Err((io_err(e), true)),
+                };
+                if n == 0 {
+                    break rest;
+                }
+                rest.extend_from_slice(&tmp[..n]);
+            }
+        };
+        Ok((Response { status, body: body_bytes }, keep))
     };
-    Ok(Response { status, body: body_bytes })
+
+    let mut pooled = take_idle(&key);
+    loop {
+        let (mut stream, reused) = match pooled.take() {
+            Some(s) => (s, true),
+            None => (connect()?, false),
+        };
+        match exchange(&mut stream) {
+            Ok((resp, keep)) => {
+                if keep {
+                    put_idle(&key, stream);
+                }
+                return Ok(resp);
+            }
+            Err((e, started)) => {
+                if reused && !started {
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
