@@ -8,6 +8,8 @@ import { join } from "node:path";
 import {
   STOP_GRACE_SECONDS,
   awaitExitOrKill,
+  bootstrapBinPath,
+  clientOfBinary,
   definitionBinPath,
   insertHookBlock,
   parseWinState,
@@ -19,8 +21,10 @@ import {
   renderTaskXml,
   serviceManagerOf,
   shquote,
+  slotRunsHx2,
   stripHookBlock,
   windowsServiceBinary,
+  type DaemonOps,
 } from "./daemon.js";
 
 test("shquote wraps in single quotes", () => {
@@ -572,4 +576,60 @@ describe("stopping a daemon that ignores SIGTERM", () => {
     },
     30_000,
   );
+});
+
+// ── The shared service slot (hx2) ───────────────────────────────────────────
+// hx2 installs the same definitions under the same label; hx reads which of
+// the two the installed definition runs, and leaves a slot running hx2 alone.
+
+describe("the shared service slot", () => {
+  const opsWithSlot = (bin: string | null): DaemonOps =>
+    ({
+      managerName: "launchd",
+      install: async () => {},
+      uninstall: async () => {},
+      start: async () => {},
+      stop: async () => ({ wasRunning: false }),
+      restart: async () => {},
+      state: async () => ({ loaded: true, pid: 42 }),
+      slotBinary: () => bin,
+    }) as DaemonOps;
+
+  it("names the client of a binary by its file name", () => {
+    assert.equal(clientOfBinary("/Users/me/.let/bin/hx2"), "hx2");
+    assert.equal(clientOfBinary("C:\\Users\\me\\.let\\bin\\hx2-svc.exe"), "hx2");
+    assert.equal(clientOfBinary("C:\\Users\\me\\.let\\bin\\HX.EXE"), "hx");
+    assert.equal(clientOfBinary("/home/me/.let/bin/hx"), "hx");
+    assert.equal(clientOfBinary("/opt/hx-old/hx-session-vault"), null);
+  });
+
+  it("reads the binary out of every definition hx writes", () => {
+    const logs = { stdout: "/o.log", stderr: "/e.log" };
+    assert.equal(definitionBinPath("launchd", renderPlist("/Users/me/.let/bin/hx2", logs)), "/Users/me/.let/bin/hx2");
+    assert.equal(definitionBinPath("systemd", renderSystemdUnit("/home/me/.let/bin/hx2", logs)), "/home/me/.let/bin/hx2");
+    assert.equal(bootstrapBinPath(renderBootstrap("/home/me/.let/bin/hx2")), "/home/me/.let/bin/hx2");
+    assert.equal(bootstrapBinPath(renderBootstrap("/tmp/it's/hx2")), "/tmp/it's/hx2");
+    assert.equal(bootstrapBinPath("echo nothing here"), null);
+  });
+
+  it("sees hx2 in the slot, and only hx2", () => {
+    assert.equal(slotRunsHx2(opsWithSlot("/Users/me/.let/bin/hx2")), "/Users/me/.let/bin/hx2");
+    assert.equal(slotRunsHx2(opsWithSlot("/Users/me/.let/bin/hx")), null);
+    assert.equal(slotRunsHx2(opsWithSlot(null)), null);
+    // A backend without the probe (an older test double) reads as empty.
+    const { slotBinary: _drop, ...bare } = opsWithSlot("/x/hx2");
+    assert.equal(slotRunsHx2(bare as DaemonOps), null);
+  });
+
+  it("re-registers a Windows slot that runs hx2 with hx2's service build", () => {
+    const has = (p: string): boolean => p.endsWith("hx2-svc.exe") || p.endsWith("hx-svc.exe");
+    assert.equal(
+      windowsServiceBinary("C:\\Users\\me\\.let\\bin\\hx2-svc.exe", has),
+      "C:\\Users\\me\\.let\\bin\\hx2-svc.exe",
+    );
+    assert.equal(
+      windowsServiceBinary("C:\\Users\\me\\.let\\bin\\hx.exe", has),
+      "C:\\Users\\me\\.let\\bin\\hx-svc.exe",
+    );
+  });
 });
