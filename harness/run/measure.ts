@@ -142,19 +142,30 @@ class Hwm {
   }
 }
 
+/** Bun 1.3 hands resourceUsage().maxRSS back as the kernel gave it —
+ *  ru_maxrss is kilobytes on Linux and bytes on macOS (getrusage(2)) — and
+ *  Bun 1.4 reports bytes on every platform. The table says bytes, so the
+ *  scale follows the Bun version: a 1.4 upgrade would otherwise multiply the
+ *  Linux figure by 1,024 once more. */
+export function bunMaxRssToBytes(maxRss: number, bunVersion: string = Bun.version, platform: string = process.platform): number {
+  if (!(maxRss >= 0)) return -1;
+  const [major = 0, minor = 0] = bunVersion.split(".").map((p) => Number(p));
+  const bytesAlready = major > 1 || (major === 1 && minor >= 4);
+  if (bytesAlready) return maxRss;
+  return platform === "linux" ? maxRss * 1024 : maxRss;
+}
+
 function usageOf(proc: ReturnType<typeof Bun.spawn>, startedAt: number, exit: string, hwm: Hwm): Usage {
   const u = proc.resourceUsage();
   // Bun 1.3 hands the CPU times back as BigInt (microseconds) although the
   // declaration says number; every field goes through Number() so arithmetic
   // and JSON.stringify never meet a BigInt.
   const n = (v: unknown): number => Number(v);
-  // ru_maxrss is kilobytes on Linux and bytes on macOS (getrusage(2)), and
-  // Bun hands the field back as the kernel gave it. The table says bytes, so
-  // Linux is scaled here; the 77.12.0 run printed the Linux figure unscaled.
+  // The 77.12.0 run printed the Linux figure unscaled; see bunMaxRssToBytes.
   // On Linux the figure is not the child's (rusage-check below), so the
   // maximum RSS the rows trust is the polled VmHWM there.
   const bunMaxRss = u ? n(u.maxRSS) : -1;
-  const bunMaxRssBytes = bunMaxRss < 0 ? -1 : process.platform === "linux" ? bunMaxRss * 1024 : bunMaxRss;
+  const bunMaxRssBytes = bunMaxRssToBytes(bunMaxRss);
   return {
     elapsedMs: Date.now() - startedAt,
     cpuMs: u ? Math.round(n(u.cpuTime.total) / 1000) : -1,
@@ -972,7 +983,7 @@ function idleRows(name: string, label: string): void {
   row(`${name}-cpu`, "CPU over the last 40 s of that daemon (sampled)", "% of one core", I.reference.sampledIdleCpuPercent!, I.candidate.sampledIdleCpuPercent!, vOf("sampledIdleCpuPercent"));
   row(`${name}-cpu`, `maximum RSS (${maxRssHow})`, "bytes", I.reference.idleMaxRss!, I.candidate.idleMaxRss!, vOf("idleMaxRss"));
   if (process.platform === "linux") {
-    row(`${name}-cpu`, "maximum RSS as Bun's resourceUsage() reports it (ru_maxrss × 1024): not the daemon's figure, see rusage-check", "bytes", I.reference.idleBunMaxRss!, I.candidate.idleBunMaxRss!, vOf("idleBunMaxRss"));
+    row(`${name}-cpu`, "maximum RSS as Bun's resourceUsage() reports it (ru_maxrss, scaled to bytes for this Bun version): not the daemon's figure, see rusage-check", "bytes", I.reference.idleBunMaxRss!, I.candidate.idleBunMaxRss!, vOf("idleBunMaxRss"));
   }
   row(`${name}-cpu`, "disk writes while idle", outUnit, I.reference.idleWrites!, I.candidate.idleWrites!, vOf("idleWrites"));
   if (I.reference.memSamples !== undefined && Number(I.reference.memSamples) > 0) {
