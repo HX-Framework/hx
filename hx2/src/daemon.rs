@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+use crate::ccd::save_ccd_index_if_changed;
 use crate::crashloop::WatchRun;
+use crate::fsutil::now_ms;
 use crate::watch::{Ctx, DaemonHooks};
 
 static RUN: OnceLock<Mutex<Option<Arc<WatchRun>>>> = OnceLock::new();
@@ -29,16 +31,19 @@ pub fn exit_with(code: i32) -> ! {
     std::process::exit(code)
 }
 
-/// Install the signal thread for the daemon. On SIGTERM the journal is folded
-/// into the snapshot and the signal is re-raised with the default handler, so
-/// the process ends by SIGTERM exactly as the TypeScript daemon does; on SIGINT
-/// the loop logs, folds and exits 0 (cmdWatch's handler).
-pub fn install_signal_thread(ctx: Arc<Ctx>, run: Arc<WatchRun>) -> DaemonHooks {
+/// Install the signal thread for the daemon. On SIGTERM every lane's journal
+/// is folded into its snapshot, the Claude Desktop index is saved, and the
+/// signal is re-raised with the default handler, so the process ends by
+/// SIGTERM exactly as the TypeScript daemon does; on SIGINT the loop logs,
+/// folds and exits 0 (cmdWatch's handler). Returns the hooks of the main lane
+/// and of the `--local` lane when one runs.
+pub fn install_signal_thread(ctx: Arc<Ctx>, local: Option<Arc<Ctx>>, run: Arc<WatchRun>) -> (DaemonHooks, Option<DaemonHooks>) {
     let stop_requested = Arc::new(AtomicBool::new(false));
     let hooks = DaemonHooks { stop_requested: stop_requested.clone() };
+    let local_hooks = local.as_ref().map(|_| DaemonHooks { stop_requested: stop_requested.clone() });
     let mut signals = match Signals::new([SIGTERM, SIGINT]) {
         Ok(s) => s,
-        Err(_) => return hooks,
+        Err(_) => return (hooks, local_hooks),
     };
     std::thread::Builder::new()
         .name("hx-signals".to_string())
@@ -48,15 +53,22 @@ pub fn install_signal_thread(ctx: Arc<Ctx>, run: Arc<WatchRun>) -> DaemonHooks {
                 stop_requested.store(true, Ordering::SeqCst);
                 if sig == SIGINT {
                     ctx.log.log("\n[hx] stopping…");
-                    let _ = ctx.store.checkpoint_state();
+                }
+                // The parting flush of every armed lane (state.ts installSignalFlush
+                // and registerPartingFlush): checkpoint, then the Claude Desktop index.
+                let _ = ctx.store.checkpoint_state();
+                if let Some(l) = &local {
+                    let _ = l.store.checkpoint_state();
+                }
+                save_ccd_index_if_changed(now_ms(), true);
+                if sig == SIGINT {
                     std::process::exit(0);
                 }
-                // SIGTERM: fold, then let the default action end the process.
-                let _ = ctx.store.checkpoint_state();
+                // SIGTERM: let the default action end the process.
                 let _ = signal_hook::low_level::emulate_default_handler(sig);
                 std::process::exit(143);
             }
         })
         .ok();
-    hooks
+    (hooks, local_hooks)
 }

@@ -126,6 +126,9 @@ impl HxHttpError {
 #[derive(Clone, Debug)]
 pub enum NetError {
     Http(HxHttpError),
+    /// A call that exceeded its deadline (net.ts FetchTimeoutError, named
+    /// "TimeoutError" so logs and classifiers can tell it from a peer error).
+    Timeout(String),
     Other(String),
 }
 
@@ -133,6 +136,7 @@ impl NetError {
     pub fn message(&self) -> String {
         match self {
             NetError::Http(e) => e.message.clone(),
+            NetError::Timeout(m) => m.clone(),
             NetError::Other(m) => m.clone(),
         }
     }
@@ -140,8 +144,12 @@ impl NetError {
     pub fn http(&self) -> Option<&HxHttpError> {
         match self {
             NetError::Http(e) => Some(e),
-            NetError::Other(_) => None,
+            _ => None,
         }
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, NetError::Timeout(_))
     }
 }
 
@@ -277,7 +285,7 @@ pub fn request(
         return Err(NetError::Other(format!("{}: {} is not supported by this build yet (plain http to loopback only)", label, u.scheme)));
     }
     let deadline = Duration::from_millis(timeout_ms);
-    let timed_out = || NetError::Other(format!("{} timed out after {}s", label, crate::js::math_round(timeout_ms as f64 / 1000.0) as i64));
+    let timed_out = || NetError::Timeout(format!("{} timed out after {}s", label, crate::js::math_round(timeout_ms as f64 / 1000.0) as i64));
     let io_err = |e: std::io::Error| -> NetError {
         match e.kind() {
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => timed_out(),
@@ -704,6 +712,170 @@ pub fn commit_body(family: &str, session_id: &str, chunk_id: &str, replace: bool
         body.set("replace", Json::Bool(true));
     }
     body.set("vaultOrgId", Json::opt_str(vault_org_id));
+    body.set("meta", drop_nulls(&meta));
+    body
+}
+
+// ── The rest of the protocol (M4) ───────────────────────────────────────────
+
+/// `fetchWhoami`'s answer: `ok` with the gateway's email and device name, or
+/// not ok with `unauthorized` set on a 401/403 (the token was revoked).
+pub struct WhoamiResult {
+    pub ok: bool,
+    pub unauthorized: bool,
+    pub email: Option<String>,
+    pub device_name: Option<String>,
+}
+
+/// What the gateway holds for this device (`fetchDeviceInventory`).
+pub struct DeviceInventory {
+    pub sessions: f64,
+    pub bytes: f64,
+    pub oldest_at: Json,
+    pub newest_at: Json,
+}
+
+/// How long `hx status` waits on /whoami.
+const WHOAMI_TIMEOUT_MS: u64 = 6000;
+
+impl Gateway {
+    /// GET /whoami: who this device token belongs to. Any transport failure
+    /// reads as not ok and not unauthorized; only an insecure gateway URL is
+    /// an error (the assertion sits outside the TypeScript client's try).
+    pub fn whoami(&self) -> Result<WhoamiResult, NetError> {
+        assert_secure_fetch_url(&self.base_url, "hx whoami")?;
+        let headers = vec![("authorization", format!("Bearer {}", self.token))];
+        let res = match request("whoami", "GET", &format!("{}/whoami", self.base_url), &headers, None, WHOAMI_TIMEOUT_MS) {
+            Ok(r) => r,
+            Err(_) => return Ok(WhoamiResult { ok: false, unauthorized: false, email: None, device_name: None }),
+        };
+        if !res.ok() {
+            return Ok(WhoamiResult { ok: false, unauthorized: res.status == 401 || res.status == 403, email: None, device_name: None });
+        }
+        let body = Json::parse(&res.text()).ok();
+        let pick = |k: &str| body.as_ref().and_then(|b| b.get_string(k)).filter(|s| !s.is_empty());
+        Ok(WhoamiResult { ok: true, unauthorized: false, email: pick("email"), device_name: pick("deviceName") })
+    }
+
+    /// GET /devices/inventory: None on any failure (a gateway that predates
+    /// the endpoint 404s and the status row is simply omitted).
+    pub fn fetch_device_inventory(&self) -> Option<DeviceInventory> {
+        if assert_secure_fetch_url(&self.base_url, "gateway request").is_err() {
+            return None;
+        }
+        let headers = auth_headers(&self.token);
+        let res = request("inventory", "GET", &format!("{}/devices/inventory", self.base_url), &headers, None, GATEWAY_TIMEOUT_MS).ok()?;
+        if !res.ok() {
+            return None;
+        }
+        let json = Json::parse(&res.text()).ok()?;
+        let sessions = match json.get("sessions") {
+            Some(Json::Num(n)) => *n,
+            _ => return None,
+        };
+        let bytes = match json.get("bytes") {
+            Some(Json::Num(n)) => *n,
+            _ => return None,
+        };
+        let nullish = |v: Option<&Json>| match v {
+            None | Some(Json::Null) => Json::Null,
+            Some(x) => x.clone(),
+        };
+        Some(DeviceInventory { sessions, bytes, oldest_at: nullish(json.get("oldestAt")), newest_at: nullish(json.get("newestAt")) })
+    }
+
+    /// POST /sessions/retitle.
+    pub fn retitle_sessions(&self, items: Vec<Json>) -> Result<Vec<Json>, NetError> {
+        let body = obj(vec![("items", Json::Arr(items))]);
+        let res = self.post("retitle", "/sessions/retitle", &body.stringify(), GATEWAY_BATCH_TIMEOUT_MS)?;
+        if !res.ok() {
+            return Err(http_error(&res, "retitle"));
+        }
+        let json = parse_json_body(&res, "retitle")?;
+        Ok(json.get("results").and_then(|r| r.as_arr()).cloned().unwrap_or_default())
+    }
+
+    /// POST /sessions/agent-append-url.
+    pub fn request_agent_append_url(&self, family: &str, session_id: &str, agent_id: &str, byte_count: u64) -> Result<Json, NetError> {
+        let body = obj(vec![
+            ("family", Json::str(family)),
+            ("sessionId", Json::str(session_id)),
+            ("agentId", Json::str(agent_id)),
+            ("byteCount", Json::num(byte_count as f64)),
+        ]);
+        let res = self.post("agent-append-url", "/sessions/agent-append-url", &body.stringify(), GATEWAY_TIMEOUT_MS)?;
+        if !res.ok() {
+            return Err(http_error(&res, "agent-append-url"));
+        }
+        parse_json_body(&res, "agent-append-url")
+    }
+
+    /// POST /sessions/agent-commit.
+    pub fn commit_agent_chunk(&self, body: &Json) -> Result<Json, NetError> {
+        let res = self.post("agent-commit", "/sessions/agent-commit", &body.stringify(), GATEWAY_TIMEOUT_MS)?;
+        if !res.ok() {
+            return Err(http_error(&res, "agent-commit"));
+        }
+        parse_json_body(&res, "agent-commit")
+    }
+
+    /// POST /sessions/workflow with the null fields dropped; an HxHttpError
+    /// on failure so a 404 (a gateway that predates the endpoint) pauses the
+    /// child lanes the way the TypeScript client's does.
+    pub fn upload_workflow_run(&self, args: &Json) -> Result<(), NetError> {
+        let res = self.post("workflow upload", "/sessions/workflow", &drop_nulls(args).stringify(), GATEWAY_TIMEOUT_MS)?;
+        if !res.ok() {
+            return Err(http_error(&res, "workflow upload"));
+        }
+        parse_json_body(&res, "workflow upload")?;
+        Ok(())
+    }
+
+    /// POST /sessions/tasks; returns the gateway's `count`.
+    pub fn upload_tasks(&self, family: &str, session_id: &str, tasks: Vec<Json>) -> Result<f64, NetError> {
+        let body = obj(vec![("family", Json::str(family)), ("sessionId", Json::str(session_id)), ("tasks", Json::Arr(tasks))]);
+        let res = self.post("tasks upload", "/sessions/tasks", &body.stringify(), GATEWAY_TIMEOUT_MS)?;
+        if !res.ok() {
+            return Err(plain_error(&res, "tasks upload"));
+        }
+        let json = parse_json_body(&res, "tasks upload")?;
+        Ok(json.get_f64("count").unwrap_or(0.0))
+    }
+
+    /// POST /sessions/plan.
+    pub fn upload_plan(&self, family: &str, session_id: &str, plan_file_path: &str, content: &str) -> Result<(), NetError> {
+        let body = obj(vec![
+            ("family", Json::str(family)),
+            ("sessionId", Json::str(session_id)),
+            ("planFilePath", Json::str(plan_file_path)),
+            ("content", Json::str(content)),
+        ]);
+        let res = self.post("plan upload", "/sessions/plan", &body.stringify(), GATEWAY_TIMEOUT_MS)?;
+        if !res.ok() {
+            return Err(plain_error(&res, "plan upload"));
+        }
+        parse_json_body(&res, "plan upload")?;
+        Ok(())
+    }
+}
+
+/// The agent-commit body (`commitAgentChunk`): `replace` only when true,
+/// `vaultOrgId` verbatim (null for let.ai), `meta` with its nulls dropped.
+pub fn agent_commit_body(family: &str, session_id: &str, agent_id: &str, chunk_id: &str, replace: bool, vault_org_id: Option<Json>, meta: Json) -> Json {
+    let mut body = obj(vec![
+        ("family", Json::str(family)),
+        ("sessionId", Json::str(session_id)),
+        ("agentId", Json::str(agent_id)),
+        ("chunkId", Json::str(chunk_id)),
+    ]);
+    if replace {
+        body.set("replace", Json::Bool(true));
+    }
+    // `vaultOrgId: args.vaultOrgId` — the append-url response's field as it
+    // came: absent (an old gateway) is dropped by JSON.stringify, null is sent.
+    if let Some(v) = vault_org_id {
+        body.set("vaultOrgId", v);
+    }
     body.set("meta", drop_nulls(&meta));
     body
 }

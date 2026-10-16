@@ -155,3 +155,134 @@ pub fn math_round(v: f64) -> f64 {
 pub fn pad2(n: u32) -> String {
     format!("{:02}", n)
 }
+
+/// `(n / 2^exp).toFixed(digits)` for a non-negative integer `n`: the
+/// quotient is exact as a double (a power of two divides exactly), and
+/// `toFixed` picks the nearest decimal, the larger one on a tie.
+pub fn to_fixed_div_pow2(n: u64, exp: u32, digits: u32) -> String {
+    let scale: u128 = 10u128.pow(digits);
+    let q: u128 = (n as u128) * scale;
+    let denom: u128 = 1u128 << exp;
+    let r = (2 * q + denom) / (2 * denom);
+    let int = r / scale;
+    let frac = r % scale;
+    if digits == 0 {
+        format!("{}", int)
+    } else {
+        format!("{}.{:0width$}", int, frac, width = digits as usize)
+    }
+}
+
+/// `x.toFixed(digits)` for a finite double: half away from zero on the
+/// scaled value, the way the specification's "larger n" rule reads for the
+/// magnitudes this client prints (rates, sizes).
+pub fn to_fixed(x: f64, digits: u32) -> String {
+    if !x.is_finite() {
+        return num_to_string(x);
+    }
+    let neg = x < 0.0;
+    let scale = 10f64.powi(digits as i32);
+    let r = ((x.abs() * scale) + 0.5).floor() as i128;
+    let s = 10i128.pow(digits);
+    let body = if digits == 0 { format!("{}", r) } else { format!("{}.{:0width$}", r / s, r % s, width = digits as usize) };
+    if neg && r != 0 {
+        format!("-{}", body)
+    } else {
+        body
+    }
+}
+
+/// `n.toLocaleString("en-US")` for an integral number: thousands separators.
+pub fn to_locale_string_int(n: f64) -> String {
+    if !n.is_finite() || n.fract() != 0.0 {
+        return num_to_string(n);
+    }
+    let neg = n < 0.0;
+    let digits = format!("{}", n.abs() as i128);
+    let mut out = String::new();
+    let len = digits.len();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if neg {
+        format!("-{}", out)
+    } else {
+        out
+    }
+}
+
+/// `a.localeCompare(b)` as the default collator orders the names this client
+/// sorts (file names, "family:sessionId" keys): letters compare without
+/// case first, a lowercase letter before its uppercase twin on a tie.
+pub fn js_locale_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    let la: Vec<char> = a.chars().flat_map(|c| c.to_lowercase()).collect();
+    let lb: Vec<char> = b.chars().flat_map(|c| c.to_lowercase()).collect();
+    match la.cmp(&lb) {
+        std::cmp::Ordering::Equal => {
+            // Tertiary: lowercase first.
+            let ta: Vec<u8> = a.chars().map(|c| if c.is_uppercase() { 1 } else { 0 }).collect();
+            let tb: Vec<u8> = b.chars().map(|c| if c.is_uppercase() { 1 } else { 0 }).collect();
+            ta.cmp(&tb)
+        }
+        o => o,
+    }
+}
+
+const MONTHS_SHORT: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// `new Date(ms).toISOString()`: milliseconds, UTC.
+pub fn iso_string(ms: f64) -> String {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms.trunc() as i64);
+    match dt {
+        Some(d) => d.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+        None => "Invalid Date".to_string(),
+    }
+}
+
+/// `new Date(ms).toISOString().slice(0, 10)`.
+pub fn iso_date(ms: f64) -> String {
+    let s = iso_string(ms);
+    s.chars().take(10).collect()
+}
+
+/// `Intl.DateTimeFormat("en", { month: "short", day: "numeric"[, year: "numeric"] })`
+/// over a (year, month, day): "Oct 16" or "Oct 16, 2026".
+pub fn en_month_day(year: i32, month: u32, day: u32, with_year: bool) -> String {
+    let m = MONTHS_SHORT[((month.max(1) - 1) % 12) as usize];
+    if with_year {
+        format!("{} {}, {}", m, day, year)
+    } else {
+        format!("{} {}", m, day)
+    }
+}
+
+/// `new Date(ms)` in the process's local time zone.
+pub fn local_datetime(ms: f64) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone;
+    chrono::Local.timestamp_millis_opt(ms.trunc() as i64).single()
+}
+
+/// `new Date(ms).toLocaleString()` under en-US: "10/16/2026, 9:12:34 PM".
+pub fn to_locale_string_en_us(ms: f64) -> String {
+    use chrono::{Datelike, Timelike};
+    let d = match local_datetime(ms) {
+        Some(d) => d,
+        None => return "Invalid Date".to_string(),
+    };
+    let (pm, h12) = d.hour12();
+    format!("{}/{}/{}, {}:{:02}:{:02} {}", d.month(), d.day(), d.year(), h12, d.minute(), d.second(), if pm { "PM" } else { "AM" })
+}
+
+/// `new Date(ms).toLocaleTimeString()` under en-US: "9:12:34 PM".
+pub fn to_locale_time_string_en_us(ms: f64) -> String {
+    use chrono::Timelike;
+    let d = match local_datetime(ms) {
+        Some(d) => d,
+        None => return "Invalid Date".to_string(),
+    };
+    let (pm, h12) = d.hour12();
+    format!("{}:{:02}:{:02} {}", h12, d.minute(), d.second(), if pm { "PM" } else { "AM" })
+}

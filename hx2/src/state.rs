@@ -11,10 +11,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::fsutil::{exists, now_ms, write_atomic_0600, write_file_0600, append_file_0600};
+use crate::fsutil::{append_file_0600_node, exists, node_error, now_ms, write_atomic_0600_node, write_file_0600_node};
 use crate::home::hx_dir;
 use crate::json::{obj, Json, OMap};
 use crate::net::Blocker;
@@ -189,6 +189,15 @@ pub struct Store {
     last_snapshot_len: AtomicUsize,
     /// Moves on every mutation of the state (see `generation`).
     mutations: AtomicU64,
+    /// The writer thread's last verdict: the message of a snapshot write that
+    /// failed twice, cleared by the next write that succeeds. A flush-through
+    /// mutator reports it, as the TypeScript client's awaited write rejects.
+    last_write_error: Mutex<Option<String>>,
+    /// Whether a flush-through write has run in this process. The first one
+    /// runs on the caller's thread, so a store that cannot be written fails
+    /// the first mutator with the runtime's error text, exactly where the
+    /// TypeScript client's first awaited write fails.
+    first_write_done: AtomicBool,
 }
 
 fn apply_journal_entry(state: &mut Json, e: &Json) -> bool {
@@ -453,6 +462,8 @@ impl Store {
             checkpoint_gen: AtomicU64::new(0),
             last_snapshot_len: AtomicUsize::new(0),
             mutations: AtomicU64::new(0),
+            last_write_error: Mutex::new(None),
+            first_write_done: AtomicBool::new(false),
         });
         let writer = store.clone();
         std::thread::Builder::new()
@@ -500,9 +511,8 @@ impl Store {
         if self.checkpoint_gen.load(Ordering::SeqCst) != gen {
             return;
         }
-        if self.write_snapshot(&text).is_err() {
-            let _ = self.write_snapshot(&text);
-        }
+        let r = self.write_snapshot(&text);
+        *self.last_write_error.lock().unwrap_or_else(|e| e.into_inner()) = r.err();
     }
 
     /// Finish any snapshot write still wanted — a one-shot process calls this
@@ -556,9 +566,32 @@ impl Store {
         text
     }
 
-    fn write_snapshot(&self, text: &str) -> std::io::Result<()> {
-        let _ = fs::create_dir_all(hx_dir());
-        write_atomic_0600(&self.state_path, text.as_bytes())
+    /// `persist` with its one retry: the directory, then `<path>.tmp` and the
+    /// rename; a double failure returns the second attempt's error, with the
+    /// text the TypeScript runtime prints (`EACCES: permission denied, open '…'`).
+    fn write_snapshot(&self, text: &str) -> Result<(), String> {
+        fs::create_dir_all(hx_dir()).map_err(|e| node_error(&e, "mkdir", hx_dir()))?;
+        write_atomic_0600_node(&self.state_path, text.as_bytes()).or_else(|_| write_atomic_0600_node(&self.state_path, text.as_bytes()))
+    }
+
+    /// A flush-through write: the first in the process on this thread, every
+    /// later one a request to the writer thread, whose last failure the
+    /// request reports.
+    fn flush_through(&self) -> Result<(), String> {
+        if !self.first_write_done.swap(true, Ordering::SeqCst) {
+            let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+            *self.persist_requested.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            let text = self.serialize();
+            let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+            let r = self.write_snapshot(&text);
+            *self.last_write_error.lock().unwrap_or_else(|e| e.into_inner()) = r.clone().err();
+            return r;
+        }
+        self.schedule_persist();
+        match self.last_write_error.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Ask the writer thread for a whole-snapshot write; concurrent requests
@@ -594,7 +627,7 @@ impl Store {
     }
 
     /// `persistOrMark`: whole snapshot now (flush-through), or a dirty mark (coalesced).
-    fn persist_or_mark(&self, mark: Mark) {
+    fn persist_or_mark(&self, mark: Mark) -> Result<(), String> {
         let coalesced = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if g.coalesced {
@@ -604,12 +637,13 @@ impl Store {
                 false
             }
         };
-        if !coalesced {
-            self.schedule_persist();
+        if coalesced {
+            return Ok(());
         }
+        self.flush_through()
     }
 
-    fn append_journal_lines(&self, entries: &[Json]) -> std::io::Result<()> {
+    fn append_journal_lines(&self, entries: &[Json]) -> Result<(), String> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -619,8 +653,8 @@ impl Store {
             text.push('\n');
         }
         let _g = self.io.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = fs::create_dir_all(hx_dir());
-        let r = append_file_0600(&self.journal_path, text.as_bytes()).or_else(|_| append_file_0600(&self.journal_path, text.as_bytes()));
+        fs::create_dir_all(hx_dir()).map_err(|e| node_error(&e, "mkdir", hx_dir()))?;
+        let r = append_file_0600_node(&self.journal_path, text.as_bytes()).or_else(|_| append_file_0600_node(&self.journal_path, text.as_bytes()));
         if r.is_ok() {
             self.inner.lock().unwrap_or_else(|e| e.into_inner()).journal_bytes += text.len() as u64;
         }
@@ -628,7 +662,7 @@ impl Store {
     }
 
     /// `journalThrough`: append the records now, in both modes, and drop their dirty marks.
-    fn journal_through(&self, entries: Vec<Json>) {
+    fn journal_through(&self, entries: Vec<Json>) -> Result<(), String> {
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             for e in &entries {
@@ -657,7 +691,7 @@ impl Store {
                 }
             }
         }
-        let _ = self.append_journal_lines(&entries);
+        self.append_journal_lines(&entries)
     }
 
     fn file_entry_line(&self, path: &str) -> Option<Json> {
@@ -676,17 +710,15 @@ impl Store {
     }
 
     /// Write the snapshot and empty the journal, as one step.
-    fn checkpoint(&self) -> std::io::Result<()> {
+    fn checkpoint(&self) -> Result<(), String> {
         let _g = self.io.lock().unwrap_or_else(|e| e.into_inner());
         *self.persist_requested.lock().unwrap_or_else(|e| e.into_inner()) = false;
         let text = self.serialize();
-        if self.write_snapshot(&text).is_err() {
-            self.write_snapshot(&text)?;
-        }
+        self.write_snapshot(&text)?;
         self.checkpoint_gen.fetch_add(1, Ordering::SeqCst);
         let bytes = self.inner.lock().unwrap_or_else(|e| e.into_inner()).journal_bytes;
         if bytes > 0 || exists(&self.journal_path) {
-            write_file_0600(&self.journal_path, b"")?;
+            write_file_0600_node(&self.journal_path, b"")?;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.journal_bytes = 0;
@@ -743,7 +775,7 @@ impl Store {
         if all {
             return self.checkpoint().map_err(|e| {
                 self.inner.lock().unwrap_or_else(|x| x.into_inner()).dirty_all = true;
-                e.to_string()
+                e
             });
         }
         if !entries.is_empty() {
@@ -774,12 +806,12 @@ impl Store {
                         _ => g.dirty_deleted = true,
                     }
                 }
-                return Err(e.to_string());
+                return Err(e);
             }
         }
         let due_now = due || self.read_due();
         if due_now {
-            self.checkpoint().map_err(|e| e.to_string())?;
+            self.checkpoint()?;
         }
         Ok(())
     }
@@ -800,7 +832,7 @@ impl Store {
         if !pending {
             return Ok(());
         }
-        self.checkpoint().map_err(|e| e.to_string())
+        self.checkpoint()
     }
 
     /// Whether the daemon's flush timer has work.
@@ -812,14 +844,14 @@ impl Store {
     // ── Mutators ────────────────────────────────────────────────────────────
 
     /// `upsertFileState`.
-    pub fn upsert_file_state(&self, entry: Json) {
+    pub fn upsert_file_state(&self, entry: Json) -> Result<(), String> {
         let path = entry.get_string("path").unwrap_or_default();
         self.mutate(|s| ensure_obj(s, "files").set(&path, entry));
-        self.persist_or_mark(Mark::File(path));
+        self.persist_or_mark(Mark::File(path))
     }
 
     /// `setOffsetFor`: journaled before returning, in both modes.
-    pub fn set_offset_for(&self, path: &str, vault_org_id: Option<&str>, offset: f64, mtime_ms: f64) {
+    pub fn set_offset_for(&self, path: &str, vault_org_id: Option<&str>, offset: f64, mtime_ms: f64) -> Result<(), String> {
         let key = dest_key(vault_org_id);
         let now = now_ms();
         let found = self.mutate(|s| {
@@ -833,15 +865,16 @@ impl Store {
             true
         });
         if !found {
-            return;
+            return Ok(());
         }
-        if let Some(line) = self.file_entry_line(path) {
-            self.journal_through(vec![line]);
+        match self.file_entry_line(path) {
+            Some(line) => self.journal_through(vec![line]),
+            None => Ok(()),
         }
     }
 
     /// `reconcileDestinations`: add missing keys at zero, drop departed ones.
-    pub fn reconcile_destinations(&self, path: &str, active_keys: &[String]) {
+    pub fn reconcile_destinations(&self, path: &str, active_keys: &[String]) -> Result<(), String> {
         let changed = self.mutate(|s| {
             let f = match s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()).and_then(|f| f.get_mut(path)) {
                 Some(f) => f,
@@ -865,12 +898,13 @@ impl Store {
             changed
         });
         if changed {
-            self.persist_or_mark(Mark::File(path.to_string()));
+            return self.persist_or_mark(Mark::File(path.to_string()));
         }
+        Ok(())
     }
 
     /// `touchMtime`.
-    pub fn touch_mtime(&self, path: &str, mtime_ms: f64) {
+    pub fn touch_mtime(&self, path: &str, mtime_ms: f64) -> Result<(), String> {
         let found = self.mutate(|s| match s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()).and_then(|f| f.get_mut(path)) {
             Some(f) => {
                 f.set("lastMtimeMs", Json::num(mtime_ms));
@@ -879,12 +913,13 @@ impl Store {
             None => false,
         });
         if found {
-            self.persist_or_mark(Mark::File(path.to_string()));
+            return self.persist_or_mark(Mark::File(path.to_string()));
         }
+        Ok(())
     }
 
     /// `benchFileProbe`: a fixed pause without touching the failure streak.
-    pub fn bench_file_probe(&self, path: &str, delay_ms: f64) {
+    pub fn bench_file_probe(&self, path: &str, delay_ms: f64) -> Result<(), String> {
         let now = now_ms();
         let found = self.mutate(|s| match s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()).and_then(|f| f.get_mut(path)) {
             Some(f) => {
@@ -894,12 +929,13 @@ impl Store {
             None => false,
         });
         if found {
-            self.persist_or_mark(Mark::File(path.to_string()));
+            return self.persist_or_mark(Mark::File(path.to_string()));
         }
+        Ok(())
     }
 
     /// `recordFileFailure`: returns the chosen delay in ms.
-    pub fn record_file_failure(&self, path: &str, base_ms: f64, skip_reason: Option<&str>, blocker: Option<&Blocker>) -> f64 {
+    pub fn record_file_failure(&self, path: &str, base_ms: f64, skip_reason: Option<&str>, blocker: Option<&Blocker>) -> Result<f64, String> {
         let now = now_ms();
         let delay = self.mutate(|s| {
             let f = match s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()).and_then(|f| f.get_mut(path)) {
@@ -930,12 +966,12 @@ impl Store {
             }
             delay
         });
-        self.persist_or_mark(Mark::File(path.to_string()));
-        delay
+        self.persist_or_mark(Mark::File(path.to_string()))?;
+        Ok(delay)
     }
 
     /// `recordHeal`: returns the streak length.
-    pub fn record_heal(&self, path: &str) -> f64 {
+    pub fn record_heal(&self, path: &str) -> Result<f64, String> {
         let now = now_ms();
         let n = self.mutate(|s| {
             let f = match s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()).and_then(|f| f.get_mut(path)) {
@@ -949,12 +985,12 @@ impl Store {
             }
             n
         });
-        self.persist_or_mark(Mark::File(path.to_string()));
-        n
+        self.persist_or_mark(Mark::File(path.to_string()))?;
+        Ok(n)
     }
 
     /// `clearHeal`: journaled when it changes anything.
-    pub fn clear_heal(&self, path: &str) {
+    pub fn clear_heal(&self, path: &str) -> Result<(), String> {
         let changed = self.mutate(|s| {
             let f = match s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()).and_then(|f| f.get_mut(path)) {
                 Some(f) => f,
@@ -969,13 +1005,14 @@ impl Store {
         });
         if changed {
             if let Some(line) = self.file_entry_line(path) {
-                self.journal_through(vec![line]);
+                return self.journal_through(vec![line]);
             }
         }
+        Ok(())
     }
 
     /// `clearFileFailure`: journaled when it changes anything.
-    pub fn clear_file_failure(&self, path: &str) {
+    pub fn clear_file_failure(&self, path: &str) -> Result<(), String> {
         let changed = self.mutate(|s| {
             let f = match s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()).and_then(|f| f.get_mut(path)) {
                 Some(f) => f,
@@ -992,13 +1029,14 @@ impl Store {
         });
         if changed {
             if let Some(line) = self.file_entry_line(path) {
-                self.journal_through(vec![line]);
+                return self.journal_through(vec![line]);
             }
         }
+        Ok(())
     }
 
     /// `clearGenericBackoffs`: drop non-hold backoffs; returns the count.
-    pub fn clear_generic_backoffs(&self) -> usize {
+    pub fn clear_generic_backoffs(&self) -> Result<usize, String> {
         let files = self.mutate(|s| {
             let mut n = 0;
             if let Some(files) = s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()) {
@@ -1018,13 +1056,89 @@ impl Store {
             n
         });
         if files > 0 {
-            self.persist_or_mark(Mark::All);
+            self.persist_or_mark(Mark::All)?;
         }
-        files
+        Ok(files)
+    }
+
+    /// `clearBlockedFailures`: drop the holds (skipReason/blocker) and their
+    /// backoffs; returns (files, sessions).
+    pub fn clear_blocked_failures(&self) -> Result<(usize, usize), String> {
+        let (files, sessions) = self.mutate(|s| {
+            let mut sessions: BTreeSet<String> = BTreeSet::new();
+            let mut files = 0usize;
+            if let Some(map) = s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()) {
+                for (_, f) in map.iter_mut() {
+                    let held = f.get("skipReason").map(|v| v.truthy()).unwrap_or(false) || f.get("blocker").map(|v| v.truthy()).unwrap_or(false);
+                    if !held {
+                        continue;
+                    }
+                    files += 1;
+                    sessions.insert(format!("{}:{}", js_field(f, "family"), js_field(f, "sessionId")));
+                    f.remove("consecutiveFailures");
+                    f.remove("nextAttemptAtMs");
+                    f.remove("skipReason");
+                    f.remove("blocker");
+                }
+            }
+            (files, sessions.len())
+        });
+        if files > 0 {
+            self.persist_or_mark(Mark::All)?;
+        }
+        Ok((files, sessions))
+    }
+
+    /// `clearAllFailures`: every per-file backoff, hold or not, and every
+    /// destination failure run; returns (files, sessions).
+    pub fn clear_all_failures(&self) -> Result<(usize, usize), String> {
+        let (files, sessions) = self.mutate(|s| {
+            let mut sessions: BTreeSet<String> = BTreeSet::new();
+            let mut files = 0usize;
+            if let Some(map) = s.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()) {
+                for (_, f) in map.iter_mut() {
+                    if f.get("skipReason").is_none() && f.get("blocker").is_none() && f.get("consecutiveFailures").is_none() && f.get("nextAttemptAtMs").is_none() {
+                        continue;
+                    }
+                    files += 1;
+                    sessions.insert(format!("{}:{}", js_field(f, "family"), js_field(f, "sessionId")));
+                    f.remove("consecutiveFailures");
+                    f.remove("nextAttemptAtMs");
+                    f.remove("skipReason");
+                    f.remove("blocker");
+                }
+            }
+            if let Some(registry) = s.as_obj_mut().and_then(|o| o.get_mut("destinations")).and_then(|d| d.as_obj_mut()) {
+                for (_, r) in registry.iter_mut() {
+                    if r.get("consecutiveErrors").is_none() {
+                        continue;
+                    }
+                    r.remove("consecutiveErrors");
+                    r.remove("lastErrorCode");
+                    r.remove("lastErrorAtMs");
+                    r.remove("failingSinceMs");
+                }
+            }
+            (files, sessions.len())
+        });
+        if files > 0 {
+            self.persist_or_mark(Mark::All)?;
+        }
+        Ok((files, sessions))
+    }
+
+    /// `state.childUploaders?.[key]`.
+    pub fn child_uploader(&self, key: &str) -> Option<String> {
+        self.read(|s| s.get("childUploaders").and_then(|m| m.get_string(key)))
+    }
+
+    /// `(state.childUploaders ??= {})[key] = path`, in place; the caller persists.
+    pub fn set_child_uploader(&self, key: &str, path: &str) {
+        self.mutate(|s| ensure_obj(s, "childUploaders").set(key, Json::str(path)));
     }
 
     /// `pruneStrandedOffsets`: returns (keys, files) dropped.
-    pub fn prune_stranded_offsets(&self) -> (usize, usize) {
+    pub fn prune_stranded_offsets(&self) -> Result<(usize, usize), String> {
         let pruned = self.mutate(|s| {
             if s.get("destinations").is_none() {
                 return (0, 0);
@@ -1064,22 +1178,23 @@ impl Store {
             (keys, nfiles)
         });
         if pruned.0 > 0 {
-            let _ = self.checkpoint();
+            self.checkpoint()?;
         }
-        pruned
+        Ok(pruned)
     }
 
     /// `recordDestinations`.
-    pub fn record_destinations(&self, reports: &[DestinationReport]) {
+    pub fn record_destinations(&self, reports: &[DestinationReport]) -> Result<(), String> {
         let now = now_ms();
         let changed = self.mutate(|s| apply_destination_reports(s, reports, now));
         if changed {
-            self.persist_or_mark(Mark::Dests(reports.iter().map(|r| dest_key(r.vault_org_id.as_deref())).collect()));
+            return self.persist_or_mark(Mark::Dests(reports.iter().map(|r| dest_key(r.vault_org_id.as_deref())).collect()));
         }
+        Ok(())
     }
 
     /// `recordDestinationUploadError`.
-    pub fn record_destination_upload_error(&self, key: &str, code: &str) {
+    pub fn record_destination_upload_error(&self, key: &str, code: &str) -> Result<(), String> {
         let now = now_ms();
         self.mutate(|s| {
             let registry = ensure_obj(s, "destinations");
@@ -1102,11 +1217,11 @@ impl Store {
             }
             registry.set(key, record);
         });
-        self.persist_or_mark(Mark::Dest(key.to_string()));
+        self.persist_or_mark(Mark::Dest(key.to_string()))
     }
 
     /// `clearDestinationUploadError`: journaled when it ends a failure run.
-    pub fn clear_destination_upload_error(&self, key: &str) {
+    pub fn clear_destination_upload_error(&self, key: &str) -> Result<(), String> {
         let record = self.mutate(|s| {
             let r = s.as_obj_mut().and_then(|o| o.get_mut("destinations")).and_then(|d| d.as_obj_mut()).and_then(|d| d.get_mut(key))?;
             if r.get("consecutiveErrors").is_none() {
@@ -1119,8 +1234,9 @@ impl Store {
             Some(r.clone())
         });
         if let Some(r) = record {
-            self.journal_through(vec![obj(vec![("t", Json::str("dest")), ("key", Json::str(key)), ("record", r)])]);
+            return self.journal_through(vec![obj(vec![("t", Json::str("dest")), ("key", Json::str(key)), ("record", r)])]);
         }
+        Ok(())
     }
 
     pub fn deleted_session_key(family: &str, session_id: &str) -> String {
@@ -1128,7 +1244,7 @@ impl Store {
     }
 
     /// `recordDeletedSession`.
-    pub fn record_deleted_session(&self, family: &str, session_id: &str) {
+    pub fn record_deleted_session(&self, family: &str, session_id: &str) -> Result<(), String> {
         let now = now_ms();
         let key = Store::deleted_session_key(family, session_id);
         self.mutate(|s| {
@@ -1145,7 +1261,7 @@ impl Store {
                 map.remove(&k);
             }
         });
-        self.persist_or_mark(Mark::DeletedSessions);
+        self.persist_or_mark(Mark::DeletedSessions)
     }
 
     /// `isDeletedSession` over a state value.
@@ -1165,18 +1281,18 @@ impl Store {
         self.read(|s| s.get("chunkCaps").and_then(|c| c.get_f64(key)))
     }
 
-    pub fn set_chunk_cap(&self, key: &str, cap: f64) {
+    pub fn set_chunk_cap(&self, key: &str, cap: f64) -> Result<(), String> {
         self.mutate(|s| ensure_obj(s, "chunkCaps").set(key, Json::num(cap)));
-        self.persist_or_mark(Mark::ChunkCap(key.to_string()));
+        self.persist_or_mark(Mark::ChunkCap(key.to_string()))
     }
 
     pub fn get_artifact_hash(&self, key: &str) -> Option<String> {
         self.read(|s| s.get("artifacts").and_then(|a| a.get_string(key)))
     }
 
-    pub fn set_artifact_hash(&self, key: &str, hash: &str) {
+    pub fn set_artifact_hash(&self, key: &str, hash: &str) -> Result<(), String> {
         self.mutate(|s| ensure_obj(s, "artifacts").set(key, Json::str(hash)));
-        self.persist_or_mark(Mark::Artifact(key.to_string()));
+        self.persist_or_mark(Mark::Artifact(key.to_string()))
     }
 
     /// `stampEffectiveRoots`: a checkpoint, so a failure is loud.
@@ -1190,11 +1306,19 @@ impl Store {
             ]);
             s.set("effectiveRoots", stamp);
         });
-        self.checkpoint().map_err(|e| e.to_string())
+        self.checkpoint()
     }
 
     /// `persistState`: after in-place whole-state mutations.
-    pub fn persist_state(&self) {
-        self.persist_or_mark(Mark::All);
+    pub fn persist_state(&self) -> Result<(), String> {
+        self.persist_or_mark(Mark::All)
+    }
+}
+
+/// `String(entry[key])` for the `family:sessionId` keys the clears count.
+fn js_field(f: &Json, key: &str) -> String {
+    match f.get(key) {
+        Some(v) => crate::js::lossy(&v.to_js_string()),
+        None => "undefined".to_string(),
     }
 }

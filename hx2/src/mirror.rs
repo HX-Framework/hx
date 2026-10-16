@@ -1,17 +1,16 @@
 //! The two device mirrors the daemon pushes on start and every 20 s: Claude
 //! Desktop's sidebar grouping (src/ccd-prefs.ts, syncGroupMirror in watch.ts)
 //! and the active agent teams (readTeamConfigs in artifacts.ts, syncTeamMirror).
-//!
-//! The hot-path spike carries the Claude Desktop reader's result for a
-//! machine without a Claude Desktop store — the disabled-empty mirror, which
-//! is also what the client uploads on Linux — and the full team reader. The
-//! leveldb scan and the session-metadata index are the next card's work.
 
 use std::fs;
 use std::path::Path;
 
+use crate::ccd_prefs::{build_group_mirror, group_mirror_gate};
 use crate::fsutil::{join, now_ms, readdir_safe, stat_safe};
 use crate::json::{obj, Json};
+
+/// artifacts.ts readTextFile's default size cap.
+pub const TEXT_FILE_MAX_BYTES: u64 = 500_000;
 use crate::net::Gateway;
 use crate::roots::{claude_teams_dir, resolve_data_roots};
 use crate::settings::read_settings;
@@ -24,36 +23,23 @@ pub fn sha1_hex(text: &str) -> String {
     h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// `buildGroupMirror` for a machine with no Claude Desktop grouping to read.
-fn build_group_mirror(now: f64) -> Json {
-    obj(vec![
-        ("groupingEnabled", Json::Bool(false)),
-        ("groups", Json::Arr(Vec::new())),
-        ("unreadIds", Json::Arr(Vec::new())),
-        ("note", Json::str("no CCD custom grouping")),
-        ("syncedAtMs", Json::num(now)),
-    ])
-}
-
-/// `syncGroupMirror`: hash-gated on the meaningful content, best-effort.
+/// `syncGroupMirror`: hash-gated on the meaningful content (groups, enabled,
+/// the sorted unread ids), best-effort.
 pub fn sync_group_mirror(store: &Store, gw: &Gateway, log: &dyn Fn(&str)) {
     let mirror = build_group_mirror(now_ms());
-    let gate = obj(vec![
-        ("enabled", mirror.get("groupingEnabled").cloned().unwrap_or(Json::Bool(false))),
-        ("groups", mirror.get("groups").cloned().unwrap_or(Json::Arr(Vec::new()))),
-        ("unread", mirror.get("unreadIds").cloned().unwrap_or(Json::Arr(Vec::new()))),
-    ]);
-    let hash = sha1_hex(&gate.stringify());
+    let hash = sha1_hex(&group_mirror_gate(&mirror).stringify());
     let key = "ccd:group-mirror";
     if store.get_artifact_hash(key).as_deref() == Some(hash.as_str()) {
         return;
     }
-    match gw.upload_group_mirror(mirror) {
-        Ok(groups) => {
-            store.set_artifact_hash(key, &hash);
-            log(&format!("  [groups] synced {} CCD group(s)", crate::js::num_to_string(groups)));
-        }
-        Err(e) => log(&format!("  [groups] sync failed: {}", e.message())),
+    let result: Result<f64, String> = (|| {
+        let groups = gw.upload_group_mirror(mirror).map_err(|e| e.message())?;
+        store.set_artifact_hash(key, &hash)?;
+        Ok(groups)
+    })();
+    match result {
+        Ok(groups) => log(&format!("  [groups] synced {} CCD group(s)", crate::js::num_to_string(groups))),
+        Err(e) => log(&format!("  [groups] sync failed: {}", e)),
     }
 }
 
@@ -119,14 +105,18 @@ pub fn sync_team_mirror(store: &Store, gw: &Gateway, log: &dyn Fn(&str)) {
         ("teams", Json::Arr(teams.iter().map(|(n, c)| obj(vec![("name", Json::str(n)), ("config", c.clone())])).collect())),
         ("syncedAtMs", Json::num(now_ms())),
     ]);
-    match gw.upload_team_mirror(mirror) {
-        Ok(_) => {
-            store.set_artifact_hash(key, &hash);
+    let result: Result<(), String> = (|| {
+        gw.upload_team_mirror(mirror).map_err(|e| e.message())?;
+        store.set_artifact_hash(key, &hash)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
             if !teams.is_empty() {
                 log(&format!("  [teams] synced {} team(s)", teams.len()));
             }
         }
-        Err(e) => log(&format!("  [teams] sync failed: {}", e.message())),
+        Err(e) => log(&format!("  [teams] sync failed: {}", e)),
     }
 }
 
