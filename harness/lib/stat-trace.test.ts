@@ -23,6 +23,9 @@ describe("summarizeStatTrace", () => {
     `4243 ${t(16)} <... statx resumed>{stx_mask=STATX_ALL}) = 0`,
     `4242 ${t(20)} readlink("${HOME}", 0x7ffd, 4095) = -1 EINVAL (Invalid argument)`,
     `${t(21)} newfstatat(AT_FDCWD, "${HOME}/.let/hx/settings.json", {st_mode=S_IFREG|0600}, 0) = 0`,
+    `4242 ${t(22)} openat(AT_FDCWD, "${HOME}/.let/hx/settings.json", O_RDONLY|O_CLOEXEC) = 3`,
+    `4242 ${t(23)} openat(AT_FDCWD, "${HOME}/.claude/projects", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4`,
+    `4242 ${t(24)} openat(AT_FDCWD, "${HOME}/.let/hx/settings.json", O_RDONLY|O_CLOEXEC) = 3`,
     "+++ exited with 0 +++",
   ].join("\n");
 
@@ -33,8 +36,16 @@ describe("summarizeStatTrace", () => {
     expect(s.idleStatPerSec).toBe(0.1);
     expect(s.idleReadlinkPerSec).toBe(0);
     expect(s.text).toContain("start-up (first 15 s): 2 calls");
-    expect(s.text).toContain("idle (the 30 s after): 4 calls");
+    expect(s.text).toContain("idle (the 30 s after): 7 calls");
     expect(s.text).toContain("statx      <HOME>/.let/hx/settings.json");
     expect(s.text).toContain("fstat      <descriptor>");
+  });
+
+  test("counts opens, a directory's apart from a file's", () => {
+    const s = summarizeStatTrace(trace, HOME, 15_000, 45_000);
+    // Three opens over 30 s.
+    expect(s.idleOpenPerSec).toBe(0.1);
+    expect(s.text).toContain("      2  openat     <HOME>/.let/hx/settings.json\n");
+    expect(s.text).toContain("      1  openat     <HOME>/.claude/projects (directory)");
   });
 });
