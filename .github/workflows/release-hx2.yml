@@ -87,7 +87,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' hx2/Cargo.toml | head -n 1)"
+          version="$(awk -F'"' '/^version = / { print $2; exit }' hx2/Cargo.toml)"
           if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "hx2/Cargo.toml version must be a stable semver: '$version'" >&2
             exit 1
@@ -227,7 +227,7 @@ jobs:
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
             . "$HOME/.cargo/env"
             rustc -V
-            ldd --version | head -n 1
+            ldd --version | sed -n 1p
             cargo build --release --locked --manifest-path hx2/Cargo.toml --target "$TARGET"
             cargo test --release --locked --manifest-path hx2/Cargo.toml --target "$TARGET"
           '

@@ -21,6 +21,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Spelled the way Windows spells them (a workflow passes `$RUNNER_TEMP/...`),
+# so %USERPROFILE% and the PATH entry derived from it carry no forward slash
+# the installer did not put there itself.
+$ReleaseDir = [IO.Path]::GetFullPath($ReleaseDir)
+$Work = [IO.Path]::GetFullPath($Work)
+
 $port = 47913
 $base = "http://127.0.0.1:$port"
 $arpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\hx2'
