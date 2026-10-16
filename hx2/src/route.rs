@@ -1,7 +1,7 @@
 //! Per-repo upload route discovery (src/route.ts).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::fsutil::now_ms;
 use crate::json::Json;
@@ -42,6 +42,58 @@ fn parse_route(v: &Json) -> Option<Route> {
         return Some(Route { mode: RouteMode::FortressDirect { gateway_url, token, expires_at }, attributed_org_ids: attributed });
     }
     Some(Route { mode: RouteMode::Cloud, attributed_org_ids: attributed })
+}
+
+/// One route discovery in flight, shared by every caller that asks for the
+/// same repo while it runs.
+struct Flight {
+    done: Mutex<Option<Route>>,
+    cv: Condvar,
+}
+
+/// A scope's route cache (watch.ts ROUTE_CACHE) with its in-flight table.
+pub struct RouteCache {
+    routes: Mutex<HashMap<String, Route>>,
+    inflight: Mutex<HashMap<String, Arc<Flight>>>,
+}
+
+impl RouteCache {
+    pub fn new() -> RouteCache {
+        RouteCache { routes: Mutex::new(HashMap::new()), inflight: Mutex::new(HashMap::new()) }
+    }
+}
+
+/// `resolveRouteShared`: under the upload pool, N workers hitting the same
+/// cold repo share ONE discovery fetch — the same result, no stampede. The
+/// cloud route is never served from the cache (resolveRoute re-asks every
+/// time), so the sharing is what keeps the route traffic at the client's level.
+pub fn resolve_route_shared(repo: &str, gateway: &Gateway, cache: &RouteCache) -> Route {
+    let (flight, leader) = {
+        let mut inflight = cache.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        let existing = inflight.get(repo).cloned();
+        match existing {
+            Some(f) => (f, false),
+            None => {
+                let f = Arc::new(Flight { done: Mutex::new(None), cv: Condvar::new() });
+                inflight.insert(repo.to_string(), f.clone());
+                (f, true)
+            }
+        }
+    };
+    if !leader {
+        let mut done = flight.done.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(r) = done.as_ref() {
+                return r.clone();
+            }
+            done = flight.cv.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    let route = resolve_route(repo, gateway, &cache.routes);
+    cache.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(repo);
+    *flight.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(route.clone());
+    flight.cv.notify_all();
+    route
 }
 
 /// Where this repo's sessions upload. Never fails: a gateway that cannot be

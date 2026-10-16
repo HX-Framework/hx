@@ -11,8 +11,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::fsutil::{exists, now_ms, write_atomic_0600, write_file_0600, append_file_0600};
 use crate::home::hx_dir;
@@ -25,6 +25,14 @@ pub const HEAL_MAX_CONSECUTIVE: f64 = 3.0;
 pub const HEAL_PAUSE_MS: f64 = 6.0 * 60.0 * 60_000.0;
 pub const CHECKPOINT_INTERVAL_MS: f64 = 10.0 * 60_000.0;
 pub const CHECKPOINT_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
+/// The least time between two coalesced snapshot writes. The TypeScript
+/// client's mutators wait for the queued write, so its upload pool runs at
+/// the pace of its own snapshot rewrites; hx2's mutators do not wait, and this
+/// gap bounds how often the writer thread rewrites a multi-megabyte file
+/// while a catch-up changes the state thousands of times a second. The
+/// snapshot on disk is at most this far behind the state in memory, and
+/// every committed offset is in the journal before the next step regardless.
+const SNAPSHOT_WRITE_GAP_MS: u64 = 100;
 const DELETED_SESSION_RETENTION_MS: f64 = 60.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 
 /// Stable per-destination state key: null (the let.ai bucket) → "letai".
@@ -61,11 +69,23 @@ pub fn fs_offset_for(f: &Json, vault_org_id: Option<&str>) -> f64 {
 
 /// Lowest committed offset across all known destinations (0 if none yet).
 pub fn fs_min_offset(f: &Json) -> f64 {
-    let vals = fs_offsets(f);
-    if vals.is_empty() {
-        return 0.0;
+    let mut min = f64::INFINITY;
+    let mut any = false;
+    if let Some(o) = f.get("offsets").and_then(|o| o.as_obj()) {
+        for (_, v) in o.iter() {
+            if let Some(n) = v.as_f64() {
+                any = true;
+                if n < min {
+                    min = n;
+                }
+            }
+        }
     }
-    vals.into_iter().map(|(_, v)| v).fold(f64::INFINITY, f64::min)
+    if any {
+        min
+    } else {
+        0.0
+    }
 }
 
 /// `migrateFileState`: a persisted entry in the per-destination shape.
@@ -154,7 +174,19 @@ pub struct Store {
     inner: Mutex<Inner>,
     /// Serializes every disk operation: snapshot writes, journal appends, checkpoints.
     io: Mutex<()>,
-    persist_requested: AtomicBool,
+    /// A whole-snapshot write is wanted (flush-through mode). One writer thread
+    /// serves it, and every mutation that lands while a write is in flight is
+    /// included in the next one — the TypeScript client's queued write, where
+    /// concurrent callers piggyback on the write already scheduled.
+    persist_requested: Mutex<bool>,
+    persist_cv: Condvar,
+    /// One snapshot text is built at a time: the writer thread and `drain`.
+    write_lock: Mutex<()>,
+    /// Bumped by every checkpoint, so a coalesced write serialized before a
+    /// checkpoint is not written over the newer snapshot the checkpoint left.
+    checkpoint_gen: AtomicU64,
+    /// The last snapshot's length, the capacity hint for the next one.
+    last_snapshot_len: AtomicUsize,
 }
 
 fn apply_journal_entry(state: &mut Json, e: &Json) -> bool {
@@ -360,8 +392,9 @@ fn json_eq(a: Option<&Json>, b: Option<&Json>) -> bool {
 }
 
 impl Store {
-    /// `loadState`: the snapshot, then the journal replayed over it.
-    pub fn load(scope: &str) -> Store {
+    /// `loadState`: the snapshot, then the journal replayed over it. The
+    /// returned store owns a writer thread for the coalesced snapshot writes.
+    pub fn load(scope: &str) -> Arc<Store> {
         let (snapshot, journal) = if scope == "local" { ("state.local.json", "state.local.journal.jsonl") } else { ("state.json", "state.journal.jsonl") };
         let state_path = hx_dir().join(snapshot);
         let journal_path = hx_dir().join(journal);
@@ -396,7 +429,7 @@ impl Store {
             }
         }
         seed_destinations_from_blockers(&mut state);
-        Store {
+        let store = Arc::new(Store {
             state_path,
             journal_path,
             inner: Mutex::new(Inner {
@@ -412,8 +445,68 @@ impl Store {
                 last_checkpoint_ms: now_ms(),
             }),
             io: Mutex::new(()),
-            persist_requested: AtomicBool::new(false),
+            persist_requested: Mutex::new(false),
+            persist_cv: Condvar::new(),
+            write_lock: Mutex::new(()),
+            checkpoint_gen: AtomicU64::new(0),
+            last_snapshot_len: AtomicUsize::new(0),
+        });
+        let writer = store.clone();
+        std::thread::Builder::new()
+            .name("hx-state-writer".to_string())
+            .spawn(move || {
+                let gap = std::time::Duration::from_millis(SNAPSHOT_WRITE_GAP_MS);
+                let mut last_write: Option<std::time::Instant> = None;
+                loop {
+                    {
+                        let mut wanted = writer.persist_requested.lock().unwrap_or_else(|e| e.into_inner());
+                        while !*wanted {
+                            wanted = writer.persist_cv.wait(wanted).unwrap_or_else(|e| e.into_inner());
+                        }
+                    }
+                    if let Some(t) = last_write {
+                        let since = t.elapsed();
+                        if since < gap {
+                            std::thread::sleep(gap - since);
+                        }
+                    }
+                    last_write = Some(std::time::Instant::now());
+                    writer.write_requested_snapshot();
+                }
+            })
+            .ok();
+        store
+    }
+
+    /// One coalesced snapshot write. The request is cleared first, so a
+    /// mutation that lands during the write is served by the next one; the
+    /// text is built off the disk lock, and a checkpoint that wrote a newer
+    /// snapshot in the meantime makes this write unnecessary.
+    fn write_requested_snapshot(&self) {
+        let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let gen = {
+            let mut wanted = self.persist_requested.lock().unwrap_or_else(|e| e.into_inner());
+            if !*wanted {
+                return;
+            }
+            *wanted = false;
+            self.checkpoint_gen.load(Ordering::SeqCst)
+        };
+        let text = self.serialize();
+        let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        if self.checkpoint_gen.load(Ordering::SeqCst) != gen {
+            return;
         }
+        if self.write_snapshot(&text).is_err() {
+            let _ = self.write_snapshot(&text);
+        }
+    }
+
+    /// Finish any snapshot write still wanted — a one-shot process calls this
+    /// before it exits, so its last bookkeeping is on disk the way the
+    /// TypeScript client's awaited writes are.
+    pub fn drain(&self) {
+        self.write_requested_snapshot();
     }
 
     pub fn journal_path(&self) -> &PathBuf {
@@ -447,7 +540,10 @@ impl Store {
     // ── Disk ────────────────────────────────────────────────────────────────
 
     fn serialize(&self) -> String {
-        self.read(|s| s.stringify())
+        let last = self.last_snapshot_len.load(Ordering::Relaxed);
+        let text = self.read(|s| s.stringify_with_capacity(last + last / 8 + 1024));
+        self.last_snapshot_len.store(text.len(), Ordering::Relaxed);
+        text
     }
 
     fn write_snapshot(&self, text: &str) -> std::io::Result<()> {
@@ -455,25 +551,12 @@ impl Store {
         write_atomic_0600(&self.state_path, text.as_bytes())
     }
 
-    /// Write the whole snapshot now, retrying once, coalescing concurrent requests.
+    /// Ask the writer thread for a whole-snapshot write; concurrent requests
+    /// collapse into one write that carries every mutation made so far.
     fn schedule_persist(&self) {
-        self.persist_requested.store(true, Ordering::SeqCst);
-        loop {
-            let guard = match self.io.try_lock() {
-                Ok(g) => g,
-                Err(_) => return, // the writer in flight sees the flag
-            };
-            while self.persist_requested.swap(false, Ordering::SeqCst) {
-                let text = self.serialize();
-                if self.write_snapshot(&text).is_err() {
-                    let _ = self.write_snapshot(&text);
-                }
-            }
-            drop(guard);
-            if !self.persist_requested.load(Ordering::SeqCst) {
-                return;
-            }
-        }
+        let mut wanted = self.persist_requested.lock().unwrap_or_else(|e| e.into_inner());
+        *wanted = true;
+        self.persist_cv.notify_one();
     }
 
     fn mark(&self, inner: &mut Inner, mark: Mark) {
@@ -585,11 +668,12 @@ impl Store {
     /// Write the snapshot and empty the journal, as one step.
     fn checkpoint(&self) -> std::io::Result<()> {
         let _g = self.io.lock().unwrap_or_else(|e| e.into_inner());
-        self.persist_requested.store(false, Ordering::SeqCst);
+        *self.persist_requested.lock().unwrap_or_else(|e| e.into_inner()) = false;
         let text = self.serialize();
         if self.write_snapshot(&text).is_err() {
             self.write_snapshot(&text)?;
         }
+        self.checkpoint_gen.fetch_add(1, Ordering::SeqCst);
         let bytes = self.inner.lock().unwrap_or_else(|e| e.into_inner()).journal_bytes;
         if bytes > 0 || exists(&self.journal_path) {
             write_file_0600(&self.journal_path, b"")?;
@@ -1064,7 +1148,7 @@ impl Store {
             return true;
         }
         let suffix = format!(":{}", session_id);
-        map.keys().iter().any(|k| k.ends_with(&suffix))
+        map.iter().any(|(k, _)| k.ends_with(&suffix))
     }
 
     pub fn get_chunk_cap(&self, key: &str) -> Option<f64> {

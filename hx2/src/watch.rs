@@ -29,7 +29,7 @@ use crate::parse::{summarise_chunk, ChunkSummary};
 use crate::pathnorm::collapse_home;
 use crate::reattribute::run_reattribute_sweep;
 use crate::roots::{resolve_data_roots, roots_signature, DataRoot, ResolvedRoots};
-use crate::route::{resolve_route, Route, RouteMode};
+use crate::route::{resolve_route_shared, RouteCache, RouteMode};
 use crate::settings::{is_paused, read_settings, should_skip_file, tuning_int, tuning_value, FileSyncIdentity, HxSettings};
 use crate::sources::{derive_fallback_title, discover_claude_files, read_head, seeded_cwd, DiscoveredFile, HeadMeta, RECENT_WINDOW_MS};
 use crate::state::{dest_key, fs_min_offset, fs_offset_for, fs_offsets, DestinationReport, Store};
@@ -73,10 +73,10 @@ pub struct WatchOptions {
 pub struct Ctx {
     pub cfg: HxConfig,
     pub gw: Gateway,
-    pub store: Store,
+    pub store: Arc<Store>,
     pub log: Logger,
     pub name: String,
-    pub routes: Mutex<HashMap<String, Route>>,
+    pub routes: RouteCache,
     stuck: Mutex<HashMap<String, (String, f64)>>,
     shadowed: Mutex<HashSet<String>>,
     pub catalog: Mutex<DiscoveryCatalog>,
@@ -90,7 +90,7 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    pub fn new(cfg: HxConfig, store: Store, log: Logger, name: &str, beat: Arc<AtomicU64>) -> Ctx {
+    pub fn new(cfg: HxConfig, store: Arc<Store>, log: Logger, name: &str, beat: Arc<AtomicU64>) -> Ctx {
         let gw = Gateway { base_url: cfg.gateway_base_url.clone(), token: cfg.access_token.clone().unwrap_or_default() };
         Ctx {
             cfg,
@@ -98,7 +98,7 @@ impl Ctx {
             store,
             log,
             name: name.to_string(),
-            routes: Mutex::new(HashMap::new()),
+            routes: RouteCache::new(),
             stuck: Mutex::new(HashMap::new()),
             shadowed: Mutex::new(HashSet::new()),
             catalog: Mutex::new(DiscoveryCatalog::new()),
@@ -299,6 +299,12 @@ fn should_skip_entry(settings: &HxSettings, fs: &Json) -> bool {
 
 /// `filterWatched`: drop files the settings keep local and tombstoned sessions.
 fn filter_watched(files: Vec<DiscoveredFile>, state: &Json, settings: &HxSettings) -> Vec<DiscoveredFile> {
+    // With no tombstone and settings that keep nothing local, every file stays.
+    let has_deleted = state.get("deletedSessions").and_then(|m| m.as_obj()).map(|m| !m.is_empty()).unwrap_or(false);
+    let settings_can_skip = !settings.personal_sync || !settings.excluded_folders.is_empty() || !settings.exclude_rules.is_empty();
+    if !has_deleted && !settings_can_skip {
+        return files;
+    }
     files
         .into_iter()
         .filter(|f| {
@@ -319,6 +325,7 @@ fn filter_watched(files: Vec<DiscoveredFile>, state: &Json, settings: &HxSetting
 /// `electUploaders`: one uploader per canonical, newest mtime wins (tie: largest).
 fn elect_uploaders(ctx: &Ctx, files: Vec<DiscoveredFile>, state: &Json, log: bool) -> Vec<DiscoveredFile> {
     let mut by_key: Vec<(String, Vec<DiscoveredFile>)> = Vec::new();
+    let mut key_index: HashMap<String, usize> = HashMap::new();
     let mut active: Vec<DiscoveredFile> = Vec::new();
     for f in files {
         let fs = match state.get("files").and_then(|m| m.get(&f.path)) {
@@ -329,10 +336,11 @@ fn elect_uploaders(ctx: &Ctx, files: Vec<DiscoveredFile>, state: &Json, log: boo
             }
         };
         let key = format!("{}:{}", fs.get_string("family").unwrap_or_default(), fs.get_string("sessionId").unwrap_or_default());
-        match by_key.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, list)) => list.push(f),
-            None => by_key.push((key, vec![f])),
-        }
+        let i = *key_index.entry(key.clone()).or_insert_with(|| {
+            by_key.push((key.clone(), Vec::new()));
+            by_key.len() - 1
+        });
+        by_key[i].1.push(f);
     }
     for (_, mut list) in by_key {
         list.sort_by(|a, b| b.mtime_ms.partial_cmp(&a.mtime_ms).unwrap_or(std::cmp::Ordering::Equal).then(b.size.cmp(&a.size)));
@@ -352,13 +360,15 @@ fn elect_uploaders(ctx: &Ctx, files: Vec<DiscoveredFile>, state: &Json, log: boo
 
 // ── The sync snapshot (ledger.ts reportableOffset) ─────────────────────────
 
-fn ever_written_keys(state: &Json) -> HashSet<String> {
+fn ever_written_keys(state: &Json) -> HashSet<&str> {
     let mut out = HashSet::new();
     if let Some(files) = state.get("files").and_then(|f| f.as_obj()) {
         for (_, fs) in files.iter() {
-            for (k, off) in fs_offsets(fs) {
-                if off > 0.0 {
-                    out.insert(k);
+            if let Some(o) = fs.get("offsets").and_then(|o| o.as_obj()) {
+                for (k, v) in o.iter() {
+                    if v.as_f64().map(|n| n > 0.0).unwrap_or(false) {
+                        out.insert(k.as_str());
+                    }
                 }
             }
         }
@@ -366,7 +376,7 @@ fn ever_written_keys(state: &Json) -> HashSet<String> {
     out
 }
 
-fn is_phantom_key(state: &Json, key: &str, offset: f64, ever_written: &HashSet<String>) -> bool {
+fn is_phantom_key(state: &Json, key: &str, offset: f64, ever_written: &HashSet<&str>) -> bool {
     if offset > 0.0 || key == "letai" {
         return false;
     }
@@ -380,12 +390,25 @@ fn is_phantom_key(state: &Json, key: &str, offset: f64, ever_written: &HashSet<S
     registry.get(key).is_none()
 }
 
-fn reportable_offset(fs: &Json, state: &Json, ever_written: &HashSet<String>) -> f64 {
-    let vals: Vec<f64> = fs_offsets(fs).into_iter().filter(|(k, off)| !is_phantom_key(state, k, *off, ever_written)).map(|(_, off)| off).collect();
-    if vals.is_empty() {
-        0.0
+fn reportable_offset(fs: &Json, state: &Json, ever_written: &HashSet<&str>) -> f64 {
+    let mut min = f64::INFINITY;
+    let mut any = false;
+    if let Some(o) = fs.get("offsets").and_then(|o| o.as_obj()) {
+        for (k, v) in o.iter() {
+            if let Some(off) = v.as_f64() {
+                if !is_phantom_key(state, k, off, ever_written) {
+                    any = true;
+                    if off < min {
+                        min = off;
+                    }
+                }
+            }
+        }
+    }
+    if any {
+        min
     } else {
-        vals.into_iter().fold(f64::INFINITY, f64::min)
+        0.0
     }
 }
 
@@ -448,7 +471,7 @@ fn upload_config_for(ctx: &Ctx, repo_slug: Option<&str>) -> UploadRoute {
         Some(r) if ctx.cfg.access_token.is_some() => r,
         _ => return UploadRoute { gw: Gateway { base_url: ctx.gw.base_url.clone(), token: ctx.gw.token.clone() }, fortress: false, attributed_org_ids: None },
     };
-    let route = resolve_route(repo, &ctx.gw, &ctx.routes);
+    let route = resolve_route_shared(repo, &ctx.gw, &ctx.routes);
     let attributed = route.attributed_org_ids.clone();
     match route.mode {
         RouteMode::FortressDirect { gateway_url, token, .. } => UploadRoute { gw: Gateway { base_url: gateway_url, token }, fortress: true, attributed_org_ids: attributed },
@@ -958,7 +981,7 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
             };
             let seeded_slug = seeded.get("repoSlug").filter(|v| !v.is_null()).and_then(|v| v.as_string());
             if !personal_sync && seeded_slug.is_some() && seeded.get("attributed").is_none() && ctx.cfg.access_token.is_some() {
-                let r = resolve_route(seeded_slug.as_deref().unwrap_or(""), &ctx.gw, &ctx.routes);
+                let r = resolve_route_shared(seeded_slug.as_deref().unwrap_or(""), &ctx.gw, &ctx.routes);
                 if let Some(ids) = r.attributed_org_ids {
                     seeded.set("attributed", Json::Bool(!ids.is_empty()));
                     ctx.store.upsert_file_state(seeded.clone());
@@ -1387,6 +1410,7 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
         *watchdog_limit_ms = resolve_watchdog_ms(&settings);
         publish_roots(&settings, &mut last_roots_sig, &mut last_stamp_at, &mut stamp_failure_logged);
         let mut skip = false;
+        let mut did_work = false;
         if now_ms() < *pause_uploads_until {
             skip = true;
         } else if is_paused(&settings, now_ms()) {
@@ -1410,6 +1434,7 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
                 Ok(r) => {
                     perf.uploads += r.uploaded;
                     if r.uploaded > 0 || r.failed > 0 {
+                        did_work = true;
                         if r.uploaded > 0 {
                             *last_contact.lock().unwrap_or_else(|e| e.into_inner()) = now_ms();
                         }
@@ -1431,9 +1456,8 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
         perf.passes += 1;
         perf.pass_ms.push(now_ms() - pass_start);
         pass_busy.store(false, Ordering::SeqCst);
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        unsafe {
-            libc::malloc_trim(0);
+        if did_work || perf.passes == 1 {
+            release_freed_memory();
         }
     };
 
@@ -1468,9 +1492,12 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
     if let Err(e) = run_reattribute_sweep(&ctx.cfg, &ctx.store, &ctx.gw, &log_fn, false) {
         ctx.log(&format!("[hx] attribution sweep error: {}", e.message()));
     }
+    release_freed_memory();
     // The codex title sweep (title-sync.ts) reads no file and sends nothing
     // on a tree without Codex rollouts; Codex rides the next card.
     if opts.one_shot {
+        // Every write the pass asked for is on disk before the process exits.
+        ctx.store.drain();
         return;
     }
     let hooks = match hooks {
@@ -1583,6 +1610,28 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
     ctx.catalog.lock().unwrap_or_else(|e| e.into_inner()).disable_file_events();
     let _ = ctx.store.checkpoint_state();
     ctx.store.disarm_coalesced();
+    ctx.store.drain();
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    /// malloc/malloc.h: hand freed pages back to the system (every zone when NULL).
+    fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+}
+
+/// Hand the allocator's freed pages back to the system after a pass that
+/// allocated: the catch-up's read buffers and the snapshot text must not sit
+/// in the daemon's resident size for the rest of the day. The allocator
+/// keeps them otherwise; nothing the servers see changes.
+fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
 }
 
 /// `new Date(ms).toLocaleTimeString()` under en-US, e.g. "9:12:34 PM".

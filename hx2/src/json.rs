@@ -13,10 +13,16 @@ use std::fmt::Write as _;
 
 use crate::js::{js, lossy, num_to_string, JsStr};
 
+/// An object with few keys (a file entry, a request body) finds a key by a
+/// linear scan; one past INDEX_FROM keys (the `files` registry, the
+/// destination registry) carries a hash index beside its entries. Thousands
+/// of small objects without an index each is what keeps the state small.
+const INDEX_FROM: usize = 9;
+
 #[derive(Clone, Debug, Default)]
 pub struct OMap {
     entries: Vec<(String, Json)>,
-    index: HashMap<String, usize>,
+    index: Option<HashMap<String, usize>>,
 }
 
 impl OMap {
@@ -24,42 +30,65 @@ impl OMap {
         Self::default()
     }
 
+    pub fn with_capacity(n: usize) -> Self {
+        OMap { entries: Vec::with_capacity(n), index: None }
+    }
+
+    fn position(&self, k: &str) -> Option<usize> {
+        match &self.index {
+            Some(ix) => ix.get(k).copied(),
+            None => self.entries.iter().position(|(key, _)| key.as_str() == k),
+        }
+    }
+
     pub fn get(&self, k: &str) -> Option<&Json> {
-        self.index.get(k).map(|&i| &self.entries[i].1)
+        self.position(k).map(|i| &self.entries[i].1)
     }
 
     pub fn get_mut(&mut self, k: &str) -> Option<&mut Json> {
-        match self.index.get(k) {
-            Some(&i) => Some(&mut self.entries[i].1),
+        match self.position(k) {
+            Some(i) => Some(&mut self.entries[i].1),
             None => None,
         }
     }
 
     pub fn contains(&self, k: &str) -> bool {
-        self.index.contains_key(k)
+        self.position(k).is_some()
     }
 
     /// `obj[k] = v`: an existing key keeps its position.
     pub fn set(&mut self, k: &str, v: Json) {
-        if let Some(&i) = self.index.get(k) {
+        if let Some(i) = self.position(k) {
             self.entries[i].1 = v;
-        } else {
-            self.index.insert(k.to_string(), self.entries.len());
-            self.entries.push((k.to_string(), v));
+            return;
+        }
+        self.entries.push((k.to_string(), v));
+        let n = self.entries.len();
+        if let Some(ix) = self.index.as_mut() {
+            ix.insert(k.to_string(), n - 1);
+        } else if n >= INDEX_FROM {
+            self.index = Some(self.entries.iter().enumerate().map(|(i, (key, _))| (key.clone(), i)).collect());
         }
     }
 
     /// `delete obj[k]`.
     pub fn remove(&mut self, k: &str) -> Option<Json> {
-        let i = self.index.remove(k)?;
+        let i = self.position(k)?;
         let (_, v) = self.entries.remove(i);
-        for (key, idx) in self.index.iter_mut() {
-            let _ = key;
-            if *idx > i {
-                *idx -= 1;
+        if let Some(ix) = self.index.as_mut() {
+            ix.remove(k);
+            for (_, idx) in ix.iter_mut() {
+                if *idx > i {
+                    *idx -= 1;
+                }
             }
         }
         Some(v)
+    }
+
+    /// Give back the slack a parse or a build left in the entry vector.
+    pub fn shrink_to_fit(&mut self) {
+        self.entries.shrink_to_fit();
     }
 
     pub fn len(&self) -> usize {
@@ -251,6 +280,14 @@ impl Json {
         out
     }
 
+    /// `JSON.stringify(value)` into a buffer sized from the last result, so a
+    /// multi-megabyte snapshot is not grown by doubling.
+    pub fn stringify_with_capacity(&self, cap: usize) -> String {
+        let mut out = String::with_capacity(cap);
+        write_value(&mut out, self, None, 0);
+        out
+    }
+
     /// `JSON.stringify(value, null, 2)`.
     pub fn stringify_pretty(&self) -> String {
         let mut out = String::new();
@@ -373,6 +410,7 @@ impl<'a> Parser<'a> {
             match c {
                 b'"' => {
                     self.i += 1;
+                    out.shrink_to_fit();
                     return Ok(out);
                 }
                 b'\\' => {
@@ -423,6 +461,7 @@ impl<'a> Parser<'a> {
         self.ws();
         if self.peek() == Some(b']') {
             self.i += 1;
+            out.shrink_to_fit();
             return Ok(Json::Arr(out));
         }
         loop {
@@ -435,6 +474,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(b']') => {
                     self.i += 1;
+                    out.shrink_to_fit();
                     return Ok(Json::Arr(out));
                 }
                 _ => return Err(()),
@@ -448,6 +488,7 @@ impl<'a> Parser<'a> {
         self.ws();
         if self.peek() == Some(b'}') {
             self.i += 1;
+            out.shrink_to_fit();
             return Ok(Json::Obj(out));
         }
         loop {
@@ -471,6 +512,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(b'}') => {
                     self.i += 1;
+                    out.shrink_to_fit();
                     return Ok(Json::Obj(out));
                 }
                 _ => return Err(()),
@@ -481,11 +523,24 @@ impl<'a> Parser<'a> {
 
 // ── Serializer ──────────────────────────────────────────────────────────────
 
+/// A JavaScript string the way `JSON.stringify` writes it: a run of plain
+/// ASCII goes out in one piece, the rest character by character.
 pub fn write_js_string(out: &mut String, s: &[u16]) {
     out.push('"');
     let mut i = 0;
     while i < s.len() {
         let c = s[i];
+        if plain_ascii(c) {
+            let start = i;
+            while i < s.len() && plain_ascii(s[i]) {
+                i += 1;
+            }
+            // Every unit in the run is one ASCII byte, so the string stays UTF-8.
+            unsafe {
+                out.as_mut_vec().extend(s[start..i].iter().map(|&u| u as u8));
+            }
+            continue;
+        }
         match c {
             0x22 => out.push_str("\\\""),
             0x5C => out.push_str("\\\\"),
@@ -522,6 +577,36 @@ pub fn write_js_string(out: &mut String, s: &[u16]) {
     out.push('"');
 }
 
+/// Printable ASCII that `JSON.stringify` writes as is.
+#[inline]
+fn plain_ascii(c: u16) -> bool {
+    (0x20..0x7F).contains(&c) && c != 0x22 && c != 0x5C
+}
+
+/// An object key, which is UTF-8 here: plain ASCII goes out as is, anything
+/// else through the string writer.
+fn write_js_key(out: &mut String, k: &str) {
+    if k.bytes().all(|b| (0x20..0x7F).contains(&b) && b != b'"' && b != b'\\') {
+        out.push('"');
+        out.push_str(k);
+        out.push('"');
+    } else {
+        write_js_string(out, &js(k));
+    }
+}
+
+/// A number the way `JSON.stringify` prints it; the integers that fill the
+/// state (offsets, sizes, millisecond stamps) take the direct path.
+fn write_num(out: &mut String, n: f64) {
+    if n == 0.0 {
+        out.push('0');
+    } else if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
+        let _ = write!(out, "{}", n as i64);
+    } else {
+        out.push_str(&num_to_string(n));
+    }
+}
+
 fn newline(out: &mut String, indent: Option<usize>, level: usize) {
     if let Some(n) = indent {
         out.push('\n');
@@ -535,7 +620,7 @@ fn write_value(out: &mut String, v: &Json, indent: Option<usize>, level: usize) 
     match v {
         Json::Null => out.push_str("null"),
         Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Json::Num(n) => out.push_str(&num_to_string(*n)),
+        Json::Num(n) => write_num(out, *n),
         Json::Str(s) => write_js_string(out, s),
         Json::Arr(a) => {
             if a.is_empty() {
@@ -566,7 +651,7 @@ fn write_value(out: &mut String, v: &Json, indent: Option<usize>, level: usize) 
                 }
                 first = false;
                 newline(out, indent, level + 1);
-                write_js_string(out, &js(k));
+                write_js_key(out, k);
                 out.push(':');
                 if indent.is_some() {
                     out.push(' ');
@@ -581,7 +666,7 @@ fn write_value(out: &mut String, v: &Json, indent: Option<usize>, level: usize) 
 
 /// Build an object from (key, value) pairs in order.
 pub fn obj(pairs: Vec<(&str, Json)>) -> Json {
-    let mut o = OMap::new();
+    let mut o = OMap::with_capacity(pairs.len());
     for (k, v) in pairs {
         o.set(k, v);
     }

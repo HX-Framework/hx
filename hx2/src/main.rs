@@ -168,6 +168,14 @@ fn cmd_watch(name: &str, args: &[String]) {
 }
 
 fn main() {
+    // glibc opens a malloc arena per thread that allocates; the upload pool's
+    // workers come and go every pass, and every arena holds on to memory it
+    // freed. Two arenas are plenty for this daemon.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        const M_ARENA_MAX: libc::c_int = -8;
+        libc::mallopt(M_ARENA_MAX, 2);
+    }
     home::ensure_hx_home();
     let name = binary_name();
     let args: Vec<String> = std::env::args().collect();
