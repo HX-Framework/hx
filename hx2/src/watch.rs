@@ -87,6 +87,46 @@ pub struct Ctx {
     semaphore: ByteSemaphore,
     pub beat: Arc<AtomicU64>,
     pub last_log_ms: Arc<AtomicU64>,
+    /// What the last pass saw and decided (see `tick_once`).
+    tick_cache: Mutex<Option<TickCache>>,
+}
+
+/// What a pass hands to the pool is a function of the catalog, the state
+/// and the settings alone (the gate reads no clock), so a pass that pooled
+/// nothing while all three stand still would pool nothing again: the next
+/// tick reuses its snapshot instead of walking every file. The TypeScript
+/// client walks them every tick; how often hx2 looks is its own business,
+/// the uploads and the reports are the same.
+struct TickCache {
+    catalog_gen: u64,
+    store_gen: u64,
+    settings_sig: String,
+    snapshot: SyncSnapshot,
+    pooled_empty: bool,
+}
+
+/// The settings a pass decides on, as one string to compare across ticks.
+fn tick_settings_signature(s: &HxSettings, roots: &ResolvedRoots) -> String {
+    let mut sig = String::new();
+    sig.push_str(if s.personal_sync { "p1|" } else { "p0|" });
+    sig.push_str(&roots_signature(roots));
+    sig.push('|');
+    for ex in &s.excluded_folders {
+        sig.push_str(&ex.family);
+        sig.push(':');
+        sig.push_str(&ex.cwd);
+        sig.push(';');
+    }
+    sig.push('|');
+    for r in &s.exclude_rules {
+        sig.push_str(r);
+        sig.push(';');
+    }
+    sig.push('|');
+    if let Some(t) = &s.tuning {
+        sig.push_str(&t.stringify());
+    }
+    sig
 }
 
 impl Ctx {
@@ -109,6 +149,7 @@ impl Ctx {
             semaphore: ByteSemaphore::new(UPLOAD_BYTES_CAP),
             beat,
             last_log_ms: Arc::new(AtomicU64::new(now_ms() as u64)),
+            tick_cache: Mutex::new(None),
         }
     }
 
@@ -887,14 +928,37 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
     let roots = resolve_data_roots(&settings);
     let legacy_sweep = tuning_value(&settings, "sweep").and_then(|v| v.as_string()).as_deref() == Some("legacy") || std::env::var("HX_SWEEP").ok().as_deref() == Some("legacy");
     let now = now_ms();
-    let mut files: Vec<DiscoveredFile> = if legacy_sweep {
-        discover_claude_files(&roots.claude, Some(RECENT_WINDOW_MS), now)
+    let cat_gen = if legacy_sweep {
+        0
     } else {
         let mut c = ctx.catalog.lock().unwrap_or_else(|e| e.into_inner());
         c.sweep(&roots, now);
-        c.list_files()
+        c.generation
     };
     ctx.beat();
+    let store_gen = ctx.store.generation();
+    let settings_sig = tick_settings_signature(&settings, &roots);
+    // Nothing moved since the last pass, which pooled nothing: the same
+    // snapshot, no per-file work (TickCache).
+    if !legacy_sweep && opts.only.is_none() && !backfill_due(ctx, "main", now) && !backfill_due(ctx, "main:children", now) {
+        let cached = {
+            let cache = ctx.tick_cache.lock().unwrap_or_else(|e| e.into_inner());
+            match &*cache {
+                Some(c) if c.pooled_empty && c.catalog_gen == cat_gen && c.store_gen == store_gen && c.settings_sig == settings_sig => Some(c.snapshot),
+                _ => None,
+            }
+        };
+        if let Some(snapshot) = cached {
+            ctx.store.flush_if_dirty()?;
+            on_progress(snapshot);
+            return Ok(TickResult { uploaded: 0, failed: 0, snapshot });
+        }
+    }
+    let mut files: Vec<DiscoveredFile> = if legacy_sweep {
+        discover_claude_files(&roots.claude, Some(RECENT_WINDOW_MS), now)
+    } else {
+        ctx.catalog.lock().unwrap_or_else(|e| e.into_inner()).list_files()
+    };
     if let Some(only) = &opts.only {
         files.retain(|f| f.path == *only);
     }
@@ -1149,7 +1213,20 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
     ctx.store.flush_if_dirty()?;
     let snapshot = ctx.store.read(|state| snapshot_from(&files, state));
     on_progress(snapshot);
-    Ok(TickResult { uploaded: uploaded.load(Ordering::SeqCst), failed: failed.load(Ordering::SeqCst), snapshot })
+    let uploaded_n = uploaded.load(Ordering::SeqCst);
+    let failed_n = failed.load(Ordering::SeqCst);
+    if !legacy_sweep && opts.only.is_none() {
+        // The generations are the ones read before this pass touched anything,
+        // so a mutation made by the pass itself sends the next tick the long way.
+        *ctx.tick_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(TickCache {
+            catalog_gen: cat_gen,
+            store_gen,
+            settings_sig,
+            snapshot,
+            pooled_empty: pooled.is_empty() && uploaded_n == 0 && failed_n == 0,
+        });
+    }
+    Ok(TickResult { uploaded: uploaded_n, failed: failed_n, snapshot })
 }
 
 // ── The canonical audit ─────────────────────────────────────────────────────

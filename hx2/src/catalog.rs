@@ -107,6 +107,10 @@ pub struct DiscoveryCatalog {
     hints: Arc<Mutex<HintBox>>,
     last_full_sweep_ms: f64,
     pub counters: Counters,
+    /// Moves every time a sweep ran or paths were adopted: a tick whose
+    /// catalog, state and settings generations all stand still has the same
+    /// files to hand to the pool as the last one.
+    pub generation: u64,
 }
 
 impl Default for DiscoveryCatalog {
@@ -130,6 +134,7 @@ impl DiscoveryCatalog {
             hints: Arc::new(Mutex::new(HintBox::default())),
             last_full_sweep_ms: f64::NEG_INFINITY,
             counters: Counters::default(),
+            generation: 0,
         }
     }
 
@@ -145,6 +150,7 @@ impl DiscoveryCatalog {
         h.overflow = false;
         drop(h);
         self.last_full_sweep_ms = f64::NEG_INFINITY;
+        self.generation += 1;
     }
 
     // ── File events ───────────────────────────────────────────────────────
@@ -214,6 +220,9 @@ impl DiscoveryCatalog {
             }
             adopted += 1;
         }
+        if adopted > 0 {
+            self.generation += 1;
+        }
         adopted
     }
 
@@ -259,6 +268,7 @@ impl DiscoveryCatalog {
             self.claude_dir_pass(roots, now_ms);
             self.file_stat_pass(now_ms);
             self.excluded_stat_pass(now_ms);
+            self.generation += 1;
             return;
         }
         let hinted: Vec<String> = {
@@ -272,6 +282,7 @@ impl DiscoveryCatalog {
         self.counters.hinted_sweeps += 1;
         self.counters.hints += hinted.len() as u64;
         self.hinted_sweep(roots, hinted, now_ms);
+        self.generation += 1;
     }
 
     // ── Hinted sweep ──────────────────────────────────────────────────────

@@ -187,6 +187,8 @@ pub struct Store {
     checkpoint_gen: AtomicU64,
     /// The last snapshot's length, the capacity hint for the next one.
     last_snapshot_len: AtomicUsize,
+    /// Moves on every mutation of the state (see `generation`).
+    mutations: AtomicU64,
 }
 
 fn apply_journal_entry(state: &mut Json, e: &Json) -> bool {
@@ -450,6 +452,7 @@ impl Store {
             write_lock: Mutex::new(()),
             checkpoint_gen: AtomicU64::new(0),
             last_snapshot_len: AtomicUsize::new(0),
+            mutations: AtomicU64::new(0),
         });
         let writer = store.clone();
         std::thread::Builder::new()
@@ -522,7 +525,14 @@ impl Store {
     /// Mutate the state in place without persisting (callers persist explicitly).
     pub fn mutate<R>(&self, f: impl FnOnce(&mut Json) -> R) -> R {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutations.fetch_add(1, Ordering::Relaxed);
         f(&mut g.state)
+    }
+
+    /// How many times the state was mutated since the load: a tick compares
+    /// it with the last tick's to know whether anything it decides on moved.
+    pub fn generation(&self) -> u64 {
+        self.mutations.load(Ordering::Relaxed)
     }
 
     pub fn file(&self, path: &str) -> Option<Json> {
