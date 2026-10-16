@@ -528,7 +528,8 @@ impl CcdIndex {
                             continue;
                         }
                     }
-                    let present: Vec<PathKey> = readdir_safe(Path::new(d)).into_iter().filter(|f| is_session_file(f)).map(|f| PathKey { dir: id, name: Arc::from(f.as_bytes()) }).collect();
+                    let mut present: Vec<PathKey> = readdir_safe(Path::new(d)).into_iter().filter(|f| is_session_file(f)).map(|f| PathKey { dir: id, name: Arc::from(f.as_bytes()) }).collect();
+                    present.shrink_to_fit();
                     if let Some(k) = self.org_dirs.get(&id) {
                         let present_set: HashSet<&PathKey> = present.iter().collect();
                         for p in &k.files {
@@ -749,6 +750,7 @@ fn saved_listing(s: &mut Scanner<'_>, paths: &mut DirTable) -> Result<Option<Org
                 list.push(paths.split(&buf));
                 Ok(())
             })?;
+            list.shrink_to_fit();
             files = Some(list);
             Ok(())
         }
