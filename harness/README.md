@@ -214,6 +214,23 @@ files byte for byte (and with the client's snapshot file). One service slot
 (`ai.let.hx-vision`) is shared by hx and hx2, so the files may differ in the
 binary's path alone.
 
+`hx2-switch` runs the service for real: `harness/run/switch.ts` moves a
+device's slot from hx to hx2 and back through launchd (macOS), systemd and
+the container shell hook (Linux), against a recording fake gateway.
+`hx start` uploads the `small` fixture; `hx2 start` takes the slot and a
+transcript grows; hx takes it back (`hx restart` up to 77.12, `hx start`
+from 77.13.0 on) and another transcript grows. It checks that every fixture
+session is in the store; that after each switch every object got exactly
+the bytes it was missing (the bytes PUT equal how much the store grew, and
+no commit replaced an object the store already held); that each grown
+transcript is stored byte for byte and went up through the client that held
+the slot; that the recording is one stretch of hx, one of hx2, one of hx (by
+User-Agent) and each phase ends with exactly one `watch` process, the right
+client's; and that `status` names the expected manager. launchd and systemd
+run the service with the user's own HOME, so on the runner the fixture is
+linked into it (`~/.claude`, `~/.codex`, Claude Desktop's folder), and the
+script refuses to run outside CI or over an existing path.
+
 `measure.ts` reports the macOS daemon's `phys_footprint` beside its `ps` RSS
 (`harness/run/phys-footprint.c`, compiled once per run with `cc`): RSS counts
 pages the allocator has handed back through `malloc_zone_pressure_relief`,
