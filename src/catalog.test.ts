@@ -32,7 +32,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DiscoveryCatalog } from "./catalog.js";
+import { DiscoveryCatalog, SAFETY_SWEEP_MS } from "./catalog.js";
 import {
   discoverClaudeChildren,
   discoverClaudeFiles,
@@ -546,5 +546,120 @@ describe("catalog equivalence", () => {
       cat.listChildren().children.map((c) => `${c.path}|${c.size}`).sort(),
       truthChildren.children.map((c) => `${c.path}|${c.size}`).sort(),
     );
+  });
+});
+
+// File events as hints: between safety sweeps a tick re-checks ONLY the paths
+// events named, through the same passes a full sweep uses; the safety sweep
+// catches whatever no event named.
+describe("hinted sweeps", () => {
+  it("re-stats a hinted transcript at once and leaves an unhinted append to the safety sweep", async () => {
+    const roots = mkRoots();
+    const hinted = mkFile("pa", "hinted.jsonl", 100, at(-3 * H)); // warm
+    const quiet = mkFile("pa", "quiet.jsonl", 100, at(-3 * H));
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0)); // the first sweep is always full
+    cat.pretendEventsArmedForTests();
+
+    for (const p of [hinted, quiet]) {
+      appendFileSync(p, "more!");
+      touch(p, at(1_000));
+    }
+    touch(join(base, "claude", "projects", "pa"), at(-3 * H));
+    cat.hint(hinted);
+    await cat.sweep(roots, at(1_500));
+    assert.ok(catalogSet(cat).has(`${hinted}|105|${at(1_000)}`), "the hinted file was re-statted");
+    assert.ok(catalogSet(cat).has(`${quiet}|100|${at(-3 * H)}`), "the unhinted one was not (no polling between sweeps)");
+    assert.equal(cat.counters.hintedSweeps, 1);
+    assert.equal(cat.counters.hints, 1);
+
+    await cat.sweep(roots, at(SAFETY_SWEEP_MS + 1));
+    assert.ok(catalogSet(cat).has(`${quiet}|105|${at(1_000)}`), "the safety sweep caught it");
+    assert.equal(cat.counters.fullSweeps, 2);
+    assert.deepEqual(catalogSet(cat), await groundTruth(roots));
+  });
+
+  it("a hint for a new file in a known project dir admits it; a hint for a new project dir admits that", async () => {
+    const roots = mkRoots();
+    mkFile("pa", "s1.jsonl", 100, at(-1 * H));
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    cat.pretendEventsArmedForTests();
+
+    const p2 = mkFile("pa", "s2.jsonl", 150, at(0)); // bumps pa's mtime
+    cat.hint(p2);
+    await cat.sweep(roots, at(1_500));
+    assert.ok(catalogSet(cat).has(`${p2}|150|${at(0)}`), "new file admitted through its dir");
+
+    const p3 = mkFile("pb", "s3.jsonl", 60, at(0)); // a brand-new project dir
+    cat.hint(p3);
+    await cat.sweep(roots, at(3_000));
+    assert.ok(catalogSet(cat).has(`${p3}|60|${at(0)}`), "new project dir admitted");
+    assert.deepEqual(catalogSet(cat), await groundTruth(roots));
+  });
+
+  it("a hint under a session dir re-walks it (lanes, runs, the hot promotion)", async () => {
+    const roots = mkRoots();
+    const sid = "hinted-sess";
+    const parent = mkFile("pa", `${sid}.jsonl`, 100, at(-3 * H)); // warm parent
+    const lane = mkChild("pa", sid, "a1", 40, at(-2 * H));
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    cat.pretendEventsArmedForTests();
+
+    appendFileSync(lane, "zz");
+    touch(lane, at(1_000));
+    cat.hint(lane);
+    await cat.sweep(roots, at(1_500));
+    const got = cat.listChildren().children.find((c) => c.path === lane);
+    assert.equal(got?.size, 42, "the lane's walk saw the append");
+
+    // Child movement promoted the parent hot; the parent's own append is
+    // hinted too, as an event would.
+    appendFileSync(parent, "p");
+    touch(parent, at(2_000));
+    touch(join(base, "claude", "projects", "pa"), at(-3 * H));
+    cat.hint(parent);
+    await cat.sweep(roots, at(3_000));
+    assert.ok(catalogSet(cat).has(`${parent}|101|${at(2_000)}`));
+  });
+
+  it("a hint for a tracker re-reads the trackers; noise is dropped; too many hints force a full sweep", async () => {
+    const roots = mkRoots();
+    const p = mkFile("pa", "idle-live.jsonl", 100, at(-6 * H)); // warm by mtime
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    cat.pretendEventsArmedForTests();
+
+    mkTracker(process.pid, "idle-live", at(-1 * DAY));
+    cat.hint(join(base, "claude", "sessions", `${process.pid}.json`));
+    cat.hint(join(base, "claude", "projects", "pa", "scratch.tmp")); // noise: not a transcript
+    cat.hint("/nowhere/at/all");
+    await cat.sweep(roots, at(1_500));
+    // Live now: the next hinted sweep of the parent is unnecessary to prove
+    // liveness; instead, the next FULL sweep stats it at tick cadence.
+    appendFileSync(p, "abc");
+    touch(p, at(2_000));
+    touch(join(base, "claude", "projects", "pa"), at(-6 * H));
+    await cat.sweep(roots, at(SAFETY_SWEEP_MS + 100));
+    assert.ok(catalogSet(cat).has(`${p}|103|${at(2_000)}`), "the safety sweep found the live session's append");
+
+    const before = cat.counters.fullSweeps;
+    for (let i = 0; i < 10_001; i++) cat.hint(`/bulk/${i}`);
+    await cat.sweep(roots, at(SAFETY_SWEEP_MS + 2_000));
+    assert.equal(cat.counters.fullSweeps, before + 1, "the hint cap turned the tick into a full sweep");
+  });
+
+  it("a codex hint re-walks the codex tree", async () => {
+    const roots = mkRoots();
+    mkCodex("15", "rollout-2026-08-15T10-00-00-aaaa.jsonl", 50, at(-2 * H));
+    const cat = new DiscoveryCatalog();
+    await cat.sweep(roots, at(0));
+    cat.pretendEventsArmedForTests();
+    const p2 = mkCodex("16", "rollout-2026-08-16T10-00-00-bbbb.jsonl", 60, at(0));
+    cat.hint(p2);
+    await cat.sweep(roots, at(1_500));
+    assert.ok(catalogSet(cat).has(`${p2}|60|${at(0)}`), "new rollout admitted through the codex walk");
+    assert.deepEqual(catalogSet(cat), await groundTruth(roots));
   });
 });

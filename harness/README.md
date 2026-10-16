@@ -17,7 +17,8 @@ harness/
   lib/            Snappy compressor + leveldb writer (for the Claude Desktop
                   fixture), normalization rules, comparators, shared types
   run/            scenarios.ts (the catalog), run-scenario.ts (drive one
-                  binary), run-harness.ts (reference vs candidate + report)
+                  binary), run-harness.ts (reference vs candidate + report),
+                  measure.ts (the design-fix numbers: rusage + strace)
   golden/<os>/    committed, normalized CLI outputs per scenario step
   broken/         patches that make a candidate differ on purpose
   ci/build.sh     one binary from one source checkout, as release.yml does it
@@ -29,10 +30,12 @@ fake gateway on `127.0.0.1:48621` (and, for fortress-direct, a second one on
 `48622`), writes the binary's own `config.json`, `device-id` and
 `settings.json`, then runs the steps: `hx watch --once`, `hx status`,
 `hx doctor sync`, `hx tick`, `hx retry`, `hx backfill`, `hx reattribute`,
-`hx update`, `hx connect`, `hx disconnect`, `hx ui` with its API probed, or a
-long-running `hx watch` killed with SIGKILL. The reference runs first, then
-the candidate, both against the same home path (transcript contents embed
-their cwd, so the stored bytes must match byte for byte).
+`hx update`, `hx connect`, `hx disconnect`, `hx ui` with its API probed, a
+long-running `hx watch` killed with SIGKILL, or a long-running `hx watch` left
+to run for a fixed time (a transcript may grow while it runs) and then
+stopped with SIGTERM. The reference runs first, then the candidate, both
+against the same home path (transcript contents embed their cwd, so the
+stored bytes must match byte for byte).
 
 ### Fixture shapes
 
@@ -63,6 +66,7 @@ stat pool returned first, an order no port can be held to.
 | `readonly-state` | `~/.let/hx` is read-only | The daemon stays up and sends nothing it cannot record; writable again, it delivers everything |
 | `retry-all` | an outage, then `hx retry --all` | Backoffs clear and one foreground pass runs |
 | `fortress-direct` | a fortress-direct route | Session bytes go to the second gateway with the capability token; sidecars and child lanes stay on the cloud gateway |
+| `daemon-backoff` | a held vault, every workflow upload 503, a transcript grows 12 s in | The long-running daemon for 50 s then SIGTERM: held sessions retry on their 20 s backoff, the workflow sidecar retries on its own backoff (77.12) instead of every tick, the stuck line is logged once per hold, the grown transcript uploads within the run (file events or polling, never a fresh process's first sweep), and `hx status` reads a current snapshot after the stop |
 | `paused`, `excluded` | settings | Pause/resume; the personal gate and an exclude rule |
 
 Fault scenarios run with `tuning.uploadConcurrency: 1`, so which file hits a
@@ -73,9 +77,11 @@ fault first is not a race.
 | Surface | Rule |
 | --- | --- |
 | Stored bytes | Every canonical object (parent sessions, agent lanes, per destination) and every sidecar: size and sha256, exact |
-| Requests | Per step, per session: the sequence of method, path, query, headers and body (the signed PUT by size and sha256). Requests that belong to no session per endpoint. Batch endpoints (`verify`, `reattribute`, `retitle`) as sorted multisets of their items. `sync-status`: the last snapshot of a step. `heartbeat`: present or not |
+| Requests | Per step, per session: the sequence of method, path, query, headers and body (the signed PUT by size and sha256). Requests that belong to no session per endpoint. Batch endpoints (`verify`, `reattribute`, `retitle`) as sorted multisets of their items. `sync-status`: the last snapshot of a step. `heartbeat`: present or not. In a long-running daemon step (`watch-for`), a REFUSED workflow upload (5xx) leaves the sequence and is compared as presence per run: since 77.12 the client retries it on a backoff, so how many attempts a run has time for is timing; the first refusal is the fact |
 | `state.json`, `activity.jsonl`, `config.json`, `settings.json`, `org-names.json` | Normalized deep equality; `activity.jsonl` as a multiset |
-| CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes) |
+| `state.journal.jsonl` | Empty or absent at the end of every run (candidate and reference alike): the offsets journal (77.12) is folded into `state.json` at every exit that is not a kill, so the compared `state.json` is current and no reader that ignores the journal is stale |
+| `ccd-index.json` | The saved Claude Desktop index (77.12), normalized, when the reference writes one; a reference that predates it says nothing about the candidate, a candidate that drops it while the reference writes it fails |
+| CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes; for a long-running daemon step the SET of distinct lines, with the per-tick `uploaded=`/`failed=` counters summed over the run and the pass-level backoff's length masked — which tick a session's retry lands in follows the clock, and the backoff doubles once per failing tick in a row) |
 | `hx ui` | Every probe's status and normalized JSON |
 | Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); Codex titles come from `state_5.sqlite`; every discovered session reached the store |
 | Coverage | All 24 calls of the protocol appear in the reference recording |
@@ -85,9 +91,33 @@ Normalization (`lib/normalize.ts`) hides exactly: the candidate's name (`hx2`
 each binary's version string, run-relative timestamps (compared with a
 per-scenario tolerance; the fixed content timestamps are compared exactly),
 the connection probe's latency/throughput/grade, the fixture home and work
-paths, local ports, pids and launch tokens. Object key order is not compared
-either: the client adds a top-level key to `state.json` when it first records
-that kind of fact, so the order follows which session it ingested first.
+paths, local ports, pids and launch tokens, and the two numbers in the stuck
+line (`waiting out a retry backoff for another <n> min (<n> consecutive
+failures`): the countdown is measured against the moment the tick ran and the
+failure count climbs with every retry a run had time for, so both follow
+timing — the reason and the hold it names are the fact. Object key order is
+not compared either: the client adds a top-level key to `state.json` when it
+first records that kind of fact, so the order follows which session it
+ingested first.
+
+### Contracts taught for the 77.12 design fixes
+
+Each rule above that names 77.12 was added when the fix it covers made the
+harness fail against the 77.11 reference, and says what the fix changed on
+purpose. Everything else the fixes touched — the offsets journal, the saved
+index, file events as hints, the lane and workflow gates — left every compared
+surface identical: stored bytes, request sequences, `state.json`,
+`activity.jsonl`, CLI output and the `hx ui` API.
+
+| Fix | What a server, a person or the UI can see | Rule |
+| --- | --- | --- |
+| Offsets journal (`state.journal.jsonl`) | Nothing: readers replay it; every exit folds it | `state.journal.jsonl` empty or absent at run end |
+| Lane and workflow gates | Nothing: an unchanged lane or run made no request before either | none |
+| Workflow upload backoff | Fewer refused `/sessions/workflow` attempts during an outage; a 404/401/403 now pauses the lane like the child lanes | refused workflow uploads compared as presence per run in `watch-for` steps |
+| Stuck-line dedupe key | One `[stuck]` line per hold instead of one per countdown minute | daemon stdout as distinct lines; the stuck line's numbers masked |
+| (not a fix) the daemon's clock | The held sessions' retries land in two ticks whose split varies run to run, so the per-tick counters and the pass-level backoff length vary with them — found by the candidate-vs-itself jobs of the first run | per-tick counters summed, backoff length masked, in daemon steps |
+| Saved Claude Desktop index (`ccd-index.json`) | A new cache file in `~/.let/hx` | compared when the reference writes it |
+| File events as hints | Nothing, unless watching fails: one `[hx] file events unavailable (…)` line | none (a failure to arm shows up as a diff, which is the point) |
 
 ### Goldens
 
@@ -115,6 +145,15 @@ reference against the candidate, and the reference against three
 deliberately broken candidates with `--expect fail` (a 3 MiB chunk, a dropped
 trailing newline per chunk, a dropped `titleSource` in commit metadata).
 
+A fourth job, `measure`, runs `harness/run/measure.ts` with both binaries
+on each OS and attaches `measurements.json` and `measurements.md`: disk
+writes per one-shot pass and per 45 s of daemon with a 5 MB state and growing
+transcripts, file checks per second of an idle daemon under `strace -c`
+(Linux), its CPU and RSS, refused workflow uploads and `[stuck]` lines in the
+`daemon-backoff` run, and (macOS) the second pass over 10,000 Claude Desktop
+files. Every number is the operating system's view of the process (rusage,
+strace); nothing is instrumented inside the binary.
+
 To test any binary — an hx2 release asset, say — start the workflow by hand
 (`Actions › Differential harness › Run workflow`) with `candidate_url_linux`
 and `candidate_url_macos` pointing at the gzipped binaries and
@@ -126,6 +165,7 @@ The entry points, for a CI job or a dedicated machine:
 bun harness/run/run-harness.ts --reference <bin> --candidate <bin> [--candidate-name hx2] \
     [--scenarios all|a,b] [--out harness-out] [--expect pass|fail] [--goldens harness/golden/Linux]
 bun harness/run/run-scenario.ts --binary <bin> --scenario baseline --out <dir>
+bun harness/run/measure.ts --reference <bin> --candidate <bin> --out measure-out
 bun harness/fixtures/gen-home.ts --out <home> --shape small --seed s
 bun test harness
 ```
@@ -148,7 +188,10 @@ Add an entry to `run/scenarios.ts`: a shape, a seed, an initial gateway
 configuration, steps. Step kinds: `run` (the binary with arguments),
 `gateway` / `fortress` (change faults, routes, tombstones at run time),
 `gateway-stop` / `gateway-start`, `watch-kill` (SIGKILL after N composed
-chunks), `ui` (start `hx ui` and probe its API), `chmod-hx-dir`, `grow`
-(append to a transcript), `settings`. Placeholders `<SELF>`, `<SELF+1>`,
+chunks), `watch-for` (run the daemon for a fixed time, optionally growing a
+transcript part-way, then SIGTERM), `ui` (start `hx ui` and probe its API),
+`chmod-hx-dir`, `grow` (append to a transcript), `settings`. Gateway faults:
+`outageStatus` (every call), `workflowStatus` (`POST /sessions/workflow`
+only), `heldVaults`, `vault503`, `tombstones`, `putDelayMs`. Placeholders `<SELF>`, `<SELF+1>`,
 `<FORTRESS>` and `<SESSION:n>` resolve at run time. Nothing in a fixture may
 come from a real machine: hx is a public repository.

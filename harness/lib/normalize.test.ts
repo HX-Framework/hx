@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { deepDiff } from "./compare.js";
+import { deepDiff, foldDaemonTicks } from "./compare.js";
 import { DEFAULT_WINDOW_AFTER_MS, DEFAULT_WINDOW_BEFORE_MS, normalizeJson, normalizeText, type NormalizeContext } from "./normalize.js";
 
 const anchor = Date.UTC(2026, 9, 15, 19, 0, 0);
@@ -52,5 +52,24 @@ describe("normalizeText", () => {
     expect(normalizeText("Connection: up — Excellent (1 ms, 212.4 MB/s)", ctx())).toBe("Connection: up — <quality> (<latency>, <rate>)");
     // A 4xx names a real per-file fault and keeps its file.
     expect(normalizeText("[error] /tmp/home/x/a.jsonl: commit failed: 400 bad", ctx())).toContain("<HOME>/x/a.jsonl: commit failed: 400");
+  });
+});
+
+describe("foldDaemonTicks", () => {
+  it("sums the per-tick counters and masks the pass-level backoff length", () => {
+    const run = (ticks: number[], backoffs: number[]): string[] =>
+      foldDaemonTicks([
+        "<stamp> [hx] tick uploaded=8 failed=12",
+        ...ticks.map((f) => `<stamp> [hx] tick uploaded=0 failed=${f}`),
+        ...backoffs.map((s) => `<stamp> [hx] uploads not progressing; backing off ${s}s`),
+        "<stamp> [hx] uploads recovered; resuming normal cadence",
+      ]);
+    // The same 11 retries, split 5+6 in one run and 7+4 in another.
+    expect(new Set(run([5, 6], [5, 10]))).toEqual(new Set(run([7, 4], [5, 10])));
+    expect(run([5, 6], [5, 10])).toContain("[hx] ticks: uploaded=8 failed=23");
+    expect(run([5, 6], [5, 10])).toContain("<stamp> [hx] uploads not progressing; backing off <n>s");
+    expect(run([5, 6], [5, 10])).not.toContain("<stamp> [hx] tick uploaded=8 failed=12");
+    // A run with no tick lines gets no synthetic line.
+    expect(foldDaemonTicks(["<stamp> [hx] watching data roots: ~/.claude"])).toEqual(["<stamp> [hx] watching data roots: ~/.claude"]);
   });
 });

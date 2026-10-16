@@ -43,7 +43,7 @@ import {
 import { formatOutage, needsAttention, type SyncLedger } from "./ledger.js";
 import { collapseHome, isPaused, readSettings, writeSettings, type HxSettings } from "./settings.js";
 import { resolveDataRoots, type ResolvedRoots } from "./roots.js";
-import { flushStateIfDirty, loadState, resetStateCache } from "./state.js";
+import { checkpointState, loadState, resetStateCache } from "./state.js";
 import { daemonAction, disconnectDevice, retryBlocked } from "./maintenance.js";
 import { checkForUpdate } from "./update.js";
 import { watch as watchDir } from "node:fs";
@@ -439,11 +439,11 @@ async function cmdWatch(): Promise<void> {
       log("\n[hx] stopping…");
       main.stop();
       local?.stop();
-      // Give coalesced state its best-effort parting flush before exiting —
-      // this handler exits synchronously otherwise, so the flush the once-
-      // handler in state.ts started would never get its microtasks. Bounded:
-      // allSettled never rejects, and both scopes are usually clean.
-      void Promise.allSettled([flushStateIfDirty("main"), flushStateIfDirty("local")]).finally(
+      // Fold the journal into the snapshot before exiting — this handler exits
+      // synchronously otherwise, so the checkpoint the once-handler in state.ts
+      // started would never get its microtasks. Bounded: allSettled never
+      // rejects, and both scopes are usually clean.
+      void Promise.allSettled([checkpointState("main"), checkpointState("local")]).finally(
         () => process.exit(0),
       );
     });
@@ -511,9 +511,9 @@ async function cmdBackfill(): Promise<void> {
 // gained a new org rule, without waiting for a version bump.
 //
 // REFUSES while the daemon is running: state.json is process-cached and
-// written whole (see state.ts), so a second process sweeping alongside the
-// daemon would clobber its in-flight upload offsets — a regressed offset means
-// re-uploaded bytes at best. The daemon already sweeps on every start, so the
+// written whole at every checkpoint (see state.ts), so a second process
+// sweeping alongside the daemon would clobber its in-flight upload offsets — a
+// regressed offset means re-uploaded bytes at best. The daemon already sweeps on every start, so the
 // restart path is both the safe and the natural trigger.
 async function cmdReattribute(force: boolean): Promise<void> {
   const cfg = await ensureConfig();

@@ -87,6 +87,10 @@ export function normalizeText(input: string, ctx: NormalizeContext): string {
   // Which file the client tried first against a refusing gateway follows
   // discovery order; the refusal itself is the fact.
   s = s.replace(/\[error\] \S+\.jsonl: ([a-z-]+(?: [a-z-]+)* failed: 5\d\d\b)/g, "[error] <a transcript>: $1");
+  // The stuck line's countdown is measured against the moment the tick ran,
+  // and its failure count climbs with every retry the run had time for:
+  // both follow timing. The reason — and the hold it names — is the fact.
+  s = s.replace(/waiting out a retry backoff for another \d+ min \(\d+ consecutive failures/g, "waiting out a retry backoff for another <n> min (<n> consecutive failures");
   // Daemon pids, launch tokens, session tokens, sha prefixes.
   s = s.replace(/\bpid \d+/g, "pid <n>");
   s = s.replace(/#k=[A-Za-z0-9_-]+/g, "#k=<token>");

@@ -114,6 +114,20 @@ function writeHxFile(home: string, name: string, content: string): void {
   writeFileSync(join(dir, name), content, { mode: 0o600 });
 }
 
+/** The binary's own files for a fixture home: connected to `cloud`, a fixed
+ *  device id, the scenario's settings. Shared with the measurement runner. */
+export function writeClientFiles(home: string, cloud: FakeGateway, gatewayUrl: string, settings: Record<string, unknown>): void {
+  writeHxFile(home, "config.json", JSON.stringify({ gatewayBaseUrl: gatewayUrl, accessToken: cloud.config.accessToken, userId: cloud.config.userId, deviceName: cloud.config.deviceName }, null, 2));
+  writeHxFile(home, "device-id", DEVICE_ID);
+  writeHxFile(home, "settings.json", JSON.stringify(settings, null, 2));
+}
+
+/** The environment a binary runs with against a fixture home. Shared with
+ *  the measurement runner. */
+export function clientEnv(home: string, gateway?: { url: string; token: string }): Record<string, string> {
+  return baseEnv(home, gateway);
+}
+
 export async function runScenario(o: DriverOptions): Promise<RunMeta> {
   const log = o.log ?? ((l: string) => process.stderr.write(`${l}\n`));
   const { scenario } = o;
@@ -148,9 +162,7 @@ export async function runScenario(o: DriverOptions): Promise<RunMeta> {
   const gatewayUrl = cloud.start(CLOUD_PORT);
 
   // The binary's own files: connected to the cloud gateway, a fixed device id.
-  writeHxFile(o.home, "config.json", JSON.stringify({ gatewayBaseUrl: gatewayUrl, accessToken: cloud.config.accessToken, userId: cloud.config.userId, deviceName: cloud.config.deviceName }, null, 2));
-  writeHxFile(o.home, "device-id", DEVICE_ID);
-  writeHxFile(o.home, "settings.json", JSON.stringify(scenario.settings ?? {}, null, 2));
+  writeClientFiles(o.home, cloud, gatewayUrl, scenario.settings ?? {});
 
   const env = baseEnv(o.home, { url: gatewayUrl, token: cloud.config.accessToken });
   const steps: StepRecord[] = [];
@@ -195,7 +207,7 @@ export async function runScenario(o: DriverOptions): Promise<RunMeta> {
   } catch {
     // never made read-only
   }
-  for (const f of ["state.json", "activity.jsonl", "config.json", "org-names.json", "settings.json", "stdout.log", "stderr.log", "watch-run.json", "watch-exits.json"]) {
+  for (const f of ["state.json", "state.journal.jsonl", "state.local.journal.jsonl", "ccd-index.json", "activity.jsonl", "config.json", "org-names.json", "settings.json", "stdout.log", "stderr.log", "watch-run.json", "watch-exits.json"]) {
     const p = join(hxDir, f);
     if (existsSync(p)) cpSync(p, join(o.outDir, f));
   }
@@ -279,37 +291,38 @@ async function runStep(step: Step, c: StepCtx): Promise<void> {
     case "chmod-hx-dir":
       chmodSync(join(c.home, ".let", "hx"), step.mode);
       return;
-    case "grow": {
-      const s = c.manifest.sessions[step.sessionIndex];
-      if (!s) throw new Error(`manifest has no session ${step.sessionIndex}`);
-      const first = readFileSync(s.path, "utf8").split("\n")[0] ?? "{}";
-      const head = JSON.parse(first) as { cwd?: string; entrypoint?: string; gitBranch?: string };
-      const rng = new Prng(`grow:${c.scenario.name}:${step.name}`);
-      const lines: string[] = [];
-      let bytes = 0;
-      let i = 0;
-      while (bytes < step.bytes) {
-        const line = JSON.stringify({
-          parentUuid: null,
-          isSidechain: false,
-          userType: "external",
-          cwd: head.cwd,
-          sessionId: s.sessionId,
-          version: "2.1.0",
-          gitBranch: head.gitBranch,
-          entrypoint: head.entrypoint,
-          type: i % 2 === 0 ? "user" : "assistant",
-          message: { role: i % 2 === 0 ? "user" : "assistant", content: [{ type: "text", text: rng.paragraph(200) }] },
-          uuid: rng.uuid(),
-          timestamp: new Date(Date.UTC(2026, 0, 6, 12, i, 0)).toISOString(),
-        });
-        lines.push(line);
-        bytes += line.length + 1;
-        i += 1;
+    case "grow":
+      growSession(c, step.sessionIndex, step.bytes, `grow:${c.scenario.name}:${step.name}`);
+      return;
+    case "watch-for": {
+      const proc = Bun.spawn([c.binary, "watch"], { env: c.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+      const out = new Response(proc.stdout).text();
+      const err = new Response(proc.stderr).text();
+      const started = Date.now();
+      let grown = false;
+      while (Date.now() - started < step.durationMs && proc.exitCode === null && proc.signalCode === null) {
+        if (step.grow && !grown && Date.now() - started >= step.grow.atMs) {
+          growSession(c, step.grow.sessionIndex, step.grow.bytes, `grow:${c.scenario.name}:${step.name}`);
+          grown = true;
+        }
+        await new Promise((r) => setTimeout(r, 50));
       }
-      appendFileSync(s.path, `${lines.join("\n")}\n`);
-      const t = new Date();
-      utimesSync(s.path, t, t);
+      const exitedEarly = proc.exitCode !== null || proc.signalCode !== null;
+      if (!exitedEarly) proc.kill("SIGTERM");
+      const stopDeadline = Date.now() + (step.stopTimeoutMs ?? 15_000);
+      while (Date.now() < stopDeadline && proc.exitCode === null && proc.signalCode === null) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+      const exitCode = await proc.exited;
+      const [stdout, stderr] = await Promise.all([out, err]);
+      writeFileSync(`${c.stepFile}.stdout`, stdout);
+      writeFileSync(`${c.stepFile}.stderr`, stderr);
+      writeFileSync(`${c.stepFile}.code`, `${proc.signalCode ? `signal ${proc.signalCode}` : exitCode}\n`);
+      c.rec.exitCode = proc.signalCode ? null : exitCode;
+      c.rec.signal = proc.signalCode ?? null;
+      if (exitedEarly) throw new Error(`the daemon exited on its own after ${Math.round((Date.now() - started) / 1000)} s (${proc.signalCode ?? exitCode})`);
+      if (step.grow && !grown) throw new Error("the run ended before the grow step");
       return;
     }
     case "watch-kill": {
@@ -343,6 +356,49 @@ async function runStep(step: Step, c: StepCtx): Promise<void> {
     case "ui":
       return runUiStep(step.port, c);
   }
+}
+
+/** Append generated transcript lines to a fixture session (the `grow` step
+ *  and the mid-run grow of `watch-for`): deterministic from `seedName`, so
+ *  both binaries see the same bytes. */
+function growSession(c: StepCtx, sessionIndex: number, bytes: number, seedName: string): void {
+  const s = c.manifest.sessions[sessionIndex];
+  if (!s) throw new Error(`manifest has no session ${sessionIndex}`);
+  appendTranscriptLines(s.path, s.sessionId, bytes, seedName);
+}
+
+/** Append about `bytes` of generated Claude Code events to a transcript,
+ *  deterministic from `seedName`, and move its mtime to now. */
+export function appendTranscriptLines(transcriptPath: string, sessionId: string, bytes: number, seedName: string): number {
+  const first = readFileSync(transcriptPath, "utf8").split("\n")[0] ?? "{}";
+  const head = JSON.parse(first) as { cwd?: string; entrypoint?: string; gitBranch?: string };
+  const rng = new Prng(seedName);
+  const lines: string[] = [];
+  let total = 0;
+  let i = 0;
+  while (total < bytes) {
+    const line = JSON.stringify({
+      parentUuid: null,
+      isSidechain: false,
+      userType: "external",
+      cwd: head.cwd,
+      sessionId,
+      version: "2.1.0",
+      gitBranch: head.gitBranch,
+      entrypoint: head.entrypoint,
+      type: i % 2 === 0 ? "user" : "assistant",
+      message: { role: i % 2 === 0 ? "user" : "assistant", content: [{ type: "text", text: rng.paragraph(200) }] },
+      uuid: rng.uuid(),
+      timestamp: new Date(Date.UTC(2026, 0, 6, 12, i, 0)).toISOString(),
+    });
+    lines.push(line);
+    total += line.length + 1;
+    i += 1;
+  }
+  appendFileSync(transcriptPath, `${lines.join("\n")}\n`);
+  const t = new Date();
+  utimesSync(transcriptPath, t, t);
+  return total;
 }
 
 // ── hx ui: start the server, exchange the launch token, probe the API ──────

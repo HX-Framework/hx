@@ -1,8 +1,10 @@
 // ~/.let/hx/state.json holds per-file upload offsets.
 //
 // On every successful chunk-commit we bump the offset for that file. On
-// startup we restore offsets and skip already-uploaded bytes. A JSON file
-// (atomic write via rename) is the right primitive — no native deps, no
+// startup we restore offsets and skip already-uploaded bytes. A JSON snapshot
+// (atomic write via rename) plus an append-only journal beside it
+// (state.journal.jsonl, folded into the snapshot at checkpoints — see the
+// persistence section below) is the right primitive — no native deps, no
 // concurrent writers (a single hx process owns it).
 //
 // State is scoped per upload lane: the regular gateway's offsets live in
@@ -11,7 +13,7 @@
 // gateway has its own "how many bytes of this file do you already hold"
 // truth, so the lanes must never share offsets or artifact hashes.
 
-import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
+import { appendFile, readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { HX_DIR } from "./hx-home.js";
@@ -281,7 +283,7 @@ export async function recordDestinationUploadError(
 ): Promise<void> {
   const state = await loadState(scope);
   applyDestinationUploadError(state, key, code, Date.now());
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, { dest: key });
 }
 
 export async function clearDestinationUploadError(
@@ -292,8 +294,11 @@ export async function clearDestinationUploadError(
   // Flush-through in both modes: this clear ends a destination failure run
   // right after a successful commit — losing it to a hard kill would leave a
   // phantom "failing" row in `hx status --detailed` until the NEXT commit to
-  // that destination. Transition-gated, so the extra write is rare.
-  if (applyDestinationUploadSuccess(state, key)) await persistThrough(state, scope);
+  // that destination. Transition-gated, so the extra line is rare.
+  if (applyDestinationUploadSuccess(state, key)) {
+    const record = state.destinations?.[key];
+    if (record) await journalThrough(scope, [{ t: "dest", key, record }]);
+  }
 }
 
 /** One destination as the gateway just described it, narrowed to what we keep. */
@@ -357,7 +362,7 @@ export async function recordDestinations(
 ): Promise<void> {
   const state = await loadState(scope);
   if (applyDestinationReports(state, reports, Date.now())) {
-    await persistOrMark(state, scope);
+    await persistOrMark(state, scope, { dests: reports.map((r) => destKey(r.vaultOrgId)) });
   }
 }
 
@@ -410,52 +415,270 @@ const STATE_FILE: Record<StateScope, string> = {
   main: "state.json",
   local: "state.local.json",
 };
+/** The offsets journal beside each snapshot: one JSON line per durable
+ *  mutation, folded into the snapshot at a checkpoint (see below). */
+const JOURNAL_FILE: Record<StateScope, string> = {
+  main: "state.journal.jsonl",
+  local: "state.local.journal.jsonl",
+};
 
 const inMemory = new Map<StateScope, HxState>();
 const writeChains = new Map<StateScope, Promise<void>>();
 
-// ── Coalesced persistence (daemon-only opt-in) ──────────────────────────────
+// ── Persistence: a snapshot plus an append-only journal ─────────────────────
 //
-// Default mode is FLUSH-THROUGH: every mutator awaits a full persist before
-// returning — exactly the historical behavior, and what every one-shot or
-// cross-process writer (`hx retry`, `hx backfill`, the UI server's actions,
-// `hx tick`, `watch --once`) must keep, since none of them has any later
-// flush point.
+// state.json is a SNAPSHOT of the whole state. Until 77.11 every durable
+// mutation rewrote it whole, so a committed chunk's new offset cost one write
+// of the entire file — 5 MB on a busy laptop, 40–110 MB of disk writes per
+// active minute. A durable mutation now APPENDS one JSON line to the journal
+// beside the snapshot, and the snapshot is rewritten only at a CHECKPOINT:
+// when the journal outgrows CHECKPOINT_JOURNAL_BYTES, every
+// CHECKPOINT_INTERVAL_MS while anything is journaled, when the daemon stops
+// (stop(), SIGTERM/SIGINT, the watchdog exit), and at the end of every
+// one-shot pass, so `hx tick`, `watch --once` and the maintenance commands
+// leave an empty journal behind them. A checkpoint writes the snapshot (tmp +
+// rename, as before) and then truncates the journal, both on the per-scope
+// write chain the appends use, so no line is ever folded and truncated out of
+// order with the append that wrote it.
 //
-// The long-running watch loop arms COALESCED mode for its scope
-// (armCoalescedPersistence, from startWatch, never for one-shot runs). In that
-// mode, high-churn bookkeeping writes (mtime touches, destination registry,
-// backoff stamps, artifact hashes) only mark the scope dirty; the daemon
-// flushes at its own points (end of every pass + a periodic timer + after
-// every chunk commit via the flush-through mutators below). What a hard kill
-// can lose is therefore only records that re-derive on the next pass — never
-// a committed-byte offset and never a post-success status clear:
-// `setOffsetFor` and the three transition clears (`clearFileFailure`,
-// `clearDestinationUploadError`, `clearHeal`) stay flush-through in BOTH
-// modes, so offset durability and status-latch clearing keep today's
-// per-commit window on every platform, hard-kill Windows and containers
-// included.
+// Every reader (loadState) replays the journal over the snapshot, so `hx
+// status`, `hx doctor` and the UI server see a committed offset as soon as
+// the daemon has appended it — as they saw it when the daemon rewrote the
+// whole file. A journal entry SETS one record (a whole file entry, a
+// destination record, an artifact hash, a chunk cap, the tombstone map), so
+// replaying a line a checkpoint already folded is harmless, and a torn
+// trailing line (a reader racing an append) is skipped.
+//
+// What is journaled, and when:
+//   • the flush-through mutators — setOffsetFor and the three transition
+//     clears (clearFileFailure, clearDestinationUploadError, clearHeal) —
+//     append their record before returning, in EVERY mode: a committed-byte
+//     offset is durable before the next fan-out step, as it always was. A
+//     vault-routed or fortress-direct canonical has no divergence heal, so a
+//     lost offset there would mean silently duplicated bytes after a hard
+//     kill — the one crash-loss class this file could create;
+//   • in COALESCED mode (the long-running daemon loop opts in through
+//     armCoalescedPersistence) the high-churn bookkeeping mutators — mtime
+//     touches, the destination registry, backoff stamps, artifact hashes —
+//     only mark their record dirty; flushStateIfDirty (end of every pass, a
+//     5 s timer) appends one line per dirty record;
+//   • in the default FLUSH-THROUGH mode (every one-shot and cross-process
+//     writer: `hx retry`, `hx backfill`, the UI server's actions, `hx tick`,
+//     `watch --once`) those mutators still write the whole snapshot at once,
+//     as they always did — none of them has a later flush point, and the
+//     snapshot must be current when they exit;
+//   • whole-state mutations (a lane flip's offset zeroing, the roots stamp,
+//     the start-of-daemon prune and backoff clears) checkpoint directly.
 const coalescedScopes = new Set<StateScope>();
-const dirtyScopes = new Set<StateScope>();
 
-// Best-effort POSIX flush-on-signal (SIGTERM from systemd/launchd stop, SIGINT
-// from a foreground Ctrl-C). Never load-bearing — Windows and `docker stop`'s
-// SIGKILL get no signal at all, which is why offsets and the transition clears
-// are flush-through in the first place. After flushing, the signal is
-// RE-RAISED (the `once` handler is gone by then) so the process's observable
-// exit — default termination, or cmdWatch's own SIGINT handler — is exactly
-// what it is today; this handler only borrows the beat before it.
+/** How often a daemon folds its journal into the snapshot while anything is
+ *  journaled, and the journal size that forces a fold sooner. */
+export const CHECKPOINT_INTERVAL_MS = 10 * 60_000;
+export const CHECKPOINT_JOURNAL_BYTES = 4 * 1024 * 1024;
+let checkpointPolicy = { intervalMs: CHECKPOINT_INTERVAL_MS, journalBytes: CHECKPOINT_JOURNAL_BYTES };
+
+/** Test seam — shrink the checkpoint interval or size bound (null restores
+ *  the defaults). Production code never calls this. */
+export function setCheckpointPolicyForTests(policy: { intervalMs?: number; journalBytes?: number } | null): void {
+  checkpointPolicy = {
+    intervalMs: policy?.intervalMs ?? CHECKPOINT_INTERVAL_MS,
+    journalBytes: policy?.journalBytes ?? CHECKPOINT_JOURNAL_BYTES,
+  };
+}
+
+/** One line of the journal: a SET of one record. Idempotent on replay. */
+export type JournalEntry =
+  | { t: "file"; path: string; state: FileState }
+  | { t: "dest"; key: string; record: DestinationRecord }
+  | { t: "artifact"; key: string; hash: string }
+  | { t: "chunkCap"; key: string; cap: number }
+  | { t: "deletedSessions"; map: Record<string, number> };
+
+/** Apply one journal line to a state object. Returns false for a line this
+ *  binary does not understand (a newer kind), which the replay skips. */
+export function applyJournalEntry(state: HxState, e: JournalEntry): boolean {
+  switch (e.t) {
+    case "file":
+      if (!e.path || !e.state || typeof e.state !== "object") return false;
+      state.files[e.path] = migrateFileState(e.state as LegacyFileState);
+      return true;
+    case "dest":
+      if (!e.key || !e.record) return false;
+      (state.destinations ??= {})[e.key] = e.record;
+      return true;
+    case "artifact":
+      if (!e.key || typeof e.hash !== "string") return false;
+      (state.artifacts ??= {})[e.key] = e.hash;
+      return true;
+    case "chunkCap":
+      if (!e.key || typeof e.cap !== "number") return false;
+      (state.chunkCaps ??= {})[e.key] = e.cap;
+      return true;
+    case "deletedSessions":
+      if (!e.map || typeof e.map !== "object") return false;
+      state.deletedSessions = e.map;
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** Replay a journal text over a state object. Pure over the text, so the
+ *  torn-line and unknown-kind rules are unit-tested without a filesystem. */
+export function replayJournalText(
+  state: HxState,
+  text: string,
+): { entries: number; skipped: number } {
+  let entries = 0;
+  let skipped = 0;
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    let e: JournalEntry;
+    try {
+      e = JSON.parse(line) as JournalEntry;
+    } catch {
+      skipped += 1; // a torn trailing line, or garbage — never a reason to fail the load
+      continue;
+    }
+    if (applyJournalEntry(state, e)) entries += 1;
+    else skipped += 1;
+  }
+  return { entries, skipped };
+}
+
+// Per-scope journal bookkeeping: how many bytes the journal holds (0 = empty
+// or absent) and when the snapshot was last written or loaded.
+interface JournalMeta {
+  bytes: number;
+  lastCheckpointAtMs: number;
+}
+const journals = new Map<StateScope, JournalMeta>();
+function journalMeta(scope: StateScope): JournalMeta {
+  let m = journals.get(scope);
+  if (!m) {
+    m = { bytes: 0, lastCheckpointAtMs: Date.now() };
+    journals.set(scope, m);
+  }
+  return m;
+}
+
+// Dirty records in coalesced mode, by kind: what the next flush point journals.
+interface DirtySet {
+  /** A whole-state mutation is pending (lane flip, start-of-daemon clears):
+   *  the next flush is a checkpoint. */
+  all: boolean;
+  files: Set<string>;
+  dests: Set<string>;
+  artifacts: Set<string>;
+  chunkCaps: Set<string>;
+  deletedSessions: boolean;
+}
+const dirty = new Map<StateScope, DirtySet>();
+function dirtyFor(scope: StateScope): DirtySet {
+  let d = dirty.get(scope);
+  if (!d) {
+    d = { all: false, files: new Set(), dests: new Set(), artifacts: new Set(), chunkCaps: new Set(), deletedSessions: false };
+    dirty.set(scope, d);
+  }
+  return d;
+}
+function isDirty(d: DirtySet): boolean {
+  return d.all || d.files.size > 0 || d.dests.size > 0 || d.artifacts.size > 0 || d.chunkCaps.size > 0 || d.deletedSessions;
+}
+function clearDirty(d: DirtySet): void {
+  d.all = false;
+  d.files.clear();
+  d.dests.clear();
+  d.artifacts.clear();
+  d.chunkCaps.clear();
+  d.deletedSessions = false;
+}
+
+type DirtyMark =
+  | "all"
+  | { file?: string; dest?: string; dests?: string[]; artifact?: string; chunkCap?: string; deletedSessions?: true };
+
+function markDirty(scope: StateScope, mark: DirtyMark): void {
+  const d = dirtyFor(scope);
+  if (mark === "all") {
+    d.all = true;
+    return;
+  }
+  if (mark.file !== undefined) d.files.add(mark.file);
+  if (mark.dest !== undefined) d.dests.add(mark.dest);
+  for (const k of mark.dests ?? []) d.dests.add(k);
+  if (mark.artifact !== undefined) d.artifacts.add(mark.artifact);
+  if (mark.chunkCap !== undefined) d.chunkCaps.add(mark.chunkCap);
+  if (mark.deletedSessions) d.deletedSessions = true;
+}
+
+/** The journal lines for every dirty record, read from the live state. */
+function collectDirtyEntries(state: HxState, d: DirtySet): JournalEntry[] {
+  const out: JournalEntry[] = [];
+  for (const p of d.files) {
+    const fs = state.files[p];
+    if (fs) out.push({ t: "file", path: p, state: fs });
+  }
+  for (const k of d.dests) {
+    const record = state.destinations?.[k];
+    if (record) out.push({ t: "dest", key: k, record });
+  }
+  for (const k of d.artifacts) {
+    const hash = state.artifacts?.[k];
+    if (hash !== undefined) out.push({ t: "artifact", key: k, hash });
+  }
+  for (const k of d.chunkCaps) {
+    const cap = state.chunkCaps?.[k];
+    if (cap !== undefined) out.push({ t: "chunkCap", key: k, cap });
+  }
+  if (d.deletedSessions) out.push({ t: "deletedSessions", map: state.deletedSessions ?? {} });
+  return out;
+}
+
+/** Re-mark the records of entries whose write failed, so the next flush
+ *  point retries them instead of stranding the in-memory mutations. */
+function remarkEntries(scope: StateScope, entries: JournalEntry[]): void {
+  for (const e of entries) {
+    if (e.t === "file") markDirty(scope, { file: e.path });
+    else if (e.t === "dest") markDirty(scope, { dest: e.key });
+    else if (e.t === "artifact") markDirty(scope, { artifact: e.key });
+    else if (e.t === "chunkCap") markDirty(scope, { chunkCap: e.key });
+    else markDirty(scope, { deletedSessions: true });
+  }
+}
+
+// Best-effort POSIX fold-on-signal (SIGTERM from systemd/launchd stop, SIGINT
+// from a foreground Ctrl-C): every armed scope checkpoints, so the next start
+// reads a current snapshot and an empty journal. Never load-bearing — Windows
+// and `docker stop`'s SIGKILL get no signal at all, which is why committed
+// offsets are journaled before the next step in the first place. After
+// flushing, the signal is RE-RAISED (the `once` handler is gone by then) so
+// the process's observable exit — default termination, or cmdWatch's own
+// SIGINT handler — is exactly what it is today; this handler only borrows the
+// beat before it. Other modules hook the same beat through
+// registerPartingFlush (the Claude Desktop index save, see ccd.ts).
 let signalFlushInstalled = false;
+const partingFlushers: Array<() => Promise<unknown>> = [];
 function installSignalFlush(): void {
   if (signalFlushInstalled || process.platform === "win32") return;
   signalFlushInstalled = true;
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
     process.once(sig, () => {
-      void Promise.allSettled([...dirtyScopes].map((s) => flushStateIfDirty(s))).finally(() => {
+      void Promise.allSettled([
+        ...[...coalescedScopes].map((s) => checkpointState(s)),
+        ...partingFlushers.map((f) => f()),
+      ]).finally(() => {
         process.kill(process.pid, sig);
       });
     });
   }
+}
+
+/** Run `fn` in the daemon's parting flush (the signal handler above). Only
+ *  the long-running loop arms that handler, so a registration from a
+ *  one-shot process is inert. */
+export function registerPartingFlush(fn: () => Promise<unknown>): void {
+  partingFlushers.push(fn);
 }
 
 /** Arm coalesced persistence for one scope — the long-running daemon loop
@@ -471,52 +694,108 @@ export function disarmCoalescedPersistence(scope: StateScope): void {
   coalescedScopes.delete(scope);
 }
 
-/** Persist now (flush-through), or — in coalesced mode — mark the scope dirty
- *  and return immediately. The daemon's flush points pick dirty scopes up. */
-function persistOrMark(state: HxState, scope: StateScope): Promise<void> {
+/** Write the whole snapshot now (flush-through), or — in coalesced mode —
+ *  mark the mutated record dirty and return immediately. */
+function persistOrMark(state: HxState, scope: StateScope, mark: DirtyMark): Promise<void> {
   if (coalescedScopes.has(scope)) {
-    dirtyScopes.add(scope);
+    markDirty(scope, mark);
     return Promise.resolve();
   }
   return schedulePersist(state, scope);
 }
 
-/** Write the scope's state to disk now and clear its dirty flag. Used by the
- *  flush-through mutators (whose full-state write necessarily includes every
- *  pending coalesced mutation) and by the daemon's flush points. A failed
- *  write (after schedulePersist's one retry) RE-MARKS the scope dirty before
- *  rethrowing, so the periodic flush keeps retrying instead of stranding the
- *  in-memory mutations behind a cleared flag. */
-async function persistThrough(state: HxState, scope: StateScope): Promise<void> {
-  dirtyScopes.delete(scope);
-  try {
-    await schedulePersist(state, scope);
-  } catch (err) {
-    dirtyScopes.add(scope);
-    throw err;
+/** Append the given records to the journal before returning — the durable
+ *  path of the flush-through mutators, in both modes. The line carries the
+ *  whole record, so a dirty mark for the same record is dropped. */
+async function journalThrough(scope: StateScope, entries: JournalEntry[]): Promise<void> {
+  const d = dirtyFor(scope);
+  for (const e of entries) {
+    if (e.t === "file") d.files.delete(e.path);
+    else if (e.t === "dest") d.dests.delete(e.key);
+    else if (e.t === "artifact") d.artifacts.delete(e.key);
+    else if (e.t === "chunkCap") d.chunkCaps.delete(e.key);
+    else d.deletedSessions = false;
   }
+  await appendJournal(scope, entries);
 }
 
-/** Flush a scope's coalesced mutations if any are pending. The daemon calls
- *  this at the end of every pass and on a short timer; a no-op everywhere
- *  else (nothing ever marks dirty outside coalesced mode). Rejections carry
- *  through to the caller (which logs) — the dirty flag was already re-marked,
- *  so the next flush point retries. */
+/** Whether a flush point should fold the journal into the snapshot: always
+ *  outside the daemon (one-shot passes leave an empty journal), on the
+ *  interval or the size bound inside it. */
+function checkpointDue(scope: StateScope): boolean {
+  const m = journalMeta(scope);
+  if (m.bytes === 0) return false;
+  if (!coalescedScopes.has(scope)) return true;
+  return m.bytes >= checkpointPolicy.journalBytes || Date.now() - m.lastCheckpointAtMs >= checkpointPolicy.intervalMs;
+}
+
+/** Flush a scope's pending mutations: dirty records become journal lines (a
+ *  pending whole-state mutation becomes a checkpoint), then the journal is
+ *  folded into the snapshot when a checkpoint is due. The daemon calls this at
+ *  the end of every pass and on a short timer; a one-shot pass calls it once
+ *  at its end. Rejections carry through to the caller (which logs) — the
+ *  records were re-marked, so the next flush point retries. */
 export async function flushStateIfDirty(scope: StateScope = "main"): Promise<void> {
-  if (!dirtyScopes.has(scope)) return;
   const state = await loadState(scope);
-  await persistThrough(state, scope);
+  const d = dirtyFor(scope);
+  if (d.all) {
+    clearDirty(d);
+    try {
+      await checkpoint(state, scope);
+    } catch (err) {
+      d.all = true;
+      throw err;
+    }
+    return;
+  }
+  const entries = collectDirtyEntries(state, d);
+  clearDirty(d);
+  if (entries.length > 0) {
+    try {
+      await appendJournal(scope, entries);
+    } catch (err) {
+      remarkEntries(scope, entries);
+      throw err;
+    }
+  }
+  if (checkpointDue(scope)) await checkpoint(state, scope);
+}
+
+/** Fold everything into the snapshot now: dirty records, the journal, all of
+ *  it. The daemon's stop(), the signal handler and the watchdog exit use it;
+ *  a no-op when nothing is pending and the journal is empty. */
+export async function checkpointState(scope: StateScope = "main"): Promise<void> {
+  const state = await loadState(scope);
+  const d = dirtyFor(scope);
+  const pending = isDirty(d) || journalMeta(scope).bytes > 0;
+  clearDirty(d);
+  if (!pending) return;
+  await checkpoint(state, scope);
 }
 
 /** Test seam: whether a scope currently has unflushed coalesced mutations. */
 export function hasDirtyState(scope: StateScope = "main"): boolean {
-  return dirtyScopes.has(scope);
+  return isDirty(dirtyFor(scope));
+}
+
+/** Whether the daemon's flush timer has work: dirty records, or a journal
+ *  whose checkpoint is due. */
+export function stateFlushDue(scope: StateScope = "main"): boolean {
+  return hasDirtyState(scope) || checkpointDue(scope);
+}
+
+/** Test seam: bytes currently in the journal (0 = empty or absent). */
+export function journalBytes(scope: StateScope = "main"): number {
+  return journalMeta(scope).bytes;
 }
 
 /** Forget a cached snapshot so a maintenance command can re-read state after
  *  stopping the daemon that owned the file. */
 export function resetStateCache(scope: StateScope = "main"): void {
   inMemory.delete(scope);
+  journals.delete(scope);
+  dirty.delete(scope);
+  pendingLines.delete(scope);
 }
 
 // Test seam: persistence tests point the module at a tmpdir (the same
@@ -534,10 +813,23 @@ function statePath(scope: StateScope): string {
   return path.join(stateDirOverride ?? STATE_DIR, STATE_FILE[scope]);
 }
 
+function journalPath(scope: StateScope): string {
+  return path.join(stateDirOverride ?? STATE_DIR, JOURNAL_FILE[scope]);
+}
+
+/** The journal file beside a scope's snapshot (for doctor and tests). */
+export function stateJournalPath(scope: StateScope = "main"): string {
+  return journalPath(scope);
+}
+
 export async function loadState(scope: StateScope = "main"): Promise<HxState> {
   const cached = inMemory.get(scope);
   if (cached) return cached;
   let state: HxState;
+  // The snapshot first, then the journal. A checkpoint by another process
+  // between the two reads leaves this reader with the OLD snapshot and the
+  // emptied journal — a stale view, never a regressed one (the other order
+  // could replay an old line over a newer snapshot). The next read catches up.
   if (!existsSync(statePath(scope))) {
     state = { files: {} };
   } else {
@@ -554,6 +846,14 @@ export async function loadState(scope: StateScope = "main"): Promise<HxState> {
   for (const [k, v] of Object.entries(state.files)) {
     state.files[k] = migrateFileState(v);
   }
+  let journalText = "";
+  try {
+    journalText = await readFile(journalPath(scope), "utf8");
+  } catch {
+    // no journal: nothing to replay
+  }
+  replayJournalText(state, journalText);
+  journals.set(scope, { bytes: Buffer.byteLength(journalText), lastCheckpointAtMs: Date.now() });
   seedDestinationsFromBlockers(state);
   inMemory.set(scope, state);
   return state;
@@ -608,19 +908,29 @@ async function persist(state: HxState, scope: StateScope): Promise<void> {
   await rename(tmp, target);
 }
 
+/** Every disk operation of a scope runs on one chain, in call order: full
+ *  snapshot writes, journal appends and checkpoints never race one another on
+ *  the two files. A step that fails rejects to its own caller only — the
+ *  chain carries on with the next step. */
+function enqueue(scope: StateScope, step: () => Promise<void>): Promise<void> {
+  const chain = (writeChains.get(scope) ?? Promise.resolve()).then(step, step);
+  writeChains.set(scope, chain);
+  return chain;
+}
+
 // One write may be QUEUED (scheduled, not yet started) per scope. `persist`
 // serializes the live state object at write time, so every mutation applied
 // before the queued write starts is already included in it — additional
 // callers piggyback on that queued write instead of enqueueing another full
 // rewrite each. A mutation landing while a write is IN FLIGHT queues exactly
-// one follow-up. Under the upload pool this is what keeps N concurrent
-// commit-flushes from becoming N serialized full-file writes.
+// one follow-up.
 const queuedWrite = new Map<StateScope, Promise<void>>();
 
-/** Chain writes per scope so we never have two writers racing on one file.
- *  A failed write RETRIES ONCE immediately (the base contract — a transient
- *  EBUSY/EPERM from an AV or indexer holding the file, classic on Windows,
- *  must stay invisible); a double failure rejects to the awaiting caller. */
+/** Chain full snapshot writes per scope so we never have two writers racing
+ *  on one file. A failed write RETRIES ONCE immediately (the base contract —
+ *  a transient EBUSY/EPERM from an AV or indexer holding the file, classic on
+ *  Windows, must stay invisible); a double failure rejects to the awaiting
+ *  caller. */
 function schedulePersist(state: HxState, scope: StateScope): Promise<void> {
   const queued = queuedWrite.get(scope);
   if (queued) return queued;
@@ -628,10 +938,57 @@ function schedulePersist(state: HxState, scope: StateScope): Promise<void> {
     queuedWrite.delete(scope); // the write begins: later mutations must re-queue
     return persist(state, scope).catch(() => persist(state, scope));
   };
-  const chain = (writeChains.get(scope) ?? Promise.resolve()).then(start, start);
-  writeChains.set(scope, chain);
+  const chain = enqueue(scope, start);
   queuedWrite.set(scope, chain);
   return chain;
+}
+
+// Journal lines queued for the next append step. One chain step writes every
+// line queued so far in a single appendFile, so N concurrent commit-flushes
+// under the upload pool become one write, not N.
+const pendingLines = new Map<StateScope, string[]>();
+
+async function writeJournalLines(scope: StateScope, text: string): Promise<void> {
+  await mkdir(stateDirOverride ?? STATE_DIR, { recursive: true });
+  await appendFile(journalPath(scope), text, { mode: 0o600 });
+}
+
+function appendJournal(scope: StateScope, entries: JournalEntry[]): Promise<void> {
+  const lines = pendingLines.get(scope) ?? [];
+  for (const e of entries) lines.push(JSON.stringify(e));
+  pendingLines.set(scope, lines);
+  return enqueue(scope, async () => {
+    const queued = pendingLines.get(scope);
+    if (!queued || queued.length === 0) return;
+    pendingLines.set(scope, []);
+    const text = `${queued.join("\n")}\n`;
+    try {
+      await writeJournalLines(scope, text).catch(() => writeJournalLines(scope, text));
+    } catch (err) {
+      // Put the lines back so a later append or flush retries them; the
+      // in-memory state already holds the mutation.
+      pendingLines.set(scope, [...queued, ...(pendingLines.get(scope) ?? [])]);
+      throw err;
+    }
+    journalMeta(scope).bytes += Buffer.byteLength(text);
+  });
+}
+
+/** Write the snapshot and empty the journal, as one step on the chain. The
+ *  snapshot is serialized inside the step, so every line a later step appends
+ *  describes a mutation this snapshot does not yet hold (or repeats one it
+ *  does, harmlessly). A failed snapshot write leaves the journal alone. */
+function checkpoint(state: HxState, scope: StateScope): Promise<void> {
+  return enqueue(scope, async () => {
+    queuedWrite.delete(scope);
+    await persist(state, scope).catch(() => persist(state, scope));
+    const m = journalMeta(scope);
+    if (m.bytes > 0 || existsSync(journalPath(scope))) {
+      await writeFile(journalPath(scope), "", { mode: 0o600 });
+    }
+    m.bytes = 0;
+    m.lastCheckpointAtMs = Date.now();
+  });
 }
 
 export async function getFileState(
@@ -648,12 +1005,12 @@ export async function upsertFileState(
 ): Promise<void> {
   const state = await loadState(scope);
   state.files[s.path] = s;
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, { file: s.path });
 }
 
 /** Persist the daemon's resolved watch roots (see HxState.effectiveRoots).
- *  Flush-through deliberately: startWatch's publishRoots latch only advances
- *  after the persist SUCCEEDS (its retry contract), so this write must fail
+ *  A checkpoint, deliberately: startWatch's publishRoots latch only advances
+ *  after the write SUCCEEDS (its retry contract), so this write must fail
  *  loudly rather than vanish into a dirty flag. Rare (signature changes +
  *  a 10-min restamp), so the cost is nil. */
 export async function stampEffectiveRoots(
@@ -666,15 +1023,16 @@ export async function stampEffectiveRoots(
     codex: roots.codex,
     resolvedAtMs: Date.now(),
   };
-  await persistThrough(state, scope);
+  await checkpoint(state, scope);
 }
 
 /** Persist the cached state after in-place mutations (childUploaders map,
  *  offset zeroing on a lane flip). Same single-writer discipline as every
- *  other writer here — only the process that owns the lane calls this. */
+ *  other writer here — only the process that owns the lane calls this. A
+ *  whole-state mutation: the daemon's next flush point is a checkpoint. */
 export async function persistState(scope: StateScope = "main"): Promise<void> {
   const state = await loadState(scope);
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, "all");
 }
 
 /** Record the bytes committed to ONE destination for a file. Other destinations'
@@ -692,12 +1050,12 @@ export async function setOffsetFor(
   existing.offsets[destKey(vaultOrgId)] = offset;
   existing.lastMtimeMs = mtimeMs;
   existing.lastUploadAtMs = Date.now();
-  // Flush-through in BOTH modes: a committed-byte offset must be durable
-  // before the next fan-out step starts (today's guarantee). Vault-routed and
-  // fortress-direct canonicals have NO divergence heal, so a lost offset there
-  // means silently duplicated bytes after a hard kill — the one unrecoverable
-  // crash-loss class this file could create. Never coalesce this write.
-  await persistThrough(state, scope);
+  // Journaled before returning, in BOTH modes: a committed-byte offset must be
+  // durable before the next fan-out step starts (today's guarantee). Vault-
+  // routed and fortress-direct canonicals have NO divergence heal, so a lost
+  // offset there means silently duplicated bytes after a hard kill — the one
+  // unrecoverable crash-loss class this file could create. Never coalesce it.
+  await journalThrough(scope, [{ t: "file", path: filePath, state: existing }]);
 }
 
 /**
@@ -720,7 +1078,7 @@ export async function reconcileDestinations(
   // Coalesce-eligible: add-at-zero/prune edits re-derive from the next
   // append-url's destination set; a lost key reads as offset 0, so no
   // committed-byte durability rides on this write.
-  if (changed) await persistOrMark(state, scope);
+  if (changed) await persistOrMark(state, scope, { file: filePath });
 }
 
 /**
@@ -744,7 +1102,7 @@ export async function pruneStrandedOffsets(
 ): Promise<{ keys: number; files: number }> {
   const state = await loadState(scope);
   const pruned = pruneStrandedOffsetsFrom(state, onDisk);
-  if (pruned.keys > 0) await persistThrough(state, scope);
+  if (pruned.keys > 0) await checkpoint(state, scope);
   return pruned;
 }
 
@@ -818,11 +1176,12 @@ export async function touchMtime(
   existing.lastMtimeMs = mtimeMs;
   // The chattiest mutator (fires per active file per tick) — the reason
   // coalesced mode exists. Loss on a hard kill costs one re-stat.
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, { file: filePath });
 }
 
-/** Per-file retry backoff cap — a broken file retries at most every 30 min. */
-const FILE_BACKOFF_CAP_MS = 30 * 60_000;
+/** Per-file retry backoff cap — a broken file retries at most every 30 min.
+ *  The workflow-sidecar backoff in watch.ts shares it. */
+export const FILE_BACKOFF_CAP_MS = 30 * 60_000;
 
 /** Bench a file for a FIXED window without touching its failure streak. Used
  *  by the gateway-outage probe in `tickOnce`: the probed file is not at fault,
@@ -843,7 +1202,7 @@ export async function benchFileProbe(
   const existing = state.files[filePath];
   if (!existing) return;
   existing.nextAttemptAtMs = Date.now() + delayMs;
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, { file: filePath });
 }
 
 /** Record a failed upload attempt for one file and schedule its next try with
@@ -883,7 +1242,7 @@ export async function recordFileFailure(
   // Coalesce-eligible: a failure stamp lost to a hard kill re-latches on the
   // very next failed attempt — and a daemon restart deliberately clears
   // generic backoffs anyway.
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, { file: filePath });
   return delay;
 }
 
@@ -906,7 +1265,7 @@ export async function recordHeal(
   if (n >= HEAL_MAX_CONSECUTIVE) {
     existing.healPausedUntilMs = Date.now() + HEAL_PAUSE_MS;
   }
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, { file: filePath });
   return n;
 }
 
@@ -922,9 +1281,9 @@ export async function clearHeal(
   }
   delete existing.healCount;
   delete existing.healPausedUntilMs;
-  // Flush-through (transition-gated): a lost heal-streak clear would let a
-  // later genuine divergence trip the 6 h heal pause early.
-  await persistThrough(state, scope);
+  // Journaled before returning (transition-gated): a lost heal-streak clear
+  // would let a later genuine divergence trip the 6 h heal pause early.
+  await journalThrough(scope, [{ t: "file", path: filePath, state: existing }]);
 }
 
 /** Clear a file's failure backoff (and any skip reason) after a clean pass. */
@@ -947,11 +1306,11 @@ export async function clearFileFailure(
   delete existing.nextAttemptAtMs;
   delete existing.skipReason;
   delete existing.blocker;
-  // Flush-through (transition-gated): this clear runs right after a recovery
-  // upload; losing it to a hard kill would keep a phantom "waiting" row (the
-  // skipReason survives clearGenericBackoffs by design) for up to the 30-min
-  // backoff cap while the offsets already say the file is delivered.
-  await persistThrough(state, scope);
+  // Journaled before returning (transition-gated): this clear runs right after
+  // a recovery upload; losing it to a hard kill would keep a phantom "waiting"
+  // row (the skipReason survives clearGenericBackoffs by design) for up to the
+  // 30-min backoff cap while the offsets already say the file is delivered.
+  await journalThrough(scope, [{ t: "file", path: filePath, state: existing }]);
 }
 
 /** Clear only transient destination holds so the next daemon pass retries them
@@ -962,7 +1321,7 @@ export async function clearBlockedFailures(
 ): Promise<{ files: number; sessions: number }> {
   const state = await loadState(scope);
   const cleared = clearBlockedFailuresFromState(state);
-  if (cleared.files > 0) await persistOrMark(state, scope);
+  if (cleared.files > 0) await persistOrMark(state, scope, "all");
   return cleared;
 }
 
@@ -1027,7 +1386,7 @@ export async function clearAllFailures(
 ): Promise<{ files: number; sessions: number }> {
   const state = await loadState(scope);
   const cleared = clearAllFailuresFromState(state);
-  if (cleared.files > 0) await persistOrMark(state, scope);
+  if (cleared.files > 0) await persistOrMark(state, scope, "all");
   return cleared;
 }
 
@@ -1053,7 +1412,7 @@ export function clearGenericBackoffsFromState(state: HxState): number {
 export async function clearGenericBackoffs(scope: StateScope = "main"): Promise<number> {
   const state = await loadState(scope);
   const files = clearGenericBackoffsFromState(state);
-  if (files > 0) await persistOrMark(state, scope);
+  if (files > 0) await persistOrMark(state, scope, "all");
   return files;
 }
 
@@ -1082,7 +1441,7 @@ export async function recordDeletedSession(
   }
   // Coalesce-eligible: the server-side tombstone is authoritative — a record
   // lost to a hard kill re-latches on the next 410.
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, { deletedSessions: true });
 }
 
 /** True when the server permanently deleted this session (any family recorded —
@@ -1120,7 +1479,7 @@ export async function setChunkCap(
   const state = await loadState(scope);
   if (!state.chunkCaps) state.chunkCaps = {};
   state.chunkCaps[key] = capBytes;
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, { chunkCap: key });
 }
 
 export async function getArtifactHash(
@@ -1139,5 +1498,5 @@ export async function setArtifactHash(
   const state = await loadState(scope);
   if (!state.artifacts) state.artifacts = {};
   state.artifacts[key] = hash;
-  await persistOrMark(state, scope);
+  await persistOrMark(state, scope, { artifact: key });
 }

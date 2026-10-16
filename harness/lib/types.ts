@@ -33,6 +33,17 @@ export type Step =
       putDelayMs: number;
       timeoutMs?: number;
     }
+  | {
+      /** Run the long-running `hx watch` for `durationMs`, then SIGTERM it
+       *  (SIGKILL after `stopTimeoutMs`, default 15 s). Optionally append to a
+       *  fixture transcript `grow.atMs` into the run, so the daemon's own
+       *  change detection — not a fresh process's first sweep — must find it. */
+      kind: "watch-for";
+      name: string;
+      durationMs: number;
+      grow?: { atMs: number; sessionIndex: number; bytes: number };
+      stopTimeoutMs?: number;
+    }
   | { kind: "ui"; name: string; port: number }
   | { kind: "chmod-hx-dir"; name: string; mode: number }
   | {

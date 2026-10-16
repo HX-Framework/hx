@@ -9,7 +9,7 @@
 
 import { afterEach, describe, it } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, renameSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,6 +19,8 @@ import {
   getCcdRecentsByCliId,
   readCcdRecentsCached,
   refreshCcdIndex,
+  saveCcdIndexIfChanged,
+  setCcdIndexPathForTests,
   setCcdSessionsDirForTests,
 } from "./ccd.js";
 
@@ -59,12 +61,20 @@ const PINNED = new Date(1_700_000_000_000);
 
 afterEach(() => {
   setCcdSessionsDirForTests(null);
+  setCcdIndexPathForTests(null);
   try {
     rmSync(root, { recursive: true, force: true });
   } catch {
     /* best-effort */
   }
 });
+
+/** A "restart": drop the in-memory index, keep the files and the saved index. */
+function restart(): void {
+  const sessions = join(root, "claude-code-sessions");
+  setCcdSessionsDirForTests(sessions);
+  setCcdIndexPathForTests(join(root, "ccd-index.json"));
+}
 
 describe("CCD session index", () => {
   it("builds once and serves the same records while nothing changed", async () => {
@@ -150,5 +160,87 @@ describe("CCD session index", () => {
     setCcdSessionsDirForTests(join(root, "does-not-exist"));
     assert.deepEqual(await readCcdRecentsCached(T0), []);
     assert.equal((await getCcdRecentsByCliId(T0)).size, 0);
+  });
+});
+
+// Saved across restarts (~/.let/hx/ccd-index.json): a fresh process loads
+// the saved index and STATS every file once instead of READING every file;
+// only files that moved while it was down are re-read.
+describe("CCD session index saved across restarts", () => {
+  it("saves when changed, loads on the next process, and serves the same records", async () => {
+    setup();
+    setCcdIndexPathForTests(join(root, "ccd-index.json"));
+    assert.equal(await saveCcdIndexIfChanged(T0), false, "nothing indexed yet: nothing to save");
+    await refreshCcdIndex(T0);
+    assert.equal(await saveCcdIndexIfChanged(T0), true, "the first build is saved");
+    assert.equal(await saveCcdIndexIfChanged(T0 + 1), false, "unchanged since: not saved again");
+    const saved = JSON.parse(readFileSync(join(root, "ccd-index.json"), "utf8")) as { v: number; files: Record<string, unknown>; dirs: Record<string, unknown> };
+    assert.equal(saved.v, 1);
+    assert.equal(Object.keys(saved.files).length, 2);
+    assert.equal(Object.keys(saved.dirs).length, 1);
+
+    restart();
+    assert.equal(ccdIndexVersion(), 0, "a fresh process starts empty");
+    const map = await getCcdRecentsByCliId(T0 + 1000);
+    assert.deepEqual([...map.keys()].sort(), ["cli-a", "cli-b"], "served from the saved index + one stat sweep");
+    assert.equal(ccdIndexVersion(), 1, "nothing moved: the loaded index is the first build");
+    assert.equal(await saveCcdIndexIfChanged(T0 + 1000, { force: true }), false, "and needs no new save");
+  });
+
+  it("the first refresh after a load re-stats every file: an in-place rewrite while down is seen at once", async () => {
+    setup();
+    setCcdIndexPathForTests(join(root, "ccd-index.json"));
+    utimesSync(org, PINNED, PINNED);
+    await refreshCcdIndex(T0);
+    await saveCcdIndexIfChanged(T0, { force: true });
+    // "Down": the file is rewritten in place (dir mtime unmoved), bigger.
+    writeFileSync(join(org, "local_b.json"), sessionJson("local_b", "cli-b2", "B2 rewritten while down"));
+    utimesSync(org, PINNED, PINNED);
+
+    restart();
+    const map = await getCcdRecentsByCliId(T0 + 1000);
+    assert.equal(map.get("cli-b2")?.title, "B2 rewritten while down", "re-read because its stat moved");
+    assert.equal(map.has("cli-b"), false);
+    assert.equal(map.get("cli-a")?.title, "A", "an unmoved file was served without a read");
+    assert.equal(ccdIndexVersion(), 2, "the loaded index changed once");
+    assert.equal(await saveCcdIndexIfChanged(T0 + 1000, { force: true }), true, "the change is saved");
+  });
+
+  it("respects the save interval unless forced", async () => {
+    setup();
+    setCcdIndexPathForTests(join(root, "ccd-index.json"));
+    await refreshCcdIndex(T0);
+    assert.equal(await saveCcdIndexIfChanged(T0), true);
+    renameWrite(join(org, "local_c.json"), sessionJson("local_c", "cli-c", "C"));
+    await refreshCcdIndex(T0 + CCD_REFRESH_TTL_MS);
+    assert.equal(await saveCcdIndexIfChanged(T0 + CCD_REFRESH_TTL_MS), false, "changed, but inside the interval");
+    assert.equal(await saveCcdIndexIfChanged(T0 + CCD_REFRESH_TTL_MS, { force: true }), true, "forced: the parting flush");
+  });
+
+  it("ignores a corrupt or foreign saved index and rebuilds", async () => {
+    setup();
+    setCcdIndexPathForTests(join(root, "ccd-index.json"));
+    writeFileSync(join(root, "ccd-index.json"), "{not json");
+    const map = await getCcdRecentsByCliId(T0);
+    assert.deepEqual([...map.keys()].sort(), ["cli-a", "cli-b"], "built from the store");
+
+    // A save that describes another store's files: none of its entries are ours.
+    restart();
+    writeFileSync(
+      join(root, "ccd-index.json"),
+      JSON.stringify({ v: 1, savedAtMs: 1, dirs: { "/elsewhere/acct/org": { mtimeMs: 1, files: ["/elsewhere/acct/org/local_z.json"] } }, files: { "/elsewhere/acct/org/local_z.json": { size: 1, mtimeMs: 1, record: { ccdSessionId: "local_z", cliSessionId: "cli-z", title: "Z", titleSource: "ai", isArchived: false, lastActivityAt: 0 } } } }),
+    );
+    const map2 = await getCcdRecentsByCliId(T0);
+    assert.equal(map2.has("cli-z"), false, "foreign entries dropped");
+    assert.deepEqual([...map2.keys()].sort(), ["cli-a", "cli-b"]);
+  });
+
+  it("writes nothing where Claude Desktop does not ship", async () => {
+    root = mkdtempSync(join(tmpdir(), "hx-ccd-index-"));
+    setCcdSessionsDirForTests(join(root, "does-not-exist"));
+    setCcdIndexPathForTests(join(root, "ccd-index.json"));
+    await refreshCcdIndex(T0);
+    assert.equal(await saveCcdIndexIfChanged(T0, { force: true }), false);
+    assert.equal(existsSync(join(root, "ccd-index.json")), false);
   });
 });
