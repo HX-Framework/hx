@@ -625,7 +625,10 @@ function memorySampler(label: string, vmmapAtMs: number[] = []): { sampler: Samp
         }
         while (process.platform === "darwin" && vmmapDue.length > 0 && atMs >= vmmapDue[0]!) {
           const at = vmmapDue.shift()!;
-          const r = Bun.spawnSync(["vmmap", "--summary", String(pid)]);
+          // Reading another process's zones can need privileges: then sudo
+          // (passwordless on the CI runner).
+          let r = Bun.spawnSync(["vmmap", "--summary", String(pid)]);
+          if (r.exitCode !== 0) r = Bun.spawnSync(["sudo", "-n", "vmmap", "--summary", String(pid)]);
           writeFileSync(join(out, `${label}-vmmap-${Math.round(at / 1000)}s.txt`), `${r.stdout.toString()}${r.stderr.toString()}`);
         }
       },
