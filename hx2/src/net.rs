@@ -4,9 +4,11 @@
 //! The TypeScript client sets no User-Agent, so every gateway call carries
 //! Bun's defaults: `accept: */*`, `accept-encoding: gzip, deflate, br, zstd`,
 //! `connection: keep-alive`, `user-agent: Bun/1.3.14`, plus `content-type`
-//! and `content-length` when there is a body. The differential harness
-//! compares every header but `host`, and the program doc's rule is that the
-//! port sends the same headers until the User-Agent decision is taken. The
+//! and `content-length` when there is a body. hx2 sends the same headers with
+//! one difference the program decided on 10-16: it names itself,
+//! `user-agent: hx2/<version>`, so the hx and hx2 fleets can be told apart
+//! before hx is retired. The differential harness compares every other
+//! header (all but `host`) and checks that hx2 sends exactly that one. The
 //! client here speaks plain HTTP to loopback hosts, the one transport the
 //! TypeScript client allows without TLS; HTTPS to the hosted gateway is the
 //! next card's work (the TLS stack is not part of the hot-path spike).
@@ -18,8 +20,9 @@ use std::time::Duration;
 use crate::js::{js, lossy, slice};
 use crate::json::{drop_nulls, obj, Json};
 
-/// The User-Agent the TypeScript client's runtime sends.
-pub const USER_AGENT: &str = "Bun/1.3.14";
+/// hx2 names itself to let.ai (the program doc, rule 4, decided 10-16): the
+/// one header that differs from the TypeScript client's `Bun/<version>`.
+pub const USER_AGENT: &str = concat!("hx2/", env!("CARGO_PKG_VERSION"));
 
 pub const GATEWAY_TIMEOUT_MS: u64 = 60_000;
 pub const GATEWAY_BATCH_TIMEOUT_MS: u64 = 120_000;

@@ -90,7 +90,10 @@ fault first is not a race.
 | Coverage | All 24 calls of the protocol appear in the reference recording |
 
 Normalization (`lib/normalize.ts`) hides exactly: the candidate's name (`hx2`
-→ `hx`, the one allowed difference, in output, User-Agent and asset names),
+→ `hx`, the one allowed difference, in output and asset names; for hx2 the
+`user-agent` header too — hx2 names itself `hx2/<version>` where the
+TypeScript client sends its runtime's default, decided 10-16, and a separate
+check, `hx2 user-agent`, asserts that every request hx2 makes carries it),
 each binary's version string, run-relative timestamps (compared with a
 per-scenario tolerance; the fixed content timestamps are compared exactly),
 the connection probe's latency/throughput/grade, the fixture home and work

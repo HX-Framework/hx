@@ -171,6 +171,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   } else {
     checks.push({ name: "requests", ok: true, details: "end-state scenario: request sequences not compared" });
   }
+  if (opts.candidateName === "hx2") checks.push(userAgentCheck(cand));
 
   // state.json. After a SIGKILL, which file was mid-ingest is a race: a
   // chunk committed on the gateway but not yet recorded locally self-heals
@@ -408,6 +409,11 @@ function normalizeRequest(r: RecordedRequest, ctx: NormalizeContext): Normalized
   const headers: Record<string, string> = {};
   for (const [k, v] of Object.entries(r.headers)) {
     if (HEADER_SKIP.has(k)) continue;
+    // hx2 names itself to let.ai: `user-agent: hx2/<version>` where the
+    // TypeScript client sends its runtime's default (the program doc, rule 4,
+    // decided 10-16). The header is an allowed difference for hx2 here, and
+    // the `hx2 user-agent` check asserts what hx2 sends.
+    if (k === "user-agent" && ctx.candidateName === "hx2") continue;
     headers[k] = normalizeText(v, ctx);
   }
   return {
@@ -420,6 +426,26 @@ function normalizeRequest(r: RecordedRequest, ctx: NormalizeContext): Normalized
     ...(r.bodySha256 ? { bodySha256: r.bodySha256 } : {}),
     status: r.status,
   };
+}
+
+/** hx2 names itself to let.ai: every request it makes carries
+ *  `user-agent: hx2/<its version>` (the program doc, rule 4, decided 10-16).
+ *  The header is hidden from the request comparison above, so this is the
+ *  check that hx2 sends it — a build that fell back to another User-Agent
+ *  fails here. */
+function userAgentCheck(cand: RunDir): CheckResult {
+  const want = `hx2/${cand.meta.version}`;
+  const wrong: string[] = [];
+  let seen = 0;
+  for (const file of ["gateway.jsonl", "fortress.jsonl"]) {
+    for (const r of readJsonl<RecordedRequest>(join(cand.dir, file))) {
+      seen += 1;
+      const ua = r.headers["user-agent"];
+      if (ua !== want && wrong.length < 8) wrong.push(`${r.method} ${r.path}: ${ua ?? "(none)"}`);
+    }
+  }
+  if (seen === 0) return { name: "hx2 user-agent", ok: true, details: "no request recorded" };
+  return check("hx2 user-agent", wrong, `every request carries user-agent: ${want}`);
 }
 
 function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ctxCand: NormalizeContext, tolS: number, file: string, label: string, daemonSteps: Set<string> = new Set()): CheckResult[] {
