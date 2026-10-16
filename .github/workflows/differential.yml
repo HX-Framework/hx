@@ -42,8 +42,11 @@ name: Differential harness
 #                     every scenario with the steps of the next card (the hx
 #                     ui API, update, connect, disconnect) removed
 #                     (harness/run/scenarios.ts, daemonScenarios), passed as
-#                     `candidate_name: hx2`, with the goldens;
-#   hx2-self          hx2 compared with itself on the same scenarios;
+#                     `candidate_name: hx2`, with the goldens; the hot-path
+#                     shapes in hx2-differential-hot, as for the TypeScript
+#                     jobs, both sampling the runner's memory;
+#   hx2-self          hx2 compared with itself on the same scenarios
+#                     (hx2-self-hot for the hot-path shapes);
 #   hx2-measure       harness/run/measure.ts with hx2 as the candidate:
 #                     the founder-sized tree (4,800 transcripts, 36,000
 #                     Claude Desktop files) for memory and idle CPU, the idle
@@ -650,17 +653,41 @@ jobs:
           name: hx2-${{ matrix.os }}
           path: bin/hx2
 
-      - name: Run the harness on the daemon surface
+      - name: Run the harness on the daemon surface, sampling memory
         shell: bash
         env:
           RUNNER_OS_NAME: ${{ runner.os }}
         run: |
           set -euo pipefail
           chmod +x bin/reference/hx bin/hx2/hx2
+          mkdir -p harness-out
+          # The runner shut the all-scenario hx2 job down two minutes into
+          # hot-10k on Linux, after the TypeScript jobs had met the same end
+          # 16 to 21 minutes in: the harness driver (one bun process hosting
+          # the fake gateway) reaches several GB there. Sample the machine
+          # every 10 s into the step log (live, so it survives a shutdown)
+          # and into memory.log.
+          sample() {
+            while true; do
+              echo "--- memory $(date -u +%FT%TZ)"
+              if [ "$RUNNER_OS" = Linux ]; then
+                free -m | sed -n '1,3p'
+                ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -6
+              else
+                vm_stat | sed -n '1,8p'
+                ps -eo pid,rss,pcpu,etime,comm -r | head -6
+              fi
+              df -h "$RUNNER_TEMP" | tail -1
+              sleep 10
+            done
+          }
+          ( sample 2>&1 | tee harness-out/memory.log ) &
+          sampler=$!
+          trap 'kill $sampler 2>/dev/null || true' EXIT
           bun harness/run/run-harness.ts \
             --reference bin/reference/hx \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios daemon --out harness-out --work "$RUNNER_TEMP/hx2-harness" \
+            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx2-harness" \
             --goldens "harness/golden/$RUNNER_OS_NAME" --write-goldens "harness-out/goldens/$RUNNER_OS_NAME"
 
       - name: Report
@@ -697,15 +724,39 @@ jobs:
           name: hx2-${{ matrix.os }}
           path: bin/hx2
 
-      - name: Run the harness
+      - name: Run the harness on the daemon surface, sampling memory
         shell: bash
         run: |
           set -euo pipefail
           chmod +x bin/hx2/hx2
+          mkdir -p harness-out
+          # The runner shut the all-scenario hx2 job down two minutes into
+          # hot-10k on Linux, after the TypeScript jobs had met the same end
+          # 16 to 21 minutes in: the harness driver (one bun process hosting
+          # the fake gateway) reaches several GB there. Sample the machine
+          # every 10 s into the step log (live, so it survives a shutdown)
+          # and into memory.log.
+          sample() {
+            while true; do
+              echo "--- memory $(date -u +%FT%TZ)"
+              if [ "$RUNNER_OS" = Linux ]; then
+                free -m | sed -n '1,3p'
+                ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -6
+              else
+                vm_stat | sed -n '1,8p'
+                ps -eo pid,rss,pcpu,etime,comm -r | head -6
+              fi
+              df -h "$RUNNER_TEMP" | tail -1
+              sleep 10
+            done
+          }
+          ( sample 2>&1 | tee harness-out/memory.log ) &
+          sampler=$!
+          trap 'kill $sampler 2>/dev/null || true' EXIT
           bun harness/run/run-harness.ts \
             --reference bin/hx2/hx2 --reference-name hx2 \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios daemon --out harness-out --work "$RUNNER_TEMP/hx2-harness"
+            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx2-harness"
 
       - name: Report
         if: always()
@@ -717,6 +768,147 @@ jobs:
         if: always()
         with:
           name: harness-hx2-self-${{ matrix.os }}
+          path: harness-out
+          if-no-files-found: warn
+
+  hx2-differential-hot:
+    name: Reference vs hx2, hot path (${{ matrix.os }})
+    needs: [reference, hx2-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx-reference-${{ matrix.os }}
+          path: bin/reference
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx2-${{ matrix.os }}
+          path: bin/hx2
+
+      - name: Run the harness on the hot-path scenarios, sampling memory
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bin/reference/hx bin/hx2/hx2
+          mkdir -p harness-out
+          # The runner shut the all-scenario hx2 job down two minutes into
+          # hot-10k on Linux, after the TypeScript jobs had met the same end
+          # 16 to 21 minutes in: the harness driver (one bun process hosting
+          # the fake gateway) reaches several GB there. Sample the machine
+          # every 10 s into the step log (live, so it survives a shutdown)
+          # and into memory.log.
+          sample() {
+            while true; do
+              echo "--- memory $(date -u +%FT%TZ)"
+              if [ "$RUNNER_OS" = Linux ]; then
+                free -m | sed -n '1,3p'
+                ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -6
+              else
+                vm_stat | sed -n '1,8p'
+                ps -eo pid,rss,pcpu,etime,comm -r | head -6
+              fi
+              df -h "$RUNNER_TEMP" | tail -1
+              sleep 10
+            done
+          }
+          ( sample 2>&1 | tee harness-out/memory.log ) &
+          sampler=$!
+          trap 'kill $sampler 2>/dev/null || true' EXIT
+          bun harness/run/run-harness.ts \
+            --reference bin/reference/hx \
+            --candidate bin/hx2/hx2 --candidate-name hx2 \
+            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx2-harness"
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          if [ -f harness-out/report.md ]; then cat harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: harness-hx2-differential-hot-${{ matrix.os }}
+          path: harness-out
+          if-no-files-found: warn
+
+  hx2-self-hot:
+    name: hx2 vs itself, hot path (${{ matrix.os }})
+    needs: hx2-build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx2-${{ matrix.os }}
+          path: bin/hx2
+
+      - name: Run the harness on the hot-path scenarios, sampling memory
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bin/hx2/hx2
+          mkdir -p harness-out
+          # The runner shut the all-scenario hx2 job down two minutes into
+          # hot-10k on Linux, after the TypeScript jobs had met the same end
+          # 16 to 21 minutes in: the harness driver (one bun process hosting
+          # the fake gateway) reaches several GB there. Sample the machine
+          # every 10 s into the step log (live, so it survives a shutdown)
+          # and into memory.log.
+          sample() {
+            while true; do
+              echo "--- memory $(date -u +%FT%TZ)"
+              if [ "$RUNNER_OS" = Linux ]; then
+                free -m | sed -n '1,3p'
+                ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -6
+              else
+                vm_stat | sed -n '1,8p'
+                ps -eo pid,rss,pcpu,etime,comm -r | head -6
+              fi
+              df -h "$RUNNER_TEMP" | tail -1
+              sleep 10
+            done
+          }
+          ( sample 2>&1 | tee harness-out/memory.log ) &
+          sampler=$!
+          trap 'kill $sampler 2>/dev/null || true' EXIT
+          bun harness/run/run-harness.ts \
+            --reference bin/hx2/hx2 --reference-name hx2 \
+            --candidate bin/hx2/hx2 --candidate-name hx2 \
+            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx2-harness"
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          if [ -f harness-out/report.md ]; then cat harness-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: harness-hx2-self-hot-${{ matrix.os }}
           path: harness-out
           if-no-files-found: warn
 

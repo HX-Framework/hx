@@ -180,8 +180,22 @@ service commands.
 on both binaries alike, and drops the goldens of the removed steps. The
 coverage check then requires every protocol call but the four only those
 steps make (`devices/code`, `devices/poll`, `devices/disconnect`, the
-`/download/…` pair). The `hx2-differential` and `hx2-self` jobs run this
-selection; `hx2-measure` runs `--only founder,idle,idle-hot,ccd-index`.
+`/download/…` pair). The jobs split it the way the TypeScript jobs are
+split: `hx2-differential` and `hx2-self` run `--scenarios daemon-main` (the
+daemon surface without the hot-path shapes), `hx2-differential-hot` and
+`hx2-self-hot` run `--scenarios hot-path`, all four sampling the runner's
+memory; `hx2-measure` runs `--only founder,idle,idle-hot,ccd-index`.
+
+The split is there because the driver is one bun process hosting the fake
+gateway, and on a 16 GB Linux runner it was the process that ran out of room:
+the TypeScript all-scenario jobs ended in "The runner has received a shutdown
+signal" 16 to 21 minutes in, during or after `hot-10k`, and the first hx2
+all-scenario job two minutes into `hot-10k` after fifteen scenarios in the
+same process. The driver now streams the recording to disk instead of
+holding every request (`FakeGateway.record` stays in memory only without a
+`recordPath`), stages a PUT's bytes without copying them, and collects
+garbage between the runs of a scenario; `memory.log` in each job's artifact
+shows what that leaves.
 
 `measure.ts` reports the macOS daemon's `phys_footprint` beside its `ps` RSS
 (`harness/run/phys-footprint.c`, compiled once per run with `cc`): RSS counts

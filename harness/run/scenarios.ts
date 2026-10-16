@@ -417,5 +417,9 @@ export function selectScenarios(spec: string | undefined): Scenario[] {
   if (spec === "main") return MAIN_SCENARIOS.map((n) => scenarioByName(n));
   if (spec === "hot-path") return HOT_PATH_SCENARIOS.map((n) => scenarioByName(n));
   if (spec === "daemon") return daemonScenarios();
+  // The daemon surface without the hot-path shapes, which run in a job of
+  // their own (the hot shapes are parent-only, so the M5 steps never occur
+  // there and `hot-path` already is their daemon selection).
+  if (spec === "daemon-main") return daemonScenarios().filter((s) => !HOT_PATH_SCENARIOS.includes(s.name));
   return spec.split(",").map((n) => scenarioByName(n.trim()));
 }

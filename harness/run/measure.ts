@@ -646,7 +646,7 @@ async function measureWrites(binary: string): Promise<Measurement> {
         appendTranscriptLines(s.path, s.sessionId, 3_000, `measure-writes-daemon-${n}`);
       },
     });
-    const commits = h.gateway.record.filter((r) => r.path === "/sessions/commit").length;
+    const commits = h.gateway.stats().parentCommits;
     return {
       stateBytes,
       grownTranscripts: sessions.length,
@@ -863,7 +863,7 @@ async function measureFounder(binary: string, who: Who): Promise<Measurement> {
     const second = await runOnce([binary, "watch", "--once"], h.env, 1_800_000);
     const memory = memorySampler(`founder-${who}`);
     const daemon = await runDaemon([binary, "watch"], h.env, FOUNDER_WARMUP_MS + FOUNDER_IDLE_MS, undefined, memory.sampler);
-    const commits = h.gateway.record.filter((r) => r.path === "/sessions/commit").length;
+    const commits = h.gateway.stats().parentCommits;
     const summary = memory.finish();
     return {
       sessions: h.manifest.sessions.length,
