@@ -13,7 +13,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { getDaemonOps, HX_DIR } from "./daemon.js";
+import { getDaemonOps, HX_DIR, slotRunsHx2 } from "./daemon.js";
 
 const IS_WIN = process.platform === "win32";
 const HX_BIN_DIR = join(homedir(), ".let", "bin");
@@ -121,9 +121,15 @@ export async function runUninstall(opts: UninstallOpts = {}): Promise<UninstallR
   let daemonRemoved = false;
   try {
     const ops = getDaemonOps();
-    await ops.uninstall();
-    daemonRemoved = true;
-    log(`removed daemon (${ops.managerName})`);
+    // The shared slot runs hx2: it is hx2's service now. --purge removes the
+    // state it runs on, so then the service goes too.
+    if (!opts.purge && slotRunsHx2(ops)) {
+      log(`left the background service alone: it runs hx2`);
+    } else {
+      await ops.uninstall();
+      daemonRemoved = true;
+      log(`removed daemon (${ops.managerName})`);
+    }
   } catch (err) {
     log(`warning: daemon teardown failed: ${(err as Error).message}`);
   }
@@ -149,7 +155,9 @@ export async function runUninstall(opts: UninstallOpts = {}): Promise<UninstallR
 
   if (IS_WIN) {
     removeWindowsUninstallEntry();
-    removeWindowsPathEntry(log);
+    // ~/.let/bin is shared with hx2: keep it on PATH while hx2 is there.
+    if (existsSync(join(HX_BIN_DIR, "hx2.exe"))) log(`kept ${HX_BIN_DIR} on PATH: hx2 is still installed there`);
+    else removeWindowsPathEntry(log);
   }
 
   let configPurged = false;

@@ -16,6 +16,7 @@ import { runReattributeSweep } from "./reattribute.js";
 import {
   getDaemonOps,
   reconcileServiceDefinition,
+  slotRunsHx2,
   startLogRotation,
   STDERR_LOG,
   STOP_GRACE_SECONDS,
@@ -226,6 +227,18 @@ async function autoStartDaemon(
   const binPath = process.execPath;
   try {
     const ops = getDaemonOps();
+    // The shared slot runs hx2 (the device moved to it): only `hx start`
+    // moves it back, so a connect leaves the service as it is. A fresh pairing
+    // wrote a new token that the running hx2 has not read yet.
+    if (slotRunsHx2(ops)) {
+      log(`hx2 runs the background service on this device, so hx left it alone.`);
+      log(
+        opts.tokenRefreshed
+          ? `Run \`hx2 restart\` so hx2 picks up the new connection, or \`hx start\` to move this device back to hx.`
+          : `Run \`hx start\` to move this device back to hx.`,
+      );
+      return;
+    }
     const before = await ops.state();
     if (!before.loaded) {
       // First connect (or after `hx stop`): install + start. The fresh daemon
@@ -643,13 +656,18 @@ async function cmdStatus(): Promise<void> {
   // two probes would print "running" beside "daemon stopped").
   const daemonState = ops.managerName !== "none" ? await ops.state().catch(() => null) : null;
   if (daemonState) {
+    // The shared slot may run hx2 (the Rust client): the row names it, since
+    // `hx start` would move the device back to hx.
+    const hx2 = slotRunsHx2(ops) !== null;
     rows.push([
       "Daemon",
       daemonState.pid
-        ? `running (${ops.managerName}, pid ${daemonState.pid})`
+        ? `running ${hx2 ? "hx2 " : ""}(${ops.managerName}, pid ${daemonState.pid})`
         : daemonState.loaded
-          ? `loaded, not running (${ops.managerName})`
-          : "stopped — run `hx start` to resume",
+          ? `${hx2 ? "hx2 " : ""}loaded, not running (${ops.managerName})`
+          : hx2
+            ? "hx2 stopped — run `hx2 start` to resume, or `hx start` to move this device back to hx"
+            : "stopped — run `hx start` to resume",
     ]);
   }
 
@@ -1097,7 +1115,10 @@ async function cmdStart(): Promise<void> {
   const ops = getDaemonOps();
   const binPath = process.execPath;
   const dotfileConsent = await resolveDotfileConsent(ops);
+  // The one command that moves a device whose service runs hx2 back to hx.
+  const fromHx2 = slotRunsHx2(ops) !== null;
   await ops.install({ binPath, dotfileConsent });
+  if (fromHx2) log(`Moved the background service from hx2 back to hx.`);
   const ds = await ops.state();
   reportStarted(ops, ds, dotfileConsent);
   log(`logs:   hx logs`);
@@ -1106,9 +1127,20 @@ async function cmdStart(): Promise<void> {
 
 async function cmdStop(): Promise<void> {
   const ops = getDaemonOps();
+  const hx2 = slotRunsHx2(ops) !== null;
   // stop() verifies the service is actually gone (and throws if it survived),
   // so this success line can't lie about a daemon that's still running.
   const { wasRunning, forced } = await ops.stop();
+  if (hx2) {
+    // The slot runs hx2: stopping keeps it there; `hx start` would move it.
+    log(
+      wasRunning
+        ? `hx2 stopped (${ops.managerName}). Run \`hx2 start\` to resume it, or \`hx start\` to move this device back to hx.`
+        : `hx2 is not running — nothing to stop. Run \`hx2 start\` to start it, or \`hx start\` to move this device back to hx.`,
+    );
+    if (wasRunning && forced) log(forcedStopNote());
+    return;
+  }
   if (wasRunning) {
     log(`hx stopped (${ops.managerName}). Run \`hx start\` to resume.`);
     if (forced) log(forcedStopNote());
@@ -1120,6 +1152,11 @@ async function cmdStop(): Promise<void> {
 async function cmdRestart(): Promise<void> {
   await ensureConfig();
   const ops = getDaemonOps();
+  if (slotRunsHx2(ops)) {
+    log(`hx2 runs the background service on this device, so hx left it alone.`);
+    log(`Run \`hx2 restart\` to restart it, or \`hx start\` to move this device back to hx.`);
+    return;
+  }
   const binPath = process.execPath;
   const dotfileConsent = await resolveDotfileConsent(ops);
   // Stop, then install. Under systemd and the container hook, install() only
@@ -1208,6 +1245,10 @@ async function cmdUpdate(): Promise<void> {
   log(`hx updated to latest (${r.asset}${shaNote}).`);
   if (r.daemonRestarted) {
     log(`daemon restarted.`);
+  }
+  if (r.serviceRunsHx2) {
+    log(`hx2 runs the background service on this device, so hx left it alone.`);
+    log(`Run \`hx start\` to move this device back to hx.`);
   }
   // Echo the now-installed version as the last line. This process is still the
   // old binary, so prefer the remote version we resolved over its own constant.
