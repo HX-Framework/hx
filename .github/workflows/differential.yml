@@ -653,6 +653,11 @@ jobs:
           name: hx2-${{ matrix.os }}
           path: bin/hx2
 
+      # The work dir is the TypeScript jobs' (`hx-harness`, not `hx2-harness`):
+      # the fixture home's path is written into every transcript, so the
+      # goldens hold the file sizes of that path's length, and the candidate's
+      # name is normalized in its output before the home path is masked, so a
+      # home path spelling "hx2" would come out of the first step unmaskable.
       - name: Run the harness on the daemon surface, sampling memory
         shell: bash
         env:
@@ -687,7 +692,7 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/reference/hx \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx2-harness" \
+            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx-harness" \
             --goldens "harness/golden/$RUNNER_OS_NAME" --write-goldens "harness-out/goldens/$RUNNER_OS_NAME"
 
       - name: Report
@@ -756,7 +761,7 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/hx2/hx2 --reference-name hx2 \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx2-harness"
+            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx-harness"
 
       - name: Report
         if: always()
@@ -829,7 +834,7 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/reference/hx \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx2-harness"
+            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx-harness"
 
       - name: Report
         if: always()
@@ -897,7 +902,7 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/hx2/hx2 --reference-name hx2 \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx2-harness"
+            --scenarios hot-path --out harness-out --work "$RUNNER_TEMP/hx-harness"
 
       - name: Report
         if: always()

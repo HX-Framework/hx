@@ -83,7 +83,11 @@ export const SCENARIOS: Scenario[] = [
     shape: "synthetic-10k",
     seed: "synthetic-10k",
     steps: [once("watch1"), status("status1"), once("watch2")],
-    compare: { requests: "per-session", tsToleranceMs: 180_000 },
+    // As for hot-10k below: the first pass takes the TypeScript client about
+    // four minutes and hx2 half a minute, so a stamp written at the end of
+    // the pass sits that far apart between the two — the clock, not the
+    // protocol. The tolerance is the step's own timeout.
+    compare: { requests: "per-session", tsToleranceMs: 600_000 },
   },
   {
     name: "outage",

@@ -223,8 +223,12 @@ fn upload_semaphore() -> &'static ByteSemaphore {
     SEMAPHORE.get_or_init(|| ByteSemaphore::new(UPLOAD_BYTES_CAP))
 }
 
-/// `runPool`: workers dequeue from the same ordered list; a stop flag ends dequeueing.
-fn run_pool<T: Sync>(items: &[T], limit: usize, worker: &(dyn Fn(&T) + Sync), stopped: &AtomicBool) {
+/// `runPool`: workers dequeue from the same ordered list; a stop flag ends
+/// dequeueing for every lane. A worker that returns false ends ITS lane
+/// only — the TypeScript lane whose worker threw rejects and stops while
+/// the other lanes keep dequeueing (with `uploadConcurrency: 1` the pass
+/// ends at the first throw).
+fn run_pool<T: Sync>(items: &[T], limit: usize, worker: &(dyn Fn(&T) -> bool + Sync), stopped: &AtomicBool) {
     if items.is_empty() {
         return;
     }
@@ -240,7 +244,9 @@ fn run_pool<T: Sync>(items: &[T], limit: usize, worker: &(dyn Fn(&T) + Sync), st
                 if i >= items.len() {
                     return;
                 }
-                worker(&items[i]);
+                if !worker(&items[i]) {
+                    return;
+                }
             });
         }
     });
@@ -1105,12 +1111,14 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
     };
     let first_error: Mutex<Option<String>> = Mutex::new(None);
     let last_progress = Mutex::new(now_ms());
-    let worker = |f: &DiscoveredFile| {
+    let worker = |f: &DiscoveredFile| -> bool {
         if let Err(e) = process_parent(f) {
             let mut fe = first_error.lock().unwrap_or_else(|x| x.into_inner());
             if fe.is_none() {
                 *fe = Some(e);
             }
+            // The lane that threw is done; the others finish their items.
+            return false;
         }
         let mut lp = last_progress.lock().unwrap_or_else(|e| e.into_inner());
         if now_ms() - *lp >= SYNC_PROGRESS_MIN_MS {
@@ -1118,10 +1126,11 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
             drop(lp);
             on_progress(ctx.store.read(|state| snapshot_from(&files, state)));
         }
+        true
     };
     run_pool(&pooled, file_concurrency, &worker, &stop_pass);
-    // runPool rejects with the first worker's error; the lanes already
-    // launched finish their items first, which the scoped pool above did.
+    // runPool rejects with the first lane's error once the lanes still
+    // running have finished their items, which the scoped pool above did.
     if let Some(e) = first_error.into_inner().unwrap_or_else(|x| x.into_inner()) {
         return Err(e);
     }
@@ -1285,13 +1294,15 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
                 }
                 Ok(())
             };
-            let child_worker = |c: &DiscoveredChildFile| {
+            let child_worker = |c: &DiscoveredChildFile| -> bool {
                 if let Err(e) = process_child(c) {
                     let mut ce = child_error.lock().unwrap_or_else(|x| x.into_inner());
                     if ce.is_none() {
                         *ce = Some(e);
                     }
+                    return false;
                 }
+                true
             };
             run_pool(&pooled_children, child_concurrency, &child_worker, &stop_children);
             if let Some(e) = child_error.into_inner().unwrap_or_else(|x| x.into_inner()) {

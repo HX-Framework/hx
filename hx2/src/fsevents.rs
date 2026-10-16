@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::roots::{claude_projects_dir, codex_archived_dir, codex_sessions_dir, ResolvedRoots};
 
@@ -40,6 +40,17 @@ impl FileEventSource {
         let on_failure_cb = on_failure.clone();
         let watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| match res {
             Ok(ev) => {
+                // fs.watch reports what changed on disk (a rename, a write);
+                // inotify also reports opens, closes and reads, which Node
+                // never passes on. Taken as hints they feed back: the hinted
+                // re-listing of a session or tracker directory opens it, the
+                // open is the next tick's hint, and the daemon re-lists the
+                // same directories every 1.5 s for as long as it runs
+                // (measured: 4.6× the TypeScript daemon's file checks at
+                // idle on the claude-like shape).
+                if matches!(ev.kind, EventKind::Access(_)) {
+                    return;
+                }
                 for p in ev.paths {
                     on_hint(p);
                 }
