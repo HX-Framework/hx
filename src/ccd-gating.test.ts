@@ -17,6 +17,7 @@ import { buildGroupMirror, setCcdLeveldbDirForTests } from "./ccd-prefs.js";
 import { CCD_FULL_STAT_INTERVAL_MS, CCD_REFRESH_TTL_MS, readCcdRecentsCached, setCcdSessionsDirForTests } from "./ccd.js";
 
 let root: string;
+const PINNED = new Date(1_700_000_000_000);
 
 function frameStoreLog(groupName: string): string {
   const state = {
@@ -48,6 +49,9 @@ function setup(groupName: string): { ldb: string; sessions: string; logPath: str
       lastActivityAt: 1,
     }),
   );
+  // The org dir last changed long ago, so a session file written by rename
+  // later moves its mtime for certain (see setup in ccd-index.test.ts).
+  utimesSync(join(sessions, "acct", "org"), PINNED, PINNED);
   setCcdLeveldbDirForTests(ldb);
   setCcdSessionsDirForTests(sessions);
   return { ldb, sessions, logPath };

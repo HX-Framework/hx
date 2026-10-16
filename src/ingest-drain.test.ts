@@ -24,6 +24,11 @@ import { setCcdSessionsDirForTests } from "./ccd.js";
 import type { DiscoveredFile } from "./sources.js";
 
 const MB = 1024 * 1024;
+/** The tests below write a 28–68 MB session file and drain it through the
+ *  real ingest path. On the Linux CI runner that takes 0.2–0.7 s. Across 53
+ *  Windows CI runs it took 0.3–5.3 s, and once 14.9 s, so Bun's default
+ *  limit of 5 s failed them there. A hang still fails, a minute in. */
+const DRAIN_TIMEOUT_MS = 60_000;
 const realFetch = globalThis.fetch;
 let dir: string;
 
@@ -160,7 +165,7 @@ describe("ingestOne drain", () => {
     assert.equal(did2, true);
     const state2 = await loadState();
     assert.equal(state2.files[f.path]!.offsets["letai"], 68 * MB, "fully delivered next pass");
-  });
+  }, DRAIN_TIMEOUT_MS);
 
   it("grows the ladder 4→8→16 MB when enabled — with UNALIGNED lines", async () => {
     // 998-byte lines: no chunk boundary ever lands on a newline, so every
@@ -179,7 +184,7 @@ describe("ingestOne drain", () => {
     const state = await loadState();
     assert.equal(state.files[f.path]!.offsets["letai"], sent, "offsets track trimmed bytes");
     assert.equal(sent, f.size, "fully delivered (tail chunks included)");
-  });
+  }, DRAIN_TIMEOUT_MS);
 
   it("probe: a grown-size failure retries in place with zero side effects and persists the cap", async () => {
     const f = await seedFile(28 * MB, 998); // unaligned — real-world trim shortfalls
@@ -241,7 +246,7 @@ describe("ingestOne drain", () => {
       ledger2.putBodies.every((b) => b <= 8 * MB),
       "persisted cap bounds every chunk — nothing above the learned rung, so no re-probe",
     );
-  });
+  }, DRAIN_TIMEOUT_MS);
 
   it("a non-size 4xx at a grown size (expired presign 403) learns NO durable cap", async () => {
     const f = await seedFile(28 * MB, 998);
@@ -270,7 +275,7 @@ describe("ingestOne drain", () => {
     const state = await loadState();
     assert.equal(state.files[f.path]!.offsets["letai"], f.size, "delivered regardless");
     assert.ok(ledger.putBodies.length > 0);
-  });
+  }, DRAIN_TIMEOUT_MS);
 
   it("a transient 5xx at a grown size steps the ladder back WITHOUT persisting a cap", async () => {
     const f = await seedFile(28 * MB, 998);
@@ -303,7 +308,7 @@ describe("ingestOne drain", () => {
     const state = await loadState();
     assert.equal(state.files[f.path]!.offsets["letai"], f.size, "delivered despite the blip");
     assert.equal(state.files[f.path]!.consecutiveFailures, undefined, "no file backoff");
-  });
+  }, DRAIN_TIMEOUT_MS);
 
   it("chunkLimitBytes stays an absolute override even under growth", async () => {
     const f = await seedFile(2 * MB);
