@@ -4,10 +4,13 @@
 // The rules are deliberately few and each one names the thing it hides:
 //
 //   • the candidate's name — hx2 prints `hx2` wherever hx prints `hx`, in its
-//     output, its User-Agent and its release asset names. This is the ONE
-//     allowed behavioral difference between the two binaries (the program
-//     doc, "What exactly the same means", row 5), so it is a rule here and
-//     not a diff;
+//     output and its release asset names. This is the ONE allowed behavioral
+//     difference between the two binaries (the program doc, "What exactly the
+//     same means", row 5), so it is a rule here and not a diff. hx2's
+//     User-Agent, `hx2/<version>` where the TypeScript client sends its
+//     runtime's default (decided 10-16), is the same rule's second face:
+//     compare.ts leaves that header out of the request comparison for hx2
+//     and checks separately that hx2 sends it;
 //   • the version string each binary reports — a candidate built from a
 //     later commit carries a later version;
 //   • wall-clock time — timestamps that fall inside the run's window become

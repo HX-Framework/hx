@@ -31,3 +31,6 @@ CLAUDE.local.md
 .harness-work/
 .harness-out/
 harness-out/
+
+# The Rust port (hx2/) builds in CI; nothing under target/ is committed
+hx2/target/

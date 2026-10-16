@@ -272,6 +272,90 @@ export const SCENARIOS: Scenario[] = [
     ],
     compare: { requests: "per-session", tsToleranceMs: 20_000 },
   },
+  // ── The hot-path surface (hx2, M3) ───────────────────────────────────────
+  // What the Rust port carries first: Claude Code transcripts through
+  // discovery (the 30-day window, the twin election), the tiered catalog with
+  // file events and the 60 s safety sweep, chunking (4 MiB, cut at the last
+  // newline), the 3-step upload and the state files (snapshot + journal). The
+  // hot shapes hold parent transcripts only — no Codex, no Claude Desktop
+  // store, no child lanes, no sidecars — and the steps are the ones the port
+  // answers: `watch --once`, the long-running daemon, a growing transcript.
+  // Every comparison of the full scenarios applies to them unchanged.
+  {
+    name: "hot-baseline",
+    description: "The hot-path core: two full passes (the 70 MB file needs both), a third after a transcript grows, the version, help and usage-error lines.",
+    shape: "hot-small",
+    seed: "hot-baseline",
+    steps: [
+      { kind: "run", name: "version", args: ["--version"], expectExit: 0 },
+      { kind: "run", name: "help", args: ["help"], expectExit: 0 },
+      { kind: "run", name: "unknown-command", args: ["no-such-command"], expectExit: 64 },
+      once("watch1"),
+      once("watch2"),
+      { kind: "grow", name: "grow", sessionIndex: 0, bytes: 3000 },
+      once("watch3"),
+    ],
+    compare: { requests: "per-session", tsToleranceMs: 20_000 },
+  },
+  {
+    name: "hot-claude-like",
+    description: "600 parent transcripts over 150 project dirs, two passes.",
+    shape: "hot-claude-like",
+    seed: "hot-claude-like",
+    steps: [once("watch1"), once("watch2")],
+    compare: { requests: "per-session", tsToleranceMs: 60_000 },
+  },
+  {
+    name: "hot-10k",
+    description: "10,000 parent transcripts over 200 project dirs, 30 KB each, two passes.",
+    shape: "hot-10k",
+    seed: "hot-10k",
+    steps: [once("watch1"), once("watch2")],
+    // The first pass takes the TypeScript client about four minutes and hx2
+    // well under one, so a stamp written at the end of the pass (the last
+    // file's lastUploadAtMs, the destination's observedAtMs) sits that far
+    // apart between the two: the clock, not the protocol. The tolerance is
+    // the step's own timeout.
+    compare: { requests: "per-session", tsToleranceMs: 600_000 },
+  },
+  {
+    name: "hot-outage",
+    description: "Every gateway call answers 503 during the first pass; the second pass recovers byte-exact (hot-path core).",
+    shape: "hot-small",
+    seed: "hot-outage",
+    settings: SERIAL,
+    gateway: { outageStatus: 503 },
+    steps: [once("watch1"), { kind: "gateway", name: "gateway-healthy", patch: { outageStatus: 0 } }, once("watch2")],
+    compare: { requests: "per-session", tsToleranceMs: 20_000 },
+  },
+  {
+    name: "hot-unreachable",
+    description: "The gateway is not listening during the first pass; the second pass recovers (hot-path core).",
+    shape: "hot-small",
+    seed: "hot-unreachable",
+    settings: SERIAL,
+    steps: [{ kind: "gateway-stop", name: "gateway-stop" }, once("watch1"), { kind: "gateway-start", name: "gateway-start" }, once("watch2")],
+    compare: { requests: "per-session", tsToleranceMs: 20_000 },
+  },
+  {
+    name: "hot-kill9",
+    description: "SIGKILL the long-running daemon in the middle of its first catch-up (after 10 composed chunks, each PUT slowed to 200 ms), then two one-shot passes: the end state must be byte-exact (hot-path core).",
+    shape: "hot-small",
+    seed: "hot-kill9",
+    steps: [{ kind: "watch-kill", name: "watch-killed", killAfterCommits: 10, putDelayMs: 200 }, once("watch1"), once("watch2")],
+    compare: { requests: "end-state", tsToleranceMs: 60_000 },
+  },
+  {
+    name: "hot-daemon",
+    description:
+      "The long-running daemon for 50 s on the hot-path core: acme/repo fans out to a held vault, a transcript grows 12 s in. Held sessions retry on their 20 s backoff, the stuck line is logged once per hold, the grown transcript uploads within the run (file events or the polling tick), SIGTERM folds the journal.",
+    shape: "hot-small",
+    seed: "hot-daemon",
+    settings: SERIAL,
+    gateway: { routes: { "acme/repo": { vaultOrgIds: ["org-acme"] } }, heldVaults: { "org-acme": ACME_HELD } },
+    steps: [{ kind: "watch-for", name: "daemon", durationMs: 50_000, grow: { atMs: 12_000, sessionIndex: 2, bytes: 3000 } }],
+    compare: { requests: "per-session", tsToleranceMs: 20_000 },
+  },
   {
     name: "excluded",
     description: "personalSync off and an exclude rule for ~/scratch: sessions with no repo stay on the machine, the excluded folder too; doctor lists why.",
@@ -291,7 +375,11 @@ export function scenarioByName(name: string): Scenario {
   return s;
 }
 
+/** The scenarios of the hot-path surface, in order. */
+export const HOT_PATH_SCENARIOS = ["hot-baseline", "hot-claude-like", "hot-10k", "hot-outage", "hot-unreachable", "hot-kill9", "hot-daemon"];
+
 export function selectScenarios(spec: string | undefined): Scenario[] {
   if (!spec || spec === "all") return SCENARIOS;
+  if (spec === "hot-path") return HOT_PATH_SCENARIOS.map((n) => scenarioByName(n));
   return spec.split(",").map((n) => scenarioByName(n.trim()));
 }
