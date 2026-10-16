@@ -235,8 +235,17 @@ transcripts, file checks per second of an idle daemon under `strace -c`
 (Linux, the per-syscall summaries attached as `idle-<run>-strace.txt`), its
 CPU and RSS, refused workflow uploads and `[stuck]` lines in the
 `daemon-backoff` run, and (macOS) the second pass over 10,000 Claude Desktop
-files. Every number is the operating system's view of the process (rusage,
-strace, /proc, ps); nothing is instrumented inside the binary.
+files, with the two saved indexes compared byte for byte per entry. Every
+number is the operating system's view of the process (rusage, strace, /proc,
+ps); nothing is instrumented inside the binary.
+
+The `strace -c` window holds the daemon's start-up pass as well as its idle
+time, and it counts calls without their paths. So on Linux a second daemon is
+traced for 45 s with every stat-family and `readlink` call's path
+(`harness/lib/stat-trace.ts`): the calls are counted by syscall and path
+pattern, the first 15 s apart from the rest, into
+`<run>-<who>-stat-paths.txt`, and the table gets the idle rates after the
+start-up pass.
 
 The idle daemon's resident memory is also sampled once a second from outside
 the process (`idle-memory` rows; `/proc/<pid>/status` and `smaps_rollup` on
