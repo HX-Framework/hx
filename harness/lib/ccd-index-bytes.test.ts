@@ -8,7 +8,7 @@ function index(files: Array<[string, number, number]>, savedAtMs = 1_760_000_000
   return JSON.stringify({
     v: 1,
     savedAtMs,
-    dirs: { "/s/a/o": { mtimeMs: 1_767_603_600_123.4567, files: files.map(([p]) => p) } },
+    dirs: { "/s/a/o": { mtimeMs: 1_767_603_780_128.4883, files: files.map(([p]) => p) } },
     files: Object.fromEntries(
       files.map(([p, size, mtimeMs]) => [p, { size, mtimeMs, record: { ccdSessionId: `local_${p.slice(-6, -5)}`, cliSessionId: null, title: "t", titleSource: "ai", isArchived: false, lastActivityAt: 1_767_607_200_000 } }]),
     ),
