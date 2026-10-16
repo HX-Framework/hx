@@ -34,6 +34,7 @@ mod net;
 mod orgnames;
 mod parse;
 mod pathnorm;
+mod platform;
 mod probe;
 mod reattribute;
 mod report;
@@ -46,6 +47,7 @@ mod state;
 mod title_sync;
 mod watch;
 mod watchdog;
+mod winpath;
 mod wtf8;
 
 use std::sync::atomic::AtomicU64;

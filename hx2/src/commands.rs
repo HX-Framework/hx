@@ -225,8 +225,7 @@ fn shared_table_widths(groups: &[&Vec<Row>]) -> TableWidths {
 }
 
 fn stdout_is_tty() -> bool {
-    // SAFETY: isatty only inspects the descriptor.
-    unsafe { libc::isatty(1) == 1 }
+    crate::platform::stdout_is_tty()
 }
 
 /// `/utf-?8/i.test(LC_ALL ?? LC_CTYPE ?? LANG ?? "")`: the first DEFINED variable decides.

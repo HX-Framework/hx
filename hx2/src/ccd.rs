@@ -42,12 +42,27 @@ pub const CCD_REFRESH_TTL_MS: f64 = 20_000.0;
 pub const CCD_FULL_STAT_INTERVAL_MS: f64 = 60_000.0;
 pub const CCD_INDEX_SAVE_INTERVAL_MS: f64 = 10.0 * 60_000.0;
 
-/// Claude Desktop's per-user data directory, where it ships.
+/// Claude Desktop's per-user data directory, where it ships: under
+/// `~/Library/Application Support` on macOS and %APPDATA% (Roaming) on
+/// Windows, else nowhere.
 pub fn ccd_app_dir() -> Option<String> {
     if cfg!(target_os = "macos") {
         return Some(homedir().join("Library").join("Application Support").join("Claude").to_string_lossy().into_owned());
     }
+    if cfg!(windows) {
+        return Some(ccd_app_dir_win32(std::env::var("APPDATA").ok().as_deref(), &homedir().to_string_lossy()));
+    }
     None
+}
+
+/// `winPath.join(env.APPDATA || winPath.join(home, "AppData", "Roaming"), "Claude")`:
+/// %APPDATA% is Roaming, and its canonical place stands in when it is unset.
+fn ccd_app_dir_win32(appdata: Option<&str>, home: &str) -> String {
+    let roaming = match appdata.filter(|v| !v.is_empty()) {
+        Some(a) => a.to_string(),
+        None => crate::winpath::join(&[home, "AppData", "Roaming"]),
+    };
+    crate::winpath::join(&[&roaming, "Claude"])
 }
 
 /// `<app data>/claude-code-sessions`.
@@ -1193,9 +1208,23 @@ pub fn save_ccd_index_if_changed(now_ms: f64, force: bool) -> bool {
 mod tests {
     use super::*;
 
+    /// A test path with the platform's separator, as `path.join` writes it.
+    fn os_path(s: &str) -> String {
+        s.replace('/', &(SEP as char).to_string())
+    }
+
+    /// `os_path` inside JSON text, where a backslash is written escaped.
+    fn os_path_json(s: &str) -> String {
+        if SEP == b'/' {
+            s.to_string()
+        } else {
+            s.replace('/', "\\\\")
+        }
+    }
+
     fn index_from(text: &str, under: &str) -> CcdIndex {
         let mut idx = CcdIndex {
-            dir: Some(under.trim_end_matches('/').to_string()),
+            dir: Some(under.trim_end_matches(SEP as char).to_string()),
             paths: DirTable::default(),
             index: IndexMap::new(),
             org_dirs: IndexMap::new(),
@@ -1242,16 +1271,17 @@ mod tests {
 
     #[test]
     fn a_saved_index_is_written_back_byte_for_byte() {
-        let idx = index_from(SAVED, "/s/");
+        let saved = os_path_json(SAVED);
+        let idx = index_from(&saved, &os_path("/s/"));
         // The JSON.stringify of the same object, with this save's clock.
-        let want = SAVED.replace("\"savedAtMs\":1792180673041", "\"savedAtMs\":1792180679999").replace("\\ud83d\\ude00", "😀");
+        let want = saved.replace("\"savedAtMs\":1792180673041", "\"savedAtMs\":1792180679999").replace("\\ud83d\\ude00", "😀");
         assert_eq!(idx.saved_text(1_792_180_679_999.0), want);
         assert_eq!(idx.records.len(), 2);
     }
 
     #[test]
     fn loading_follows_the_client_on_odd_files() {
-        let under = "/s/";
+        let under = os_path("/s/");
         let mut paths = DirTable::default();
         for bad in ["", "[]", "null", "{\"v\":2,\"dirs\":{},\"files\":{}}", "{\"v\":1,\"dirs\":{}}", "{\"v\":1,\"dirs\":0,\"files\":{}}", "{\"v\":1,\"dirs\":\"x\",\"files\":{}}", "{\"v\":1,\"dirs\":{},\"files\":{} ", "{\"v\":1,\"dirs\":{},\"files\":{}} x"] {
             assert!(!parse_saved_index(bad.as_bytes(), under.as_bytes(), &mut paths).map(|s| !s.dirs.is_empty() || !s.files.is_empty()).unwrap_or(false), "{:?}", bad);
@@ -1260,11 +1290,11 @@ mod tests {
         // Arrays pass `typeof` and give no entries; paths outside the store
         // and entries of the wrong shape are skipped; the last of a
         // duplicated path counts, in the first one's place.
-        let text = "{\"files\":{\"/s/a/local_1.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/elsewhere/local_2.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/s/a/local_3.json\":{\"size\":\"1\",\"mtimeMs\":2},\"/s/a/local_4.json\":{\"size\":4,\"mtimeMs\":4,\"record\":{\"ccdSessionId\":\"x\"}},\"/s/a/local_1.json\":{\"size\":9,\"mtimeMs\":9,\"record\":{\"ccdSessionId\":\"y\",\"cliSessionId\":null}}},\"dirs\":[],\"v\":1.0}";
+        let text = os_path_json("{\"files\":{\"/s/a/local_1.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/elsewhere/local_2.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/s/a/local_3.json\":{\"size\":\"1\",\"mtimeMs\":2},\"/s/a/local_4.json\":{\"size\":4,\"mtimeMs\":4,\"record\":{\"ccdSessionId\":\"x\"}},\"/s/a/local_1.json\":{\"size\":9,\"mtimeMs\":9,\"record\":{\"ccdSessionId\":\"y\",\"cliSessionId\":null}}},\"dirs\":[],\"v\":1.0}");
         let saved = parse_saved_index(text.as_bytes(), under.as_bytes(), &mut paths).expect("loads");
         assert!(saved.dirs.is_empty());
         let kept: Vec<(String, f64, bool)> = saved.files.iter().filter_map(|(k, v)| v.as_ref().map(|f| (paths.path_string(k), f.size, f.record.is_some()))).collect();
-        assert_eq!(kept, vec![("/s/a/local_1.json".to_string(), 9.0, true), ("/s/a/local_4.json".to_string(), 4.0, false)]);
+        assert_eq!(kept, vec![(os_path("/s/a/local_1.json"), 9.0, true), (os_path("/s/a/local_4.json"), 4.0, false)]);
     }
 
     #[test]
@@ -1323,7 +1353,7 @@ mod tests {
         // File names.
         let mut paths = DirTable::default();
         for name in [format!("local_{}.json", canon), format!("local_{}.json", others[0]), "local_x.json".to_string(), "notes.txt".to_string()] {
-            let full = format!("/s/a/o/{}", name);
+            let full = os_path(&format!("/s/a/o/{}", name));
             let k = paths.split(full.as_bytes());
             assert_eq!(matches!(k.name, Name::Session(_)), name.contains(canon), "{}", name);
             assert_eq!(paths.path_string(&k), full);
@@ -1349,5 +1379,18 @@ mod tests {
         assert_eq!(m.get("a").map(|x| x.ccd_session_id().to_vec()), Some(b"local_2".to_vec()));
         assert!(m.get("").is_none());
         assert!(m.get("c").is_none());
+    }
+
+    // src/ccd.test.ts: ccdAppDir on win32.
+
+    #[test]
+    fn finds_claude_desktop_under_appdata_on_windows() {
+        assert_eq!(ccd_app_dir_win32(Some("C:\\Users\\me\\AppData\\Roaming"), "C:\\Users\\me"), "C:\\Users\\me\\AppData\\Roaming\\Claude");
+    }
+
+    #[test]
+    fn falls_back_to_the_roaming_path_when_appdata_is_unset() {
+        assert_eq!(ccd_app_dir_win32(None, "C:\\Users\\me"), "C:\\Users\\me\\AppData\\Roaming\\Claude");
+        assert_eq!(ccd_app_dir_win32(Some(""), "C:\\Users\\me"), "C:\\Users\\me\\AppData\\Roaming\\Claude");
     }
 }
