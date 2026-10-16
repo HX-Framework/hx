@@ -1,11 +1,12 @@
-//! hx2 — the hx client's daemon in Rust (HX2 program, M3 + M4).
+//! hx2 — the hx client in Rust (HX2 program, M3 to M5).
 //!
 //! The binary prints its own file name (`hx2`, or `hx` once renamed) wherever
-//! the TypeScript client prints `hx`. This build carries the daemon and its
-//! maintenance commands: `watch` (long-running and `--once`, with the `--local`
-//! tee), `tick`, `status` (`--detailed`), `doctor sync`, `backfill`,
-//! `reattribute`, `retry`. The service, pairing, update and ui commands are the
-//! next card's work.
+//! the TypeScript client prints `hx`, and updates from the release channel of
+//! that name. It carries every command of the client: the daemon (`watch`,
+//! long-running and `--once`, with the `--local` tee), `tick`, `status`
+//! (`--detailed`), `doctor sync`, `backfill`, `reattribute`, `retry`,
+//! `connect` and `disconnect`, the service (`start`, `stop`, `restart`,
+//! `logs`, `uninstall`), `update`, and `ui`.
 
 mod activity;
 mod artifacts;
@@ -17,7 +18,9 @@ mod children;
 mod codex_titles;
 mod commands;
 mod config;
+mod connect;
 mod crashloop;
+mod crypto;
 mod daemon;
 mod daemon_state;
 mod diagnostics;
@@ -28,21 +31,31 @@ mod js;
 mod json;
 mod ledger;
 mod logger;
+mod logs;
+mod maintenance;
 mod mirror;
 mod net;
 mod orgnames;
 mod parse;
 mod pathnorm;
 mod probe;
+mod progress;
 mod reattribute;
 mod report;
 mod roots;
 mod route;
+mod service;
 mod settings;
 mod sidecars;
 mod sources;
 mod state;
 mod title_sync;
+mod ui_assets;
+mod ui_auth;
+mod ui_data;
+mod ui_server;
+mod uninstall;
+mod update;
 mod watch;
 mod watchdog;
 
@@ -61,11 +74,13 @@ pub fn bin_name() -> &'static str {
     BIN_NAME.get().map(|s| s.as_str()).unwrap_or("hx2")
 }
 
-/// The name this binary goes by: its own file name when it starts with `hx`, else `hx2`.
+/// The name this binary goes by: its own file name (`hx` or `hx2`; the
+/// Windows service build `hx2-svc.exe` goes by `hx2`), else `hx2`.
 fn binary_name() -> String {
     let from_exe = std::env::current_exe().ok().and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
     let from_argv = std::env::args().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned()));
     for cand in [from_exe, from_argv].into_iter().flatten() {
+        let cand = cand.strip_suffix("-svc").map(|c| c.to_string()).unwrap_or(cand);
         if cand == "hx" || cand == "hx2" {
             return cand;
         }
@@ -106,7 +121,21 @@ fn help(name: &str) {
 
 /// `hx watch [--once] [--only <path>] [--local]`.
 fn cmd_watch(name: &str, args: &[String]) {
+    // Windows' Task Scheduler redirects nothing: the daemon writes its own log.
+    logs::tee_stdio_to_logs();
+    // Keep stdout.log / stderr.log bounded; acts only in a process that writes them.
+    let rotation_log = Logger::new(true, "");
+    logs::start_log_rotation(Box::new(move |m: &str| rotation_log.log(m)));
     let cfg = commands::ensure_config(name);
+    // When launchd or systemd started this process, bring the installed
+    // definition up to this binary's template; if it changed, the manager is
+    // about to restart the service with it.
+    {
+        let reconcile_log = Logger::new(true, "");
+        if service::reconcile_service_definition(&|m: &str| reconcile_log.log(m)) == service::Reconcile::Reloading {
+            std::thread::sleep(std::time::Duration::from_millis(service::SERVICE_RELOAD_WAIT_MS));
+        }
+    }
     let local_cfg = if has_flag(args, "local") { Some(commands::ensure_local_config(name)) } else { None };
     let one_shot = args.iter().any(|a| a == "--once" || a == "-1");
     let only = flag(args, "only");
@@ -226,16 +255,25 @@ fn main() {
         Some("status") => commands::cmd_status(&name, &args),
         Some("doctor") => commands::cmd_doctor(&name, &args),
         Some("retry") => commands::cmd_retry(&name, &args),
+        // `login` and `logout`: the pre-2026-05-28 aliases, kept for old installers and docs.
+        Some("connect") | Some("login") => connect::cmd_connect(&name, &args),
+        Some("disconnect") | Some("logout") => connect::cmd_disconnect(&args),
+        Some("start") => connect::cmd_start(&name, &args),
+        Some("stop") => connect::cmd_stop(&name),
+        Some("restart") => connect::cmd_restart(&name, &args),
+        Some("logs") => {
+            let lines = flag(&args, "lines").unwrap_or_else(|| "50".to_string());
+            let n = lines.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(50.0);
+            logs::tail_logs(n).map(|_| 0)
+        }
+        Some("ui") => ui_server::cmd_ui(&name, &args),
+        Some("update") => update::cmd_update(&name, &args),
+        Some("uninstall") => uninstall::cmd_uninstall(&name, &args),
         None | Some("--help") | Some("-h") | Some("help") => {
             help(&name);
             Ok(0)
         }
         Some(other) => {
-            let known = ["connect", "login", "disconnect", "logout", "start", "stop", "restart", "logs", "ui", "update", "uninstall"];
-            if known.contains(&other) {
-                say(&format!("{}: `{}` is not available in this build.", name, other));
-                std::process::exit(64);
-            }
             say(&format!("unknown command: {}", other));
             say(&format!("run `{} help` for the full list.", name));
             std::process::exit(64);

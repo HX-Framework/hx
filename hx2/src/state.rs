@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -402,44 +402,62 @@ fn json_eq(a: Option<&Json>, b: Option<&Json>) -> bool {
     norm(a) == norm(b)
 }
 
+/// The snapshot and journal file names of a lane.
+fn state_paths(scope: &str) -> (PathBuf, PathBuf) {
+    let (snapshot, journal) = if scope == "local" { ("state.local.json", "state.local.journal.jsonl") } else { ("state.json", "state.journal.jsonl") };
+    (hx_dir().join(snapshot), hx_dir().join(journal))
+}
+
+/// `loadState` as a value: the snapshot, then the journal replayed over it.
+/// Returns the state and the journal's length.
+fn read_state_files(state_path: &Path, journal_path: &Path) -> (Json, u64) {
+    let mut state = match fs::read_to_string(state_path) {
+        Ok(raw) => match Json::parse(&raw) {
+            Ok(v) if v.as_obj().is_some() => v,
+            _ => obj(vec![("files", Json::obj())]),
+        },
+        Err(_) => obj(vec![("files", Json::obj())]),
+    };
+    if !state.get("files").map(|f| f.truthy()).unwrap_or(false) {
+        state.set("files", Json::obj());
+    }
+    // Upgrade legacy single-offset entries to the per-destination shape.
+    let migrated: Vec<(String, Json)> = state
+        .get("files")
+        .and_then(|f| f.as_obj())
+        .map(|o| o.iter().map(|(k, v)| (k.clone(), migrate_file_state(v))).collect())
+        .unwrap_or_default();
+    if let Some(files) = state.as_obj_mut().and_then(|o| o.get_mut("files")) {
+        for (k, v) in migrated {
+            files.set(&k, v);
+        }
+    }
+    let journal_text = fs::read_to_string(journal_path).unwrap_or_default();
+    for line in journal_text.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(e) = Json::parse(line) {
+            apply_journal_entry(&mut state, &e);
+        }
+    }
+    seed_destinations_from_blockers(&mut state);
+    (state, journal_text.len() as u64)
+}
+
+/// `resetStateCache(); await loadState(scope)` for a process that only reads
+/// the state (the `hx ui` server): no store, no writer thread, nothing kept.
+pub fn read_state_json(scope: &str) -> Json {
+    let (state_path, journal_path) = state_paths(scope);
+    read_state_files(&state_path, &journal_path).0
+}
+
 impl Store {
     /// `loadState`: the snapshot, then the journal replayed over it. The
     /// returned store owns a writer thread for the coalesced snapshot writes.
     pub fn load(scope: &str) -> Arc<Store> {
-        let (snapshot, journal) = if scope == "local" { ("state.local.json", "state.local.journal.jsonl") } else { ("state.json", "state.journal.jsonl") };
-        let state_path = hx_dir().join(snapshot);
-        let journal_path = hx_dir().join(journal);
-        let mut state = match fs::read_to_string(&state_path) {
-            Ok(raw) => match Json::parse(&raw) {
-                Ok(v) if v.as_obj().is_some() => v,
-                _ => obj(vec![("files", Json::obj())]),
-            },
-            Err(_) => obj(vec![("files", Json::obj())]),
-        };
-        if !state.get("files").map(|f| f.truthy()).unwrap_or(false) {
-            state.set("files", Json::obj());
-        }
-        // Upgrade legacy single-offset entries to the per-destination shape.
-        let migrated: Vec<(String, Json)> = state
-            .get("files")
-            .and_then(|f| f.as_obj())
-            .map(|o| o.iter().map(|(k, v)| (k.clone(), migrate_file_state(v))).collect())
-            .unwrap_or_default();
-        if let Some(files) = state.as_obj_mut().and_then(|o| o.get_mut("files")) {
-            for (k, v) in migrated {
-                files.set(&k, v);
-            }
-        }
-        let journal_text = fs::read_to_string(&journal_path).unwrap_or_default();
-        for line in journal_text.split('\n') {
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(e) = Json::parse(line) {
-                apply_journal_entry(&mut state, &e);
-            }
-        }
-        seed_destinations_from_blockers(&mut state);
+        let (state_path, journal_path) = state_paths(scope);
+        let (state, journal_len) = read_state_files(&state_path, &journal_path);
         let store = Arc::new(Store {
             state_path,
             journal_path,
@@ -452,7 +470,7 @@ impl Store {
                 dirty_artifacts: BTreeSet::new(),
                 dirty_chunk_caps: BTreeSet::new(),
                 dirty_deleted: false,
-                journal_bytes: journal_text.len() as u64,
+                journal_bytes: journal_len,
                 last_checkpoint_ms: now_ms(),
             }),
             io: Mutex::new(()),

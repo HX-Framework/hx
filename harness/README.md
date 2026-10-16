@@ -171,20 +171,18 @@ SQLite titles, the Claude Desktop session-metadata index (saved as
 and workflow sidecars, tasks and plans, verify and self-heal, reattribute
 and the codex title sweep, the ledger and `hx status` / `hx status
 --detailed` / `hx doctor sync`, `hx tick`, `hx backfill`, `hx reattribute`,
-`hx retry` and the `--local` tee. What it does not carry yet is the next
-card's: the hx ui API, `hx update`, `hx connect`, `hx disconnect` and the
-service commands.
+`hx retry` and the `--local` tee. The hx ui API, `hx update`, `hx connect`,
+`hx disconnect` and the service commands came with M5 (below).
 
 `--scenarios daemon` runs the full catalog with exactly those steps removed
 (the `ui` steps and the `run` steps of `update`, `connect` and `disconnect`),
 on both binaries alike, and drops the goldens of the removed steps. The
 coverage check then requires every protocol call but the four only those
 steps make (`devices/code`, `devices/poll`, `devices/disconnect`, the
-`/download/…` pair). The jobs split it the way the TypeScript jobs are
-split: `hx2-differential` and `hx2-self` run `--scenarios daemon-main` (the
-daemon surface without the hot-path shapes), `hx2-differential-hot` and
-`hx2-self-hot` run `--scenarios hot-path`, all four sampling the runner's
-memory; `hx2-measure` runs `--only founder,idle,idle-hot,ccd-index`.
+`/download/…` pair). Until M5 the hx2 jobs ran `--scenarios daemon-main`
+(the daemon surface without the hot-path shapes) and `--scenarios hot-path`,
+all four sampling the runner's memory; `hx2-measure` runs `--only
+founder,idle,idle-hot,ccd-index`.
 
 The split is there because the driver is one bun process hosting the fake
 gateway, and on a 16 GB Linux runner it was the process that ran out of room:
@@ -196,6 +194,25 @@ holding every request (`FakeGateway.record` stays in memory only without a
 `recordPath`), stages a PUT's bytes without copying them, and collects
 garbage between the runs of a scenario; `memory.log` in each job's artifact
 shows what that leaves.
+
+### The whole client (hx2, M5)
+
+After M5 hx2 carries every command: `hx connect` (the device-code flow and
+the `--local` tee), `hx disconnect`, the service (`start`, `stop`,
+`restart`, `logs`, `uninstall`), `hx update` from its own channel (the
+`hx2-*` assets), and `hx ui` with the React app embedded as built. The hx2
+jobs run `--scenarios main`, the same list as the TypeScript jobs, so the
+`ui` probes, both update paths, the pairing after a disconnect and every
+golden compare identical, and coverage requires all 24 protocol calls. The
+`daemon` selections stay for a candidate that predates M5.
+
+The service definitions never run in the harness, so the build job checks
+them apart: `harness/run/service-defs.ts` renders the TypeScript client's
+plist, systemd unit, container bootstrap and Task Scheduler XML for a fixed
+binary path, and hx2's unit tests compare their own renderings with those
+files byte for byte (and with the client's snapshot file). One service slot
+(`ai.let.hx-vision`) is shared by hx and hx2, so the files may differ in the
+binary's path alone.
 
 `measure.ts` reports the macOS daemon's `phys_footprint` beside its `ps` RSS
 (`harness/run/phys-footprint.c`, compiled once per run with `cc`): RSS counts

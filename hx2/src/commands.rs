@@ -115,7 +115,7 @@ fn data_root_from_json(v: &Json) -> DataRoot {
 
 /// `effectiveRootsForCli`: the daemon's stamp when present, else this
 /// process's own resolution.
-fn effective_roots_for_cli(store: &Store, settings: &HxSettings) -> (ResolvedRoots, &'static str) {
+pub(crate) fn effective_roots_for_cli(store: &Store, settings: &HxSettings) -> (ResolvedRoots, &'static str) {
     let stamp = store.read(|s| s.get("effectiveRoots").filter(|v| v.truthy()).cloned());
     if let Some(er) = stamp {
         let list = |key: &str| -> Vec<DataRoot> { er.get(key).and_then(|a| a.as_arr()).map(|a| a.iter().map(data_root_from_json).collect()).unwrap_or_default() };
@@ -511,24 +511,24 @@ pub fn cmd_retry(name: &str, args: &[String]) -> Result<i32, String> {
         say(&format!("No blocked sessions to retry. (`{} retry --all` clears every backoff.)", name));
         return Ok(0);
     }
+    // state.json has one writer: retry_blocked stops an installed daemon
+    // before it changes the backoffs and brings the same service back; a
+    // deliberately stopped client gets one foreground pass and stays stopped.
     let ops = get_daemon_ops();
     let before = ops.state();
-    if before.loaded {
-        // Stopping and restarting the background service is the service
-        // card's work (M5); until then a loaded service keeps its state file.
-        say(&format!("[hx] the background service is loaded ({}); `{} retry` cannot stop and restart it in this build. Run `{} stop` first.", ops.manager_name, name, name));
-        return Ok(64);
-    }
+    let consent = if before.loaded { crate::connect::resolve_dotfile_consent(&ops, args) } else { crate::service::Consent::Denied };
     drop(store);
-    let fresh = Store::load("main");
-    let (_files, sessions) = if all { fresh.clear_all_failures()? } else { fresh.clear_blocked_failures()? };
-    let ctx = Ctx::new(cfg, fresh, Logger::new(false, ""), name, Arc::new(AtomicU64::new(0)));
-    let pass = tick_once(&ctx, &WatchOptions { only: None, one_shot: true, chunk_limit_bytes: None, chunk_growth: false }, &|_| {});
-    ctx.store.drain();
-    let pass = pass?;
+    let r = crate::maintenance::retry_blocked(cfg, consent, all, Logger::new(false, ""), name)?;
     let what = if all { "backed-off" } else { "blocked" };
-    say(&format!("Released {} {} session{}; ran one retry pass now.", sessions, what, if sessions == 1 { "" } else { "s" }));
-    say(&format!("Retry pass complete. uploaded={} failed={}", pass.uploaded, pass.failed));
+    let s = if r.sessions == 1 { "" } else { "s" };
+    if r.restarted {
+        say(&format!("Released {} {} session{}; daemon restarted for an immediate retry.", r.sessions, what, s));
+    } else {
+        say(&format!("Released {} {} session{}; ran one retry pass now.", r.sessions, what, s));
+        if let Some((uploaded, failed)) = r.pass {
+            say(&format!("Retry pass complete. uploaded={} failed={}", uploaded, failed));
+        }
+    }
     say(&format!("Check the result with `{} status`.", name));
     Ok(0)
 }

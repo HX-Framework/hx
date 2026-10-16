@@ -35,16 +35,17 @@ name: Differential harness
 # on a manual run — from another ref, or downloaded from a URL (an hx2
 # release asset, say) with `candidate_name: hx2`.
 #
-# On the hx-2.0 branch four more jobs run the Rust port (hx2/, the daemon)
-# against the same reference:
-#   hx2-build         cargo build --release on both runners;
-#   hx2-differential  the reference compared with hx2 on the daemon surface:
-#                     every scenario with the steps of the next card (the hx
-#                     ui API, update, connect, disconnect) removed
-#                     (harness/run/scenarios.ts, daemonScenarios), passed as
-#                     `candidate_name: hx2`, with the goldens; the hot-path
-#                     shapes in hx2-differential-hot, as for the TypeScript
-#                     jobs, both sampling the runner's memory;
+# On the hx-2.0 branch four more jobs run the Rust port (hx2/, the whole
+# client since M5) against the same reference:
+#   hx2-build         the web UI (bun), then cargo build --release and the
+#                     unit tests on both runners; the tests check the service
+#                     definitions against the TypeScript client's renderings;
+#   hx2-differential  the reference compared with hx2 on every scenario but
+#                     the hot-path shapes (`--scenarios main`: the daemon, the
+#                     CLI, the hx ui API, update, connect and disconnect),
+#                     passed as `candidate_name: hx2`, with the goldens; the
+#                     hot-path shapes in hx2-differential-hot, as for the
+#                     TypeScript jobs, both sampling the runner's memory;
 #   hx2-self          hx2 compared with itself on the same scenarios
 #                     (hx2-self-hot for the hot-path shapes);
 #   hx2-measure       harness/run/measure.ts with hx2 as the candidate:
@@ -611,6 +612,21 @@ jobs:
         with:
           workspaces: hx2
 
+      # `hx ui` serves the React app as built: the same ui/ sources, lockfile
+      # and Bun as the TypeScript build (harness/ci/build.sh), embedded into
+      # the binary by hx2/build.rs.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Build the web UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ui
+          bun install --frozen-lockfile
+          bun run build
+
       - name: Build
         shell: bash
         run: |
@@ -621,6 +637,19 @@ jobs:
           ls -l bin/hx2
           bin/hx2 --version
 
+      # The unit tests, among them the service definitions against the
+      # TypeScript client's own renderings for the same binary and HOME
+      # (one service slot: the files may differ in the binary's path alone).
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          # Both renderings take their log and state paths from the same HOME.
+          defs="$RUNNER_TEMP/service-defs"
+          bun harness/run/service-defs.ts --out "$defs"
+          HX2_TS_SERVICE_DEFS="$defs" cargo test --manifest-path hx2/Cargo.toml
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hx2-${{ matrix.os }}
@@ -628,7 +657,7 @@ jobs:
           if-no-files-found: error
 
   hx2-differential:
-    name: Reference vs hx2, daemon surface (${{ matrix.os }})
+    name: Reference vs hx2 (${{ matrix.os }})
     needs: [reference, hx2-build]
     strategy:
       fail-fast: false
@@ -658,7 +687,7 @@ jobs:
       # goldens hold the file sizes of that path's length, and the candidate's
       # name is normalized in its output before the home path is masked, so a
       # home path spelling "hx2" would come out of the first step unmaskable.
-      - name: Run the harness on the daemon surface, sampling memory
+      - name: Run the harness, sampling memory
         shell: bash
         env:
           RUNNER_OS_NAME: ${{ runner.os }}
@@ -692,7 +721,7 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/reference/hx \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx-harness" \
+            --scenarios main --out harness-out --work "$RUNNER_TEMP/hx-harness" \
             --goldens "harness/golden/$RUNNER_OS_NAME" --write-goldens "harness-out/goldens/$RUNNER_OS_NAME"
 
       - name: Report
@@ -709,7 +738,7 @@ jobs:
           if-no-files-found: warn
 
   hx2-self:
-    name: hx2 vs itself, daemon surface (${{ matrix.os }})
+    name: hx2 vs itself (${{ matrix.os }})
     needs: hx2-build
     strategy:
       fail-fast: false
@@ -729,7 +758,7 @@ jobs:
           name: hx2-${{ matrix.os }}
           path: bin/hx2
 
-      - name: Run the harness on the daemon surface, sampling memory
+      - name: Run the harness, sampling memory
         shell: bash
         run: |
           set -euo pipefail
@@ -761,7 +790,7 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/hx2/hx2 --reference-name hx2 \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx-harness"
+            --scenarios main --out harness-out --work "$RUNNER_TEMP/hx-harness"
 
       - name: Report
         if: always()

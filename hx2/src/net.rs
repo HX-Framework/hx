@@ -1,22 +1,28 @@
-//! The gateway calls of the hot path (src/uploader.ts) over an HTTP/1.1
-//! client that sends exactly the request Bun's fetch sends.
+//! The gateway calls (src/uploader.ts and the commands around it) over an
+//! HTTP/1.1 client that sends exactly the request Bun's fetch sends.
 //!
 //! The TypeScript client sets no User-Agent, so every gateway call carries
 //! Bun's defaults: `accept: */*`, `accept-encoding: gzip, deflate, br, zstd`,
 //! `connection: keep-alive`, `user-agent: Bun/1.3.14`, plus `content-type`
-//! and `content-length` when there is a body. hx2 sends the same headers with
-//! one difference the program decided on 10-16: it names itself,
-//! `user-agent: hx2/<version>`, so the hx and hx2 fleets can be told apart
-//! before hx is retired. The differential harness compares every other
-//! header (all but `host`) and checks that hx2 sends exactly that one. The
-//! client here speaks plain HTTP to loopback hosts, the one transport the
-//! TypeScript client allows without TLS; HTTPS to the hosted gateway is the
-//! next card's work (the TLS stack is not part of the hot-path spike).
+//! and `content-length` when there is a body (a POST without one sends
+//! `content-length: 0`). hx2 sends the same headers with one difference the
+//! program decided on 10-16: it names itself, `user-agent: hx2/<version>`, so
+//! the hx and hx2 fleets can be told apart before hx is retired. The
+//! differential harness compares every other header (all but `host`) and
+//! checks that hx2 sends exactly that one.
+//!
+//! The transport is the one Bun's fetch gives the client: HTTPS anywhere
+//! (rustls, trusting the Mozilla root store Bun bundles plus the PEM file
+//! NODE_EXTRA_CA_CERTS names), plain HTTP to loopback hosts (the only
+//! cleartext the client allows), kept-alive connections per origin, a
+//! response body decoded by its content-encoding (gzip, deflate, br and zstd,
+//! the four the request advertises), and redirects followed up to 20 hops,
+//! unless the caller takes them itself (`hx update` checks every hop).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::js::{js, lossy, slice};
@@ -159,7 +165,15 @@ pub const UNABLE_TO_CONNECT: &str = "Unable to connect. Is the computer able to 
 const CONNECTION_CLOSED: &str =
     "The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()";
 
+
 // ── Transport ───────────────────────────────────────────────────────────────
+
+/// Bun's message for a redirect chain past its limit.
+const TOO_MANY_REDIRECTS: &str =
+    "The response redirected too many times. For more information, pass `verbose: true` in the second argument to fetch()";
+
+/// The redirect hops fetch follows before it gives up.
+const MAX_REDIRECTS: usize = 20;
 
 struct Url {
     scheme: String,
@@ -171,9 +185,11 @@ struct Url {
 
 fn parse_url(url: &str) -> Option<Url> {
     let (scheme, rest) = url.split_once("://")?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    let rest = rest.split('#').next().unwrap_or("");
+    let (authority, path) = match rest.find(['/', '?']) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+        Some(i) => (&rest[..i], format!("/{}", &rest[i..])),
+        None => (rest, "/".to_string()),
     };
     let authority = authority.split('@').last().unwrap_or(authority);
     let (host, port) = if authority.starts_with('[') {
@@ -187,8 +203,51 @@ fn parse_url(url: &str) -> Option<Url> {
             None => (authority.to_string(), None),
         }
     };
-    let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
-    Some(Url { scheme: scheme.to_lowercase(), host, port: port.unwrap_or(default_port), target: path.to_string() })
+    if host.is_empty() {
+        return None;
+    }
+    let scheme = scheme.to_lowercase();
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    Some(Url { scheme, host: host.to_lowercase(), port: port.unwrap_or(default_port), target: path })
+}
+
+/// `scheme://host[:port]` of a URL, the origin a redirect is compared against.
+fn origin_of(url: &str) -> String {
+    match parse_url(url) {
+        Some(u) => format!("{}://{}:{}", u.scheme, u.host, u.port),
+        None => String::new(),
+    }
+}
+
+/// `new URL(location, base).toString()` for the shapes a Location header takes.
+pub fn resolve_url(base: &str, location: &str) -> String {
+    if location.contains("://") {
+        return location.to_string();
+    }
+    let (scheme, rest) = match base.split_once("://") {
+        Some(x) => x,
+        None => return location.to_string(),
+    };
+    if let Some(rest_loc) = location.strip_prefix("//") {
+        return format!("{}://{}", scheme, rest_loc);
+    }
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    if location.starts_with('/') {
+        return format!("{}://{}{}", scheme, authority, location);
+    }
+    let path = &rest[auth_end..];
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    if location.starts_with('?') {
+        return format!("{}://{}{}{}", scheme, authority, if path.is_empty() { "/" } else { path }, location);
+    }
+    let dir = match path.rfind('/') {
+        Some(i) => &path[..=i],
+        None => "/",
+    };
+    let joined = crate::fsutil::normalize_posix(&format!("{}{}", dir, location));
+    let keep_slash = location.ends_with('/') && !joined.ends_with('/');
+    format!("{}://{}{}{}", scheme, authority, joined, if keep_slash { "/" } else { "" })
 }
 
 fn is_loopback_host(h: &str) -> bool {
@@ -228,6 +287,10 @@ pub fn assert_secure_fetch_url(url: &str, label: &str) -> Result<(), NetError> {
 
 pub struct Response {
     pub status: u16,
+    /// The reason phrase of the status line (`res.statusText`).
+    pub status_text: String,
+    /// Header names lowercased, in the order the server sent them.
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -239,28 +302,121 @@ impl Response {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+
+    /// `res.headers.get(name)` for a lowercase name.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
 }
 
-/// Idle keep-alive connections by host:port — what Bun's fetch keeps between
+/// The client's TLS settings: the Mozilla roots, NODE_EXTRA_CA_CERTS, HTTP/1.1.
+fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Bun, like Node, adds the certificates of the PEM file this names.
+        if let Ok(path) = std::env::var("NODE_EXTRA_CA_CERTS") {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                for der in pem_certificates(&text) {
+                    let _ = roots.add(rustls::pki_types::CertificateDer::from(der));
+                }
+            }
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the ring provider supports the default TLS versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(cfg)
+    })
+    .clone()
+}
+
+/// The DER bodies of every `CERTIFICATE` block of a PEM text.
+fn pem_certificates(text: &str) -> Vec<Vec<u8>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(BEGIN) {
+        let after = &rest[start + BEGIN.len()..];
+        let end = match after.find(END) {
+            Some(e) => e,
+            None => break,
+        };
+        if let Some(der) = crate::crypto::base64_decode(&after[..end]) {
+            if !der.is_empty() {
+                out.push(der);
+            }
+        }
+        rest = &after[end + END.len()..];
+    }
+    out
+}
+
+/// One connection: plain TCP to loopback, or TLS.
+enum Conn {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Conn {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Conn::Plain(s) => s,
+            Conn::Tls(t) => &t.sock,
+        }
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.read(buf),
+            Conn::Tls(t) => t.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.write(buf),
+            Conn::Tls(t) => t.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Plain(s) => s.flush(),
+            Conn::Tls(t) => t.flush(),
+        }
+    }
+}
+
+/// Idle keep-alive connections by origin — what Bun's fetch keeps between
 /// requests, so a pass over thousands of sessions reuses a handful of
 /// connections instead of opening four per session. (A fresh connection per
 /// request exhausted macOS's 16k ephemeral ports after about 4,000 sessions
 /// of the 10,000-session scenario; the port range and TIME_WAIT are not the
 /// servers' business, the connection count is Bun's behavior.)
-fn idle_pool() -> &'static Mutex<HashMap<String, Vec<TcpStream>>> {
-    static POOL: OnceLock<Mutex<HashMap<String, Vec<TcpStream>>>> = OnceLock::new();
+fn idle_pool() -> &'static Mutex<HashMap<String, Vec<Conn>>> {
+    static POOL: OnceLock<Mutex<HashMap<String, Vec<Conn>>>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Idle connections kept per host beyond which a returned one is closed.
+/// Idle connections kept per origin beyond which a returned one is closed.
 const IDLE_PER_HOST: usize = 16;
 
-fn take_idle(key: &str) -> Option<TcpStream> {
+fn take_idle(key: &str) -> Option<Conn> {
     let mut p = idle_pool().lock().unwrap_or_else(|e| e.into_inner());
     p.get_mut(key).and_then(|v| v.pop())
 }
 
-fn put_idle(key: &str, s: TcpStream) {
+fn put_idle(key: &str, s: Conn) {
     let mut p = idle_pool().lock().unwrap_or_else(|e| e.into_inner());
     let v = p.entry(key.to_string()).or_default();
     if v.len() < IDLE_PER_HOST {
@@ -268,10 +424,40 @@ fn put_idle(key: &str, s: TcpStream) {
     }
 }
 
-/// One HTTP/1.1 request under a deadline, on a kept-alive connection when
-/// the pool has one for the host, else on a fresh one. A pooled connection
-/// the peer closed while it sat idle fails before any response byte
-/// arrives; the request is then sent once more on a fresh connection.
+/// What a failed TLS handshake or read says, in the words Bun uses where it
+/// has them.
+fn tls_message(e: &std::io::Error) -> Option<String> {
+    let inner = e.get_ref()?;
+    let tls = inner.downcast_ref::<rustls::Error>()?;
+    Some(match tls {
+        rustls::Error::InvalidCertificate(c) => match c {
+            rustls::CertificateError::UnknownIssuer => "unable to get local issuer certificate".to_string(),
+            rustls::CertificateError::Expired => "certificate has expired".to_string(),
+            rustls::CertificateError::NotValidForName => "Hostname/IP does not match certificate's altnames".to_string(),
+            other => format!("certificate verify failed: {:?}", other),
+        },
+        other => other.to_string(),
+    })
+}
+
+fn timed_out(label: &str, timeout_ms: u64) -> NetError {
+    NetError::Timeout(format!("{} timed out after {}s", label, crate::js::math_round(timeout_ms as f64 / 1000.0) as i64))
+}
+
+fn map_io(e: std::io::Error, label: &str, timeout_ms: u64) -> NetError {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => timed_out(label, timeout_ms),
+        std::io::ErrorKind::ConnectionRefused => NetError::Other(UNABLE_TO_CONNECT.to_string()),
+        _ => match tls_message(&e) {
+            Some(m) => NetError::Other(m),
+            None => NetError::Other(CONNECTION_CLOSED.to_string()),
+        },
+    }
+}
+
+/// One HTTP/1.1 request under a deadline, redirects followed the way fetch
+/// follows them: a 303 (and a 301 or 302 answering a POST) turns into a GET
+/// without a body, and a hop to another origin drops the authorization header.
 pub fn request(
     label: &str,
     method: &str,
@@ -280,36 +466,108 @@ pub fn request(
     body: Option<&[u8]>,
     timeout_ms: u64,
 ) -> Result<Response, NetError> {
-    let u = parse_url(url).ok_or_else(|| NetError::Other(format!("{}: invalid url", label)))?;
-    if u.scheme != "http" {
-        return Err(NetError::Other(format!("{}: {} is not supported by this build yet (plain http to loopback only)", label, u.scheme)));
-    }
-    let deadline = Duration::from_millis(timeout_ms);
-    let timed_out = || NetError::Timeout(format!("{} timed out after {}s", label, crate::js::math_round(timeout_ms as f64 / 1000.0) as i64));
-    let io_err = |e: std::io::Error| -> NetError {
-        match e.kind() {
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => timed_out(),
-            std::io::ErrorKind::ConnectionRefused => NetError::Other(UNABLE_TO_CONNECT.to_string()),
-            _ => NetError::Other(CONNECTION_CLOSED.to_string()),
+    let mut current = url.to_string();
+    let mut method = method.to_string();
+    let mut body = body;
+    let mut headers: Vec<(&str, String)> = headers.to_vec();
+    for hop in 0..=MAX_REDIRECTS {
+        let res = send_once(label, &method, &current, &headers, body, timeout_ms, &mut |_, _| {})?;
+        if !matches!(res.status, 301 | 302 | 303 | 307 | 308) {
+            return Ok(res);
         }
+        let location = match res.header("location") {
+            Some(l) => l.to_string(),
+            None => return Ok(res),
+        };
+        if hop == MAX_REDIRECTS {
+            return Err(NetError::Other(TOO_MANY_REDIRECTS.to_string()));
+        }
+        let next = resolve_url(&current, &location);
+        let to_get = (res.status == 303 && method != "GET" && method != "HEAD") || ((res.status == 301 || res.status == 302) && method == "POST");
+        if to_get {
+            method = "GET".to_string();
+            body = None;
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+        }
+        if origin_of(&next) != origin_of(&current) {
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+        }
+        current = next;
+    }
+    Err(NetError::Other(TOO_MANY_REDIRECTS.to_string()))
+}
+
+/// One request with no redirect following: a 3xx comes back as it is
+/// (fetch's `redirect: "manual"`), and `progress` hears (body bytes received,
+/// content-length or 0) for every block of a 2xx body as it arrives.
+pub fn request_manual(
+    label: &str,
+    method: &str,
+    url: &str,
+    headers: &[(&str, String)],
+    timeout_ms: u64,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Response, NetError> {
+    send_once(label, method, url, headers, None, timeout_ms, progress)
+}
+
+/// One exchange on a kept-alive connection when the pool has one for the
+/// origin, else on a fresh one. A pooled connection the peer closed while it
+/// sat idle fails before any response byte arrives; the request is then sent
+/// once more on a fresh connection.
+fn send_once(
+    label: &str,
+    method: &str,
+    url: &str,
+    headers: &[(&str, String)],
+    body: Option<&[u8]>,
+    timeout_ms: u64,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Response, NetError> {
+    let u = parse_url(url).ok_or_else(|| NetError::Other(format!("{}: invalid url", label)))?;
+    let tls = match u.scheme.as_str() {
+        "https" => true,
+        "http" => false,
+        other => return Err(NetError::Other(format!("{}: unsupported protocol {}:", label, other))),
     };
-    let connect = || -> Result<TcpStream, NetError> {
+    let deadline = Duration::from_millis(timeout_ms);
+    let connect = || -> Result<Conn, NetError> {
         let addrs = (u.host.as_str(), u.port).to_socket_addrs().map_err(|_| NetError::Other(UNABLE_TO_CONNECT.to_string()))?;
         let mut last_err: Option<std::io::Error> = None;
+        let mut stream: Option<TcpStream> = None;
         for addr in addrs {
             match TcpStream::connect_timeout(&addr, deadline) {
-                Ok(s) => return Ok(s),
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(match last_err {
-            Some(e) if e.kind() == std::io::ErrorKind::TimedOut => timed_out(),
-            _ => NetError::Other(UNABLE_TO_CONNECT.to_string()),
-        })
+        let s = match stream {
+            Some(s) => s,
+            None => {
+                return Err(match last_err {
+                    Some(e) if e.kind() == std::io::ErrorKind::TimedOut => timed_out(label, timeout_ms),
+                    _ => NetError::Other(UNABLE_TO_CONNECT.to_string()),
+                })
+            }
+        };
+        let _ = s.set_nodelay(true);
+        if !tls {
+            return Ok(Conn::Plain(s));
+        }
+        let name = rustls::pki_types::ServerName::try_from(u.host.as_str())
+            .map(|n| n.to_owned())
+            .map_err(|_| NetError::Other(format!("{}: invalid host name {}", label, u.host)))?;
+        let conn = rustls::ClientConnection::new(tls_config(), name).map_err(|e| NetError::Other(e.to_string()))?;
+        Ok(Conn::Tls(Box::new(rustls::StreamOwned::new(conn, s))))
     };
 
-    let host_header = if u.port == 80 { u.host.clone() } else { format!("{}:{}", u.host, u.port) };
-    let key = format!("{}:{}", u.host, u.port);
+    let default_port = if tls { 443 } else { 80 };
+    let host_name = if u.host.contains(':') { format!("[{}]", u.host) } else { u.host.clone() };
+    let host_header = if u.port == default_port { host_name } else { format!("{}:{}", host_name, u.port) };
+    let key = format!("{}://{}:{}", u.scheme, u.host, u.port);
     let mut head = String::new();
     head.push_str(&format!("{} {} HTTP/1.1\r\n", method, u.target));
     head.push_str(&format!("host: {}\r\n", host_header));
@@ -325,108 +583,13 @@ pub fn request(
     }
     head.push_str("\r\n");
 
-    // The exchange on one connection: the request, then the whole response.
-    // Ok((response, keep)): keep says the connection may serve another
-    // request. Err((error, started)): started says response bytes had
-    // arrived, so the peer may have acted on the request.
-    let exchange = |stream: &mut TcpStream| -> Result<(Response, bool), (NetError, bool)> {
-        let _ = stream.set_nodelay(true);
-        let _ = stream.set_read_timeout(Some(deadline));
-        let _ = stream.set_write_timeout(Some(deadline));
-        stream.write_all(head.as_bytes()).map_err(|e| (io_err(e), false))?;
-        if let Some(b) = body {
-            stream.write_all(b).map_err(|e| (io_err(e), false))?;
-        }
-        stream.flush().map_err(|e| (io_err(e), false))?;
-
-        // Headers, then the body by content-length or chunked transfer
-        // coding, else until the peer closes (which ends the connection).
-        let mut buf: Vec<u8> = Vec::with_capacity(8192);
-        let mut tmp = [0u8; 16384];
-        let header_end;
-        loop {
-            if let Some(i) = find_header_end(&buf) {
-                header_end = i;
-                break;
-            }
-            let n = stream.read(&mut tmp).map_err(|e| (io_err(e), !buf.is_empty()))?;
-            if n == 0 {
-                return Err((NetError::Other(CONNECTION_CLOSED.to_string()), !buf.is_empty()));
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        let head_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-        let mut lines = head_text.split("\r\n");
-        let status_line = lines.next().unwrap_or("");
-        let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let mut keep = !status_line.starts_with("HTTP/1.0");
-        let mut content_length: Option<usize> = None;
-        let mut chunked = false;
-        for line in lines {
-            if let Some((k, v)) = line.split_once(':') {
-                let k = k.trim().to_lowercase();
-                let v = v.trim();
-                if k == "content-length" {
-                    content_length = v.parse().ok();
-                } else if k == "transfer-encoding" && v.to_lowercase().contains("chunked") {
-                    chunked = true;
-                } else if k == "connection" {
-                    let v = v.to_lowercase();
-                    if v.contains("close") {
-                        keep = false;
-                    } else if v.contains("keep-alive") {
-                        keep = true;
-                    }
-                }
-            }
-        }
-        let mut rest: Vec<u8> = buf[header_end + 4..].to_vec();
-        let body_bytes: Vec<u8> = if method == "HEAD" || status == 204 || status == 304 {
-            Vec::new()
-        } else if chunked {
-            loop {
-                if let Some(decoded) = decode_chunked(&rest) {
-                    break decoded;
-                }
-                let n = stream.read(&mut tmp).map_err(|e| (io_err(e), true))?;
-                if n == 0 {
-                    return Err((NetError::Other(CONNECTION_CLOSED.to_string()), true));
-                }
-                rest.extend_from_slice(&tmp[..n]);
-            }
-        } else if let Some(len) = content_length {
-            while rest.len() < len {
-                let n = stream.read(&mut tmp).map_err(|e| (io_err(e), true))?;
-                if n == 0 {
-                    return Err((NetError::Other(CONNECTION_CLOSED.to_string()), true));
-                }
-                rest.extend_from_slice(&tmp[..n]);
-            }
-            rest.truncate(len);
-            rest
-        } else {
-            keep = false;
-            loop {
-                let n = match stream.read(&mut tmp) {
-                    Ok(n) => n,
-                    Err(e) => return Err((io_err(e), true)),
-                };
-                if n == 0 {
-                    break rest;
-                }
-                rest.extend_from_slice(&tmp[..n]);
-            }
-        };
-        Ok((Response { status, body: body_bytes }, keep))
-    };
-
     let mut pooled = take_idle(&key);
     loop {
         let (mut stream, reused) = match pooled.take() {
             Some(s) => (s, true),
             None => (connect()?, false),
         };
-        match exchange(&mut stream) {
+        match exchange(&mut stream, &head, body, method, deadline, label, timeout_ms, progress) {
             Ok((resp, keep)) => {
                 if keep {
                     put_idle(&key, stream);
@@ -443,33 +606,261 @@ pub fn request(
     }
 }
 
+/// The exchange on one connection: the request, then the whole response.
+/// Ok((response, keep)): keep says the connection may serve another request.
+/// Err((error, started)): started says response bytes had arrived, so the
+/// peer may have acted on the request.
+#[allow(clippy::too_many_arguments)]
+fn exchange(
+    stream: &mut Conn,
+    head: &str,
+    body: Option<&[u8]>,
+    method: &str,
+    deadline: Duration,
+    label: &str,
+    timeout_ms: u64,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(Response, bool), (NetError, bool)> {
+    let _ = stream.tcp().set_read_timeout(Some(deadline));
+    let _ = stream.tcp().set_write_timeout(Some(deadline));
+    let io = |e: std::io::Error, started: bool| (map_io(e, label, timeout_ms), started);
+    stream.write_all(head.as_bytes()).map_err(|e| io(e, false))?;
+    if let Some(b) = body {
+        if !b.is_empty() {
+            stream.write_all(b).map_err(|e| io(e, false))?;
+        }
+    }
+    stream.flush().map_err(|e| io(e, false))?;
+
+    // Headers, then the body by content-length or chunked transfer coding,
+    // else until the peer closes (which ends the connection). A 1xx interim
+    // answer is skipped.
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut tmp = vec![0u8; 65536];
+    let (status, status_text, resp_headers, keep_hint, rest) = loop {
+        let header_end;
+        loop {
+            if let Some(i) = find_header_end(&buf) {
+                header_end = i;
+                break;
+            }
+            let n = stream.read(&mut tmp).map_err(|e| io(e, !buf.is_empty()))?;
+            if n == 0 {
+                return Err((NetError::Other(CONNECTION_CLOSED.to_string()), !buf.is_empty()));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let head_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let mut lines = head_text.split("\r\n");
+        let status_line = lines.next().unwrap_or("");
+        let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let rest = buf[header_end + 4..].to_vec();
+        if (100..200).contains(&status) && status != 101 {
+            buf = rest;
+            continue;
+        }
+        let mut hs: Vec<(String, String)> = Vec::new();
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                hs.push((k.trim().to_lowercase(), v.trim().to_string()));
+            }
+        }
+        let status_text = status_line.splitn(3, ' ').nth(2).unwrap_or("").trim().to_string();
+        break (status, status_text, hs, !status_line.starts_with("HTTP/1.0"), rest);
+    };
+    let mut keep = keep_hint;
+    let mut content_length: Option<u64> = None;
+    let mut chunked = false;
+    for (k, v) in &resp_headers {
+        if k == "content-length" {
+            content_length = v.parse().ok();
+        } else if k == "transfer-encoding" && v.to_lowercase().contains("chunked") {
+            chunked = true;
+        } else if k == "connection" {
+            let v = v.to_lowercase();
+            if v.contains("close") {
+                keep = false;
+            } else if v.contains("keep-alive") {
+                keep = true;
+            }
+        }
+    }
+    let total = if chunked { 0 } else { content_length.unwrap_or(0) };
+    // Progress is for a body the caller will keep: a 2xx (fetch hands an
+    // error status back before anyone reads its body).
+    let reporting = (200..300).contains(&status);
+    let mut report = |n: u64| {
+        if reporting {
+            progress(n, total);
+        }
+    };
+    let raw_body: Vec<u8> = if method == "HEAD" || status == 204 || status == 304 {
+        Vec::new()
+    } else if chunked {
+        let mut dec = ChunkedDecoder::default();
+        let mut out: Vec<u8> = Vec::new();
+        dec.feed(&rest, &mut out).map_err(|_| (NetError::Other(CONNECTION_CLOSED.to_string()), true))?;
+        report(out.len() as u64);
+        while !dec.done {
+            let n = stream.read(&mut tmp).map_err(|e| io(e, true))?;
+            if n == 0 {
+                return Err((NetError::Other(CONNECTION_CLOSED.to_string()), true));
+            }
+            dec.feed(&tmp[..n], &mut out).map_err(|_| (NetError::Other(CONNECTION_CLOSED.to_string()), true))?;
+            report(out.len() as u64);
+        }
+        out
+    } else if let Some(len) = content_length {
+        let len = len as usize;
+        let mut out = rest;
+        if out.capacity() < len {
+            out.reserve(len - out.len().min(len));
+        }
+        report(out.len().min(len) as u64);
+        while out.len() < len {
+            let n = stream.read(&mut tmp).map_err(|e| io(e, true))?;
+            if n == 0 {
+                return Err((NetError::Other(CONNECTION_CLOSED.to_string()), true));
+            }
+            out.extend_from_slice(&tmp[..n]);
+            report(out.len().min(len) as u64);
+        }
+        out.truncate(len);
+        out
+    } else {
+        keep = false;
+        let mut out = rest;
+        report(out.len() as u64);
+        loop {
+            let n = match stream.read(&mut tmp) {
+                Ok(n) => n,
+                // A TLS peer that closes without close_notify ends a
+                // close-delimited body the way a plain close does.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(io(e, true)),
+            };
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&tmp[..n]);
+            report(out.len() as u64);
+        }
+        out
+    };
+    let encoding = resp_headers.iter().find(|(k, _)| k == "content-encoding").map(|(_, v)| v.clone());
+    let body_bytes = if raw_body.is_empty() {
+        raw_body
+    } else {
+        decode_body(encoding.as_deref(), raw_body).map_err(|m| (NetError::Other(m), true))?
+    };
+    Ok((Response { status, status_text, headers: resp_headers, body: body_bytes }, keep))
+}
+
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Decode a complete chunked body; None while more bytes are needed.
-fn decode_chunked(data: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    loop {
-        let line_end = data[i..].windows(2).position(|w| w == b"\r\n")? + i;
-        let size_text = std::str::from_utf8(&data[i..line_end]).ok()?;
-        let size_text = size_text.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16).ok()?;
-        i = line_end + 2;
-        if size == 0 {
-            // Trailers end with an empty line.
-            if data.len() >= i + 2 {
-                return Some(out);
+/// `transfer-encoding: chunked`, decoded as the bytes arrive.
+#[derive(Default)]
+struct ChunkedDecoder {
+    pending: Vec<u8>,
+    /// Data bytes left in the current chunk.
+    remaining: usize,
+    in_data: bool,
+    need_crlf: bool,
+    trailers: bool,
+    done: bool,
+}
+
+impl ChunkedDecoder {
+    fn feed(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
+        self.pending.extend_from_slice(data);
+        let mut i = 0usize;
+        while !self.done {
+            if self.in_data {
+                let take = (self.pending.len() - i).min(self.remaining);
+                out.extend_from_slice(&self.pending[i..i + take]);
+                i += take;
+                self.remaining -= take;
+                if self.remaining > 0 {
+                    break;
+                }
+                self.in_data = false;
+                self.need_crlf = true;
             }
-            return None;
+            if self.need_crlf {
+                if self.pending.len() - i < 2 {
+                    break;
+                }
+                i += 2;
+                self.need_crlf = false;
+            }
+            let line_end = match self.pending[i..].windows(2).position(|w| w == b"\r\n") {
+                Some(p) => i + p,
+                None => break,
+            };
+            let line = self.pending[i..line_end].to_vec();
+            i = line_end + 2;
+            if self.trailers {
+                if line.is_empty() {
+                    self.done = true;
+                }
+                continue;
+            }
+            let text = std::str::from_utf8(&line).map_err(|_| ())?;
+            let size_text = text.split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(size_text, 16).map_err(|_| ())?;
+            if size == 0 {
+                self.trailers = true;
+                continue;
+            }
+            self.remaining = size;
+            self.in_data = true;
         }
-        if data.len() < i + size + 2 {
-            return None;
-        }
-        out.extend_from_slice(&data[i..i + size]);
-        i += size + 2;
+        self.pending.drain(..i);
+        Ok(())
     }
+}
+
+/// Undo the codings a response names, last applied first, the way fetch
+/// hands back a decoded body. An unknown coding leaves the bytes as they are.
+fn decode_body(encoding: Option<&str>, body: Vec<u8>) -> Result<Vec<u8>, String> {
+    let enc = match encoding {
+        Some(e) => e.to_ascii_lowercase(),
+        None => return Ok(body),
+    };
+    let fail = |e: std::io::Error| format!("Decompression error: {}", e);
+    let mut data = body;
+    for coding in enc.split(',').map(|c| c.trim()).collect::<Vec<_>>().into_iter().rev() {
+        data = match coding {
+            "" | "identity" => data,
+            "gzip" | "x-gzip" => {
+                let mut out = Vec::new();
+                flate2::read::MultiGzDecoder::new(&data[..]).read_to_end(&mut out).map_err(fail)?;
+                out
+            }
+            "deflate" => {
+                // Servers send either zlib-wrapped or raw deflate under this name.
+                let mut out = Vec::new();
+                match flate2::read::ZlibDecoder::new(&data[..]).read_to_end(&mut out) {
+                    Ok(_) => out,
+                    Err(_) => {
+                        let mut raw = Vec::new();
+                        flate2::read::DeflateDecoder::new(&data[..]).read_to_end(&mut raw).map_err(fail)?;
+                        raw
+                    }
+                }
+            }
+            "br" => {
+                let mut out = Vec::new();
+                brotli_decompressor::Decompressor::new(&data[..], 4096).read_to_end(&mut out).map_err(fail)?;
+                out
+            }
+            "zstd" => zstd::stream::decode_all(&data[..]).map_err(fail)?,
+            _ => return Ok(data),
+        };
+    }
+    Ok(data)
 }
 
 // ── The protocol ────────────────────────────────────────────────────────────
