@@ -18,7 +18,8 @@ harness/
                   fixture), normalization rules, comparators, shared types
   run/            scenarios.ts (the catalog), run-scenario.ts (drive one
                   binary), run-harness.ts (reference vs candidate + report),
-                  measure.ts (the design-fix numbers: rusage + strace)
+                  measure.ts (the design-fix numbers and hx2's exit check:
+                  rusage, strace, per-second RSS and CPU samples)
   golden/<os>/    committed, normalized CLI outputs per scenario step
   broken/         patches that make a candidate differ on purpose
   ci/build.sh     one binary from one source checkout, as release.yml does it
@@ -44,6 +45,8 @@ stored bytes must match byte for byte).
 | `small` | The curated core: 13 Claude Code transcripts covering every parsing quirk (a user and an AI title, a plan attachment, a cwd-change twin, a 70 MB file past the 64 MB per-pass budget, a 5 MiB single line, emoji/CJK/a lone surrogate, a message past the 4,000-unit cap, a file and a directory older than the 30-day window, an empty file), two subagent lanes with meta sidecars, a workflow run (journal + script + lane), tasks for two sessions, a team config, git repositories the cwds point at (a clone, a linked worktree, a non-GitHub remote) and an encoded `@owner@name@xxxxxx` scratch cwd; four Codex rollouts (CLI, desktop originator, archived) and a `state_5.sqlite` with a user name, an AI title and a missing row; five Claude Desktop session files and a Local Storage leveldb with a stale `.log` and an authoritative Snappy-compressed `.ldb` (two groups, assignments, unread ids, a vestigial `dframe-store`). |
 | `claude-like` | The core plus 600 sessions over 150 project dirs, 60 lanes, 30 workflow runs, 120 task sets, 300 Claude Desktop files: the shape of a real `~/.claude`. |
 | `synthetic-10k` | The core plus 10,000 sessions over 200 project dirs with 500 lanes, 30 KB each. |
+| `hot-small`, `hot-claude-like`, `hot-10k` | The hot-path shapes: the same Claude Code parent transcripts and git repositories, nothing else (see The hot-path surface below). |
+| `founder` | The measurement tree: the hot core plus 4,800 transcripts over 700 project dirs and 36,000 Claude Desktop session files. |
 
 Timestamps inside files are fixed; only mtimes follow the clock (set relative
 to the moment of generation), so discovery windows and tiers classify the
@@ -118,6 +121,39 @@ surface identical: stored bytes, request sequences, `state.json`,
 | (not a fix) the daemon's clock | The held sessions' retries land in two ticks whose split varies run to run, so the per-tick counters and the pass-level backoff length vary with them — found by the candidate-vs-itself jobs of the first run | per-tick counters summed, backoff length masked, in daemon steps |
 | Saved Claude Desktop index (`ccd-index.json`) | A new cache file in `~/.let/hx` | compared when the reference writes it |
 | File events as hints | Nothing, unless watching fails: one `[hx] file events unavailable (…)` line | none (a failure to arm shows up as a diff, which is the point) |
+
+### The hot-path surface (hx2, M3)
+
+The Rust port (`hx2/`, built from the `hx-2.0` branch) starts with the hot
+path: Claude Code transcripts through discovery (the 30-day window, newest
+file wins per session), the tiered catalog with file events as hints and the
+60 s safety sweep, chunking (4 MiB, cut at the last newline or the whole
+window when it has none, the 64 MiB per-pass budget), the 3-step upload with
+the same bodies, headers and `byteCount` semantics, and the state files
+(`state.json` + the offsets journal with 77.12's checkpoint rules). Seven
+scenarios exercise exactly that surface, on three fixture shapes that hold
+parent transcripts only (no Codex rollouts, no Claude Desktop store, no child
+lanes, no sidecars), with the steps hx2 answers:
+
+| Scenario | Shape | What it proves |
+| --- | --- | --- |
+| `hot-baseline` | `hot-small` | Two full passes (the 70 MB file needs both), a third after a transcript grows; `--version`, `help` and the usage error |
+| `hot-claude-like`, `hot-10k` | `hot-claude-like`, `hot-10k` | 600 and 10,000 parent transcripts, two passes each |
+| `hot-outage`, `hot-unreachable` | `hot-small` | A 503 outage and a refused connection during the first pass; the second recovers byte-exact |
+| `hot-kill9` | `hot-small` | SIGKILL mid-catch-up, then two one-shot passes: the end state is byte-exact |
+| `hot-daemon` | `hot-small` | The long-running daemon for 50 s with a held vault and a transcript growing 12 s in: the 20 s hold retries, one stuck line per hold, file events, SIGTERM folds the journal |
+
+`--scenarios hot-path` selects them. Every comparison above applies to them
+unchanged; hx2 is passed as `--candidate-name hx2`, so its name is a
+normalization rule and not a diff. What the hot shapes leave out is what the
+next card ports (Codex and its SQLite titles, the Claude Desktop index and
+leveldb scan, child lanes and sidecars, verify and self-heal beyond the
+audit the daemon already runs, reattribute and retitle, the group and team
+mirrors beyond the empty ones a store-less machine uploads); once those land,
+hx2 runs the full scenario list. A fourth shape, `founder`, is the
+measurement tree: 4,800 transcripts over 700 project directories and 36,000
+Claude Desktop session files, the size of the founder's laptop
+(`measure.ts --only founder`).
 
 ### Goldens
 

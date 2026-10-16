@@ -41,7 +41,15 @@ import { dirname, join } from "node:path";
 import { Prng } from "../lib/prng.js";
 import { buildLdb, buildLog, localStorageKey, localStorageValue, type KeyValue } from "../lib/leveldb-writer.js";
 
-export type Shape = "small" | "claude-like" | "synthetic-10k";
+export type Shape = "small" | "claude-like" | "synthetic-10k" | "hot-small" | "hot-claude-like" | "hot-10k" | "founder";
+
+/** The hot-path shapes hold Claude Code parent transcripts only: no Codex
+ *  rollouts, no Claude Desktop store, no child lanes, no sidecars (tasks,
+ *  plans, teams). They are what the Rust port carries first (hx2, M3); the
+ *  `founder` shape is the measurement tree, sized like the founder's laptop. */
+export function isHotShape(shape: Shape): boolean {
+  return shape.startsWith("hot-") || shape === "founder";
+}
 
 export interface GenOptions {
   out: string;
@@ -336,7 +344,7 @@ interface Core {
   subagentParent: ClaudeSessionSpec;
 }
 
-function writeCore(ctx: Ctx): Core {
+function writeCore(ctx: Ctx, hot = false): Core {
   const { home, rng } = ctx;
   const repo = join(home, "work", "acme-repo");
   const gitlab = join(home, "work", "gitlab-proj");
@@ -358,7 +366,7 @@ function writeCore(ctx: Ctx): Core {
   write(ctx, "scratch/notes/todo.txt", "fixture scratch dir, no git\n", -1 * DAY);
 
   const planPath = join(home, ".claude", "plans", "offsets-journal.md");
-  write(ctx, ".claude/plans/offsets-journal.md", "# Plan\n\n1. Keep offsets in a journal.\n2. Snapshot hourly.\n", -2 * HOUR);
+  if (!hot) write(ctx, ".claude/plans/offsets-journal.md", "# Plan\n\n1. Keep offsets in a journal.\n2. Snapshot hourly.\n", -2 * HOUR);
 
   const sessions: Array<ClaudeSessionSpec & { mtimeOffsetMs: number; dirMtimeOffsetMs?: number; note: string; projectDir?: string }> = [];
   const mk = (seed: string, partial: Partial<ClaudeSessionSpec> & { cwd: string; mtimeOffsetMs: number; note: string; dirMtimeOffsetMs?: number; projectDir?: string }): (typeof sessions)[number] => {
@@ -381,8 +389,8 @@ function writeCore(ctx: Ctx): Core {
     approxBytes: 60_000,
     customTitle: "Offsets journal design",
     aiTitle: "Designing the offsets journal",
-    planFilePath: planPath,
-    note: "GitHub repo, user title, plan attachment, tasks",
+    ...(hot ? {} : { planFilePath: planPath }),
+    note: hot ? "GitHub repo, user title" : "GitHub repo, user title, plan attachment, tasks",
   });
   const repoDesktop = mk("repo-desktop", {
     cwd: repo,
@@ -462,6 +470,10 @@ function writeCore(ctx: Ctx): Core {
     const p = write(ctx, `.claude/projects/${encodeCwd(repo)}/${rng.uuid()}.jsonl`, "", -20 * MIN);
     ctx.manifest.ignored.push({ path: p, reason: "empty file" });
   }
+
+  // The hot-path core ends here: transcripts, their git repositories and the
+  // discovery edge cases, nothing a sidecar or another source would add.
+  if (hot) return { repoCli, repoDesktop, subagentParent };
 
   // Subagent lanes + a workflow run under the parent's session-artifact dir.
   {
@@ -666,6 +678,18 @@ function writeBulk(ctx: Ctx, opts: { sessions: number; dirs: number; lanes: numb
       write(ctx, `${ccdRoot}/local_${rng.uuid()}.json`, JSON.stringify({ sessionId: `local_${rng.uuid()}`, cliSessionId: sid, title: rng.sentence(5), titleSource: rng.pick(["user", "ai"]), isArchived: false, lastActivityAt: CONTENT_EPOCH + i * MIN, cwd }), mtimeOffsetMs);
     }
   }
+  // A long-lived machine keeps far more Claude Desktop session files than it
+  // has transcripts on disk (36,445 against 4,800 on the founder's laptop):
+  // the rest name sessions whose transcripts are gone.
+  while (ccdWritten < opts.ccdFiles) {
+    ccdWritten += 1;
+    write(
+      ctx,
+      `${ccdRoot}/local_${rng.uuid()}.json`,
+      JSON.stringify({ sessionId: `local_${rng.uuid()}`, cliSessionId: rng.uuid(), title: rng.sentence(5), titleSource: "ai", isArchived: ccdWritten % 5 === 0, lastActivityAt: CONTENT_EPOCH + ccdWritten * MIN, cwd: dirs[ccdWritten % dirs.length] }),
+      -rng.int(20 * MIN, 29 * DAY),
+    );
+  }
 }
 
 export function generateHome(opts: GenOptions): Manifest {
@@ -687,12 +711,24 @@ export function generateHome(opts: GenOptions): Manifest {
     },
     mtimes: [],
   };
-  writeCore(ctx);
+  writeCore(ctx, isHotShape(opts.shape));
   if (opts.shape === "claude-like") {
     const rng = ctx.rng;
     writeBulk(ctx, { sessions: 600, dirs: 150, lanes: 60, ccdFiles: 300, bytes: () => Math.round(5_000 * Math.exp(rng.float() * 6)), tasks: 120, runs: 30 });
   } else if (opts.shape === "synthetic-10k") {
     writeBulk(ctx, { sessions: 10_000, dirs: 200, lanes: 500, ccdFiles: 2_000, bytes: () => 30_000, tasks: 200, runs: 50 });
+  } else if (opts.shape === "hot-claude-like") {
+    const rng = ctx.rng;
+    writeBulk(ctx, { sessions: 600, dirs: 150, lanes: 0, ccdFiles: 0, bytes: () => Math.round(5_000 * Math.exp(rng.float() * 6)), tasks: 0, runs: 0 });
+  } else if (opts.shape === "hot-10k") {
+    writeBulk(ctx, { sessions: 10_000, dirs: 200, lanes: 0, ccdFiles: 0, bytes: () => 30_000, tasks: 0, runs: 0 });
+  } else if (opts.shape === "founder") {
+    // The founder's laptop: about 4,800 transcripts over 727 project
+    // directories and 36,445 Claude Desktop session files. Transcripts are
+    // kept small (10–90 KB) so the fake gateway holds the tree in memory;
+    // the daemon's idle cost follows the file and directory counts, not the bytes.
+    const rng = ctx.rng;
+    writeBulk(ctx, { sessions: 4_800, dirs: 700, lanes: 0, ccdFiles: 36_000, bytes: () => Math.round(10_000 * Math.exp(rng.float() * 2.2)), tasks: 0, runs: 0 });
   }
   // mtimes last: every write above bumped its parent directory. Files first,
   // then directories deepest-first, so a directory's stamp is not undone by a
@@ -734,7 +770,7 @@ if (import.meta.main) {
   const seed = arg("seed", "harness") ?? "harness";
   const nowArg = arg("now");
   if (!out) {
-    console.error("usage: gen-home.ts --out <home> [--shape small|claude-like|synthetic-10k] [--seed s] [--now ms]");
+    console.error("usage: gen-home.ts --out <home> [--shape small|claude-like|synthetic-10k|hot-small|hot-claude-like|hot-10k|founder] [--seed s] [--now ms]");
     process.exit(64);
   }
   const started = Date.now();
