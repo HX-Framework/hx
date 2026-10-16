@@ -21,7 +21,11 @@
 //   writes-daemon        the same growth fed to a running daemon for 45 s
 //   idle-syscalls        a daemon idle for 75 s on a 600-session tree under
 //                        strace -c (Linux): file checks per second (file
-//                        events + the lane and workflow gates)
+//                        events + the lane and workflow gates); then a second
+//                        daemon traced for 45 s with every stat-family and
+//                        readlink call's path (harness/lib/stat-trace.ts),
+//                        the first 15 s — the start-up pass — counted apart,
+//                        into <label>-<who>-stat-paths.txt
 //   idle-cpu             the same daemon without strace: CPU% and RSS
 //   idle-memory          that daemon's resident memory over its 60 s: VmRSS,
 //                        VmHWM, RssAnon, RssFile, AnonHugePages, threads,
@@ -69,6 +73,7 @@ import { join } from "node:path";
 import { FakeGateway } from "../gateway/gateway.js";
 import { CCD_DIR_MTIME_SEC, ccdMtimeSec, generateHome, type Manifest } from "../fixtures/gen-home.js";
 import { ccdIndexByteDiffs } from "../lib/compare.js";
+import { summarizeStatTrace } from "../lib/stat-trace.js";
 import { Prng } from "../lib/prng.js";
 import type { BinaryName } from "../lib/types.js";
 import { appendTranscriptLines, binaryVersion, clientEnv, runScenario, writeClientFiles } from "./run-scenario.js";
@@ -685,6 +690,8 @@ function parseStraceSummary(text: string): Record<string, number> {
 /** The idle daemon on one shape: `label` names the measurement (its home,
  *  its strace summary and memory samples), so `idle` and `idle-hot` keep
  *  their files apart. */
+const PATH_TRACE_MS = 45_000;
+const PATH_TRACE_STARTUP_MS = 15_000;
 async function measureIdle(binary: string, who: Who, shape: Manifest["shape"], label: string): Promise<Measurement> {
   const h = await prepareHome(binary, label, shape);
   try {
@@ -726,6 +733,25 @@ async function measureIdle(binary: string, who: Who, shape: Manifest["shape"], l
         syscallsPerSec: Math.round(total / secs),
         fileChecksPerSec: Math.round((stat + open + dents) / secs),
       });
+      // Which paths those stat calls take, from a second traced daemon: each
+      // stat-family and readlink call with its path and a timestamp, the
+      // start-up pass apart from the idle time after it (the summary above
+      // counts both). Not for the variant, whose question is memory.
+      if (who !== "variant") {
+        const trace = join(workDir, `${label}-${who}-stat-trace.txt`);
+        rmSync(trace, { force: true });
+        await runDaemon(
+          [strace, "-f", "-ttt", "-s", "4096", "-e", "trace=%%stat,readlink,readlinkat", "-o", trace, timeout, "-s", "TERM", String(PATH_TRACE_MS / 1000), binary, "watch"],
+          h.env,
+          PATH_TRACE_MS + 30_000,
+        );
+        if (existsSync(trace)) {
+          const paths = summarizeStatTrace(readFileSync(trace, "utf8"), h.home, PATH_TRACE_STARTUP_MS, PATH_TRACE_MS);
+          writeFileSync(join(out, `${label}-${who}-stat-paths.txt`), `${label}, ${who}: stat-family and readlink calls by path (strace -f -ttt, ${PATH_TRACE_MS / 1000} s; the first ${PATH_TRACE_STARTUP_MS / 1000} s hold the daemon's start-up pass)\n\n${paths.text}`);
+          Object.assign(result, { idleStatPerSec: paths.idleStatPerSec, idleReadlinkPerSec: paths.idleReadlinkPerSec, startupStatCalls: paths.startupStatCalls });
+          rmSync(trace, { force: true });
+        }
+      }
     } else {
       result.strace = "not available";
     }
@@ -987,6 +1013,12 @@ function idleRows(name: string, label: string): void {
     row(`${name}-syscalls`, "read", "calls/s", I.reference.readPerSec!, I.candidate.readPerSec!, vOf("readPerSec"));
     row(`${name}-syscalls`, "memory (mmap, munmap, mremap, madvise, mprotect, brk)", "calls/s", I.reference.memoryCallsPerSec!, I.candidate.memoryCallsPerSec!, vOf("memoryCallsPerSec"));
     row(`${name}-syscalls`, "all system calls", "calls/s", I.reference.syscallsPerSec!, I.candidate.syscallsPerSec!, vOf("syscallsPerSec"));
+  }
+  if (I.reference.idleStatPerSec !== undefined && I.candidate.idleStatPerSec !== undefined) {
+    const after = `after the first ${PATH_TRACE_STARTUP_MS / 1000} s of a ${PATH_TRACE_MS / 1000} s traced daemon (by path: ${name}-<who>-stat-paths.txt)`;
+    row(`${name}-syscalls`, `stat family, ${after}`, "calls/s", I.reference.idleStatPerSec!, I.candidate.idleStatPerSec!);
+    row(`${name}-syscalls`, `readlink, ${after}`, "calls/s", I.reference.idleReadlinkPerSec!, I.candidate.idleReadlinkPerSec!);
+    row(`${name}-syscalls`, `stat family in those first ${PATH_TRACE_STARTUP_MS / 1000} s (the start-up pass)`, "calls", I.reference.startupStatCalls!, I.candidate.startupStatCalls!);
   }
   row(`${name}-cpu`, `CPU of a 60 s idle daemon (${label})`, "% of one core", I.reference.idleCpuPercent!, I.candidate.idleCpuPercent!, vOf("idleCpuPercent"));
   row(`${name}-cpu`, "CPU over the last 40 s of that daemon (sampled)", "% of one core", I.reference.sampledIdleCpuPercent!, I.candidate.sampledIdleCpuPercent!, vOf("sampledIdleCpuPercent"));
