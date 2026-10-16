@@ -1,0 +1,31 @@
+[package]
+name = "hx2"
+version = "78.0.0"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+description = "hx2: the hx client's hot path, ported to Rust as an exact copy of the TypeScript daemon (HX2 program, M3)"
+license = "MIT"
+
+[[bin]]
+name = "hx2"
+path = "src/main.rs"
+
+[dependencies]
+# Local-time stamps on the daemon's log lines (the TypeScript client stamps
+# with the process's local time zone, which the TZ variable selects).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# File events as hints: FSEvents on macOS, inotify on Linux, the same role
+# fs.watch(recursive) plays in src/fs-events.ts.
+notify = "7"
+# sha1 content hashes for the hash-gated sidecar uploads (artifacts.ts hashContent).
+sha1 = "0.10"
+# SIGTERM / SIGINT: fold the journal, then end the way the default handler would.
+signal-hook = "0.3"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
