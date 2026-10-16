@@ -326,7 +326,7 @@ impl<'a> Scanner<'a> {
             if !self.eat(b':') {
                 return Err(());
             }
-            each(self, &key)?;
+            each(self, key.as_slice())?;
             if self.eat(b',') {
                 continue;
             }
