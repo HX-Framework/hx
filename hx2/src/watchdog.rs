@@ -156,10 +156,7 @@ pub fn start_watchdog_thread(limits: WatchdogLimits, log_path: PathBuf, marker: 
                     }
                 }
                 let _ = append_file_0600(&log_path, format!("{}\n", line).as_bytes());
-                // SAFETY: ending our own process.
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
+                crate::platform::kill_self_hard(pid);
                 std::process::abort();
             }
         })
