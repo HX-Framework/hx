@@ -10,7 +10,7 @@ use crate::config::HxConfig;
 use crate::daemon_state::get_daemon_ops;
 use crate::json::{obj, Json};
 use crate::logger::Logger;
-use crate::service::{exec_path, Consent};
+use crate::service::{exec_path, slot_other_binary, slot_runs_other_client, Consent};
 use crate::state::Store;
 use crate::watch::{tick_once, Ctx, WatchOptions};
 
@@ -21,7 +21,13 @@ pub fn daemon_action(action: &str, consent: Consent) -> Result<Json, String> {
         "stop" => {
             ops.stop()?;
         }
-        "restart" => ops.restart(&exec_path(), consent)?,
+        // A slot that runs the other client stays with it; "start" is what
+        // moves it.
+        "restart" => {
+            if slot_runs_other_client(&ops).is_none() {
+                ops.restart(&exec_path(), consent)?;
+            }
+        }
         _ => ops.install(&exec_path(), consent)?,
     }
     let ds = ops.state();
@@ -57,6 +63,9 @@ impl RetryResult {
 pub fn retry_blocked(cfg: HxConfig, consent: Consent, all: bool, log: Logger, name: &str) -> Result<RetryResult, String> {
     let ops = get_daemon_ops();
     let before = ops.state();
+    // The shared slot runs the other client: bring the service back with
+    // that client, as installed. The definitions differ in the binary alone.
+    let bin_path = slot_other_binary(&ops).unwrap_or_else(exec_path);
     if before.loaded {
         ops.stop()?;
     }
@@ -64,7 +73,7 @@ pub fn retry_blocked(cfg: HxConfig, consent: Consent, all: bool, log: Logger, na
     let (files, sessions) = if all { fresh.clear_all_failures()? } else { fresh.clear_blocked_failures()? };
     if before.loaded {
         fresh.drain();
-        ops.install(&exec_path(), consent)?;
+        ops.install(&bin_path, consent)?;
         return Ok(RetryResult { sessions, files, restarted: true, pass: None });
     }
     let ctx = Ctx::new(cfg, fresh, log, name, Arc::new(AtomicU64::new(0)));

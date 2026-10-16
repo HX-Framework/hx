@@ -291,11 +291,17 @@ pub fn cmd_status(name: &str, args: &[String]) -> Result<i32, String> {
     let ops = get_daemon_ops();
     let daemon_state = if ops.manager_name != "none" { Some(ops.state()) } else { None };
     if let Some(ds) = &daemon_state {
+        // The shared slot may run the other client: the row names it, since
+        // `start` would move the device (hx 77.13.0's row, seen from hx2).
+        let other = crate::service::slot_runs_other_client(&ops);
+        let who = other.map(|o| format!("{} ", o)).unwrap_or_default();
         let value = match ds.pid {
-            Some(pid) if pid != 0 => format!("running ({}, pid {})", ops.manager_name, pid),
+            Some(pid) if pid != 0 => format!("running {}({}, pid {})", who, ops.manager_name, pid),
             _ => {
                 if ds.loaded {
-                    format!("loaded, not running ({})", ops.manager_name)
+                    format!("{}loaded, not running ({})", who, ops.manager_name)
+                } else if let Some(o) = other {
+                    format!("{} stopped — run `{} start` to resume, or `{} start` to move this device to {}", o, o, name, name)
                 } else {
                     format!("stopped — run `{} start` to resume", name)
                 }

@@ -1007,16 +1007,25 @@ pub fn client_of_binary(path: &str) -> Option<&'static str> {
     }
 }
 
-/// The other client when the service slot's definition runs it, else None.
-pub fn slot_runs_other_client(ops: &DaemonOps) -> Option<&'static str> {
+/// The other client's binary when the service slot's definition runs it,
+/// else None (src/daemon.ts `slotRunsHx2`, seen from this client's side).
+pub fn slot_other_binary(ops: &DaemonOps) -> Option<String> {
     let bin = ops.slot_binary()?;
     let client = client_of_binary(&bin)?;
     let mine = client_of_binary(crate::bin_name()).unwrap_or("hx2");
     if client != mine {
-        Some(client)
+        Some(bin)
     } else {
         None
     }
+}
+
+/// The other client when the service slot's definition runs it, else None.
+/// Only `start` (and `connect`, which is how a device joins hx2) moves such a
+/// slot; every other command leaves it alone and says so, as hx 77.13.0 does
+/// for a slot that runs hx2.
+pub fn slot_runs_other_client(ops: &DaemonOps) -> Option<&'static str> {
+    slot_other_binary(ops).and_then(|b| client_of_binary(&b))
 }
 
 /// The binary path inside a bootstrap.sh: the `[ -x '<bin>' ] || return` line.

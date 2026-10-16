@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::daemon_state::{get_daemon_ops, node_platform};
 use crate::json::{obj, Json};
 use crate::net::{assert_secure_fetch_url, request_manual, resolve_url, NetError, Response};
-use crate::service::{exec_path, Consent};
+use crate::service::{exec_path, slot_runs_other_client, Consent};
 
 /// A download or unpack can take a while; this is the per-read deadline.
 const DOWNLOAD_TIMEOUT_MS: u64 = 300_000;
@@ -43,6 +43,10 @@ pub struct UpdateResult {
     pub asset: String,
     pub sha256: Option<String>,
     pub daemon_restarted: bool,
+    /// The other client when the loaded service runs it (the shared slot):
+    /// this binary was updated and the service left alone, since only
+    /// `start` moves a device (hx 77.13.0's `serviceRunsHx2`, seen from hx2).
+    pub service_runs_other: Option<&'static str>,
     pub already_latest: bool,
     pub local_version: String,
     pub remote_version: Option<String>,
@@ -229,7 +233,7 @@ pub fn run_update(gateway_base_url: &str, log: &dyn Fn(&str), on_progress: &mut 
     let target = detect_target()?;
     let asset = format!("{}-{}", name, target);
     let local_version = crate::HX_VERSION.to_string();
-    let latest = |remote: Option<String>| UpdateResult { asset: asset.clone(), sha256: None, daemon_restarted: false, already_latest: true, local_version: local_version.clone(), remote_version: remote };
+    let latest = |remote: Option<String>| UpdateResult { asset: asset.clone(), sha256: None, daemon_restarted: false, service_runs_other: None, already_latest: true, local_version: local_version.clone(), remote_version: remote };
 
     let remote_version = fetch_remote_version(&download_base);
     if let Some(r) = &remote_version {
@@ -281,7 +285,10 @@ pub fn run_update(gateway_base_url: &str, log: &dyn Fn(&str), on_progress: &mut 
     let ops = get_daemon_ops();
     let before = ops.state();
     let mut daemon_restarted = false;
-    if before.loaded {
+    // The shared slot runs the other client: this binary is current now, and
+    // the service stays with that client until `start` moves the device.
+    let service_runs_other = if before.loaded { slot_runs_other_client(&ops) } else { None };
+    if before.loaded && service_runs_other.is_none() {
         log(&format!("restarting daemon (was {})", match before.pid {
             Some(p) if p != 0 => format!("pid {}", p),
             _ => "loaded but idle".to_string(),
@@ -296,7 +303,7 @@ pub fn run_update(gateway_base_url: &str, log: &dyn Fn(&str), on_progress: &mut 
         }
         daemon_restarted = true;
     }
-    Ok(UpdateResult { asset, sha256: Some(actual), daemon_restarted, already_latest: false, local_version, remote_version })
+    Ok(UpdateResult { asset, sha256: Some(actual), daemon_restarted, service_runs_other, already_latest: false, local_version, remote_version })
 }
 
 /// `checkForUpdate`: the cheap check the UI asks for.
@@ -374,6 +381,10 @@ pub fn cmd_update(name: &str, args: &[String]) -> Result<i32, String> {
     crate::logger::say(&format!("{} updated to latest ({}{}).", name, r.asset, sha_note));
     if r.daemon_restarted {
         crate::logger::say("daemon restarted.");
+    }
+    if let Some(o) = r.service_runs_other {
+        crate::logger::say(&format!("{} runs the background service on this device, so {} left it alone.", o, name));
+        crate::logger::say(&format!("Run `{} start` to move this device to {}.", name, name));
     }
     crate::logger::say(&format!("{} version: {}", name, r.remote_version.unwrap_or(r.local_version)));
     Ok(0)

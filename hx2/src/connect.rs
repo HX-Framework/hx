@@ -652,7 +652,21 @@ fn forced_stop_note() -> String {
 /// `hx stop`.
 pub fn cmd_stop(name: &str) -> Result<i32, String> {
     let ops = get_daemon_ops();
+    let other = slot_runs_other_client(&ops);
     let r = ops.stop()?;
+    if let Some(o) = other {
+        // The slot runs the other client: stopping keeps it there; `start`
+        // would move it.
+        if r.was_running {
+            say(&format!("{} stopped ({}). Run `{} start` to resume it, or `{} start` to move this device to {}.", o, ops.manager_name, o, name, name));
+            if r.forced {
+                say(&forced_stop_note());
+            }
+        } else {
+            say(&format!("{} is not running — nothing to stop. Run `{} start` to start it, or `{} start` to move this device to {}.", o, o, name, name));
+        }
+        return Ok(0);
+    }
     if r.was_running {
         say(&format!("{} stopped ({}). Run `{} start` to resume.", name, ops.manager_name, name));
         if r.forced {
@@ -664,10 +678,16 @@ pub fn cmd_stop(name: &str) -> Result<i32, String> {
     Ok(0)
 }
 
-/// `hx restart`: stop, then install.
+/// `hx restart`: stop, then install. A slot that runs the other client is
+/// left alone: `start` is the command that moves a device.
 pub fn cmd_restart(name: &str, args: &[String]) -> Result<i32, String> {
     ensure_config(name);
     let ops = get_daemon_ops();
+    if let Some(o) = slot_runs_other_client(&ops) {
+        say(&format!("{} runs the background service on this device, so {} left it alone.", o, name));
+        say(&format!("Run `{} restart` to restart it, or `{} start` to move this device to {}.", o, name, name));
+        return Ok(0);
+    }
     let consent = resolve_dotfile_consent(&ops, args);
     let r = ops.stop()?;
     ops.install(&exec_path(), consent)?;
