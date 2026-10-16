@@ -78,7 +78,13 @@ const BLOCK = 512; // Linux reports ru_oublock/ru_inblock in 512-byte units
 interface Usage {
   elapsedMs: number;
   cpuMs: number;
+  /** The process's maximum resident size: on Linux VmHWM from /proc, read
+   *  every 50 ms while it ran (see maxRssOf); on macOS ru_maxrss. */
   maxRssBytes: number;
+  /** ru_maxrss as Bun's resourceUsage() hands it back (kilobytes on Linux
+   *  scaled to bytes here, bytes on macOS). On Linux this is not the child's
+   *  figure: see the rusage-check measurement. */
+  bunMaxRssBytes: number;
   blocksIn: number;
   blocksOut: number;
   exit: string;
@@ -95,7 +101,20 @@ interface Row {
   variant?: number | string;
 }
 
-function usageOf(proc: ReturnType<typeof Bun.spawn>, startedAt: number, exit: string): Usage {
+/** The child's VmHWM (its maximum resident size, in kB, as the kernel keeps
+ *  it) read from /proc while it runs: a `Hwm` is polled every 50 ms by
+ *  runOnce and runDaemon and keeps the highest reading. The mark only ever
+ *  grows, so the last reading before the exit is the figure. Linux only. */
+class Hwm {
+  kb = -1;
+  poll(pid: number): void {
+    if (process.platform !== "linux") return;
+    const v = procNumber(readOr(`/proc/${pid}/status`), "VmHWM");
+    if (v > this.kb) this.kb = v;
+  }
+}
+
+function usageOf(proc: ReturnType<typeof Bun.spawn>, startedAt: number, exit: string, hwm: Hwm): Usage {
   const u = proc.resourceUsage();
   // Bun 1.3 hands the CPU times back as BigInt (microseconds) although the
   // declaration says number; every field goes through Number() so arithmetic
@@ -104,11 +123,15 @@ function usageOf(proc: ReturnType<typeof Bun.spawn>, startedAt: number, exit: st
   // ru_maxrss is kilobytes on Linux and bytes on macOS (getrusage(2)), and
   // Bun hands the field back as the kernel gave it. The table says bytes, so
   // Linux is scaled here; the 77.12.0 run printed the Linux figure unscaled.
-  const maxRss = u ? n(u.maxRSS) : -1;
+  // On Linux the figure is not the child's (rusage-check below), so the
+  // maximum RSS the rows trust is the polled VmHWM there.
+  const bunMaxRss = u ? n(u.maxRSS) : -1;
+  const bunMaxRssBytes = bunMaxRss < 0 ? -1 : process.platform === "linux" ? bunMaxRss * 1024 : bunMaxRss;
   return {
     elapsedMs: Date.now() - startedAt,
     cpuMs: u ? Math.round(n(u.cpuTime.total) / 1000) : -1,
-    maxRssBytes: maxRss < 0 ? -1 : process.platform === "linux" ? maxRss * 1024 : maxRss,
+    maxRssBytes: process.platform === "linux" ? (hwm.kb > 0 ? hwm.kb * 1024 : -1) : bunMaxRssBytes,
+    bunMaxRssBytes,
     blocksIn: u ? n(u.ops.in) : -1,
     blocksOut: u ? n(u.ops.out) : -1,
     exit,
@@ -120,11 +143,14 @@ async function runOnce(cmd: string[], env: Record<string, string>, timeoutMs: nu
   const startedAt = Date.now();
   const proc = Bun.spawn(cmd, { env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);
+  const hwm = new Hwm();
+  const poll = setInterval(() => hwm.poll(proc.pid), 50);
   const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   const code = await proc.exited;
   clearTimeout(timer);
+  clearInterval(poll);
   if (proc.signalCode || code !== 0) log(`    ${cmd.slice(1).join(" ")}: exit ${proc.signalCode ?? code}\n${stderr.slice(0, 800)}`);
-  return { ...usageOf(proc, startedAt, proc.signalCode ?? String(code)), stdout };
+  return { ...usageOf(proc, startedAt, proc.signalCode ?? String(code), hwm), stdout };
 }
 
 /** Something to do while the daemon runs: on a schedule (`during`), or a
@@ -148,8 +174,10 @@ async function runDaemon(cmd: string[], env: Record<string, string>, durationMs:
   let n = 0;
   let nextAt = startedAt + (during?.everyMs ?? Infinity);
   let nextSampleAt = startedAt + (sample?.everyMs ?? Infinity);
+  const hwm = new Hwm();
   const alive = (): boolean => proc.exitCode === null && proc.signalCode === null;
   while (Date.now() - startedAt < durationMs && alive()) {
+    hwm.poll(proc.pid);
     if (during && Date.now() >= nextAt) {
       during.fn(n++);
       nextAt += during.everyMs;
@@ -165,12 +193,15 @@ async function runDaemon(cmd: string[], env: Record<string, string>, durationMs:
   // A command that ended on its own (a `timeout`-wrapped daemon) needs no stop.
   if (alive()) proc.kill("SIGTERM");
   const stopAt = Date.now() + 20_000;
-  while (Date.now() < stopAt && alive()) await new Promise((r) => setTimeout(r, 50));
+  while (Date.now() < stopAt && alive()) {
+    hwm.poll(proc.pid);
+    await new Promise((r) => setTimeout(r, 50));
+  }
   if (alive()) proc.kill("SIGKILL");
   const code = await proc.exited;
   const [stdout, stderr] = await Promise.all([out, err]);
   if (!proc.signalCode || proc.signalCode !== "SIGTERM") log(`    daemon ended ${proc.signalCode ?? code}: ${stderr.slice(0, 400)}`);
-  return { ...usageOf(proc, startedAt, proc.signalCode ?? String(code)), stdout };
+  return { ...usageOf(proc, startedAt, proc.signalCode ?? String(code), hwm), stdout };
 }
 
 interface Home {
@@ -463,6 +494,7 @@ async function measureWrites(binary: string): Promise<Measurement> {
       daemonElapsedMs: daemon.elapsedMs,
       daemonCpuMs: daemon.cpuMs,
       daemonMaxRss: daemon.maxRssBytes,
+      daemonBunMaxRss: daemon.bunMaxRssBytes,
       daemonExit: daemon.exit,
     };
   } finally {
@@ -531,6 +563,7 @@ async function measureIdle(binary: string, who: Who): Promise<Measurement> {
     const plain = await runDaemon([binary, "watch"], h.env, 60_000, undefined, memory.sampler);
     result.idleCpuPercent = Math.round((plain.cpuMs / plain.elapsedMs) * 1000) / 10;
     result.idleMaxRss = plain.maxRssBytes;
+    result.idleBunMaxRss = plain.bunMaxRssBytes;
     result.idleWrites = bytesOut(plain);
     result.idleExit = plain.exit;
     Object.assign(result, memory.finish());
@@ -560,7 +593,32 @@ async function measureWatchOnly(home: string, armed: boolean): Promise<Measureme
   } catch {
     // the script died before its summary line; the samples still stand
   }
-  return { exit: r.exit, cpuMs: r.cpuMs, maxRss: r.maxRssBytes, roots: info.roots ?? -1, dirCount: info.dirCount ?? -1, events: info.events ?? -1, ...memory.finish() };
+  return { exit: r.exit, cpuMs: r.cpuMs, maxRss: r.maxRssBytes, bunMaxRss: r.bunMaxRssBytes, roots: info.roots ?? -1, dirCount: info.dirCount ?? -1, events: info.events ?? -1, ...memory.finish() };
+}
+
+// ── rusage-check (what Bun's resourceUsage().maxRSS is on Linux) ─────────────
+
+/** A child that touches `mb` megabytes, reads its own VmHWM from /proc and
+ *  prints it, beside what Bun's resourceUsage() then reports for it and
+ *  this process's own VmHWM at that moment. Linux only: the three numbers
+ *  say whose high-water mark the field is. */
+async function measureRusageCheck(mb: number): Promise<Measurement> {
+  const script = `const a = new Uint8Array(${mb} * 1024 * 1024); a.fill(1); const s = require("node:fs").readFileSync("/proc/self/status", "utf8"); const m = /^VmHWM:\\s+(\\d+)/m.exec(s); console.log(JSON.stringify({ hwmKb: m ? Number(m[1]) : -1, sum: a[0] + a[a.length - 1] }));`;
+  const r = await runOnce([process.execPath, "-e", script], clientEnv(workDir), 60_000);
+  let own = -1;
+  try {
+    own = (JSON.parse(r.stdout.trim()) as { hwmKb: number }).hwmKb;
+  } catch {
+    // the child did not print its summary; the other two numbers still stand
+  }
+  return {
+    touchedMb: mb,
+    childOwnHwmKb: own,
+    childPolledHwmKb: r.maxRssBytes > 0 ? Math.round(r.maxRssBytes / 1024) : -1,
+    bunMaxRssKb: r.bunMaxRssBytes > 0 ? Math.round(r.bunMaxRssBytes / 1024) : -1,
+    parentHwmKb: procNumber(readOr("/proc/self/status"), "VmHWM"),
+    exit: r.exit,
+  };
 }
 
 // ── workflow-retries (the backoff, the stuck-line key) ──────────────────────
@@ -655,6 +713,12 @@ async function both(name: string, fn: (binary: string, who: Who) => Promise<Meas
 
 const env = environment();
 log(`environment: ${JSON.stringify(env)}`);
+const rusageChecks: Measurement[] = [];
+if (process.platform === "linux") {
+  log("\n=== rusage-check (first)");
+  rusageChecks.push(await measureRusageCheck(300));
+  log(`    ${JSON.stringify(rusageChecks[0])}`);
+}
 await both("writes", (b) => measureWrites(b));
 await both("idle", (b, who) => measureIdle(b, who), { variant: true });
 let watchOnly: { without: Measurement; with: Measurement } | null = null;
@@ -667,6 +731,11 @@ if (process.platform === "linux" || process.platform === "darwin") {
 }
 await both("backoff", (b, who) => measureBackoff(b, who));
 if (process.platform === "darwin") await both("ccd-index", (b) => measureCcdIndex(b));
+if (process.platform === "linux") {
+  log("\n=== rusage-check (last)");
+  rusageChecks.push(await measureRusageCheck(300));
+  log(`    ${JSON.stringify(rusageChecks[1])}`);
+}
 
 // ── Report ──────────────────────────────────────────────────────────────────
 
@@ -676,7 +745,7 @@ row("writes-per-pass", `disk writes of one pass (${R.reference.grownTranscripts}
 row("writes-per-pass", "journal left after the pass", "bytes", R.reference.journalAfterPass!, R.candidate.journalAfterPass!);
 row("writes-daemon", `disk writes of a 45 s daemon (${R.reference.daemonCommits} commits)`, outUnit, R.reference.daemonWrites!, R.candidate.daemonWrites!);
 row("writes-daemon", "daemon CPU time", "ms", R.reference.daemonCpuMs!, R.candidate.daemonCpuMs!);
-row("writes-daemon", "daemon maximum RSS (ru_maxrss)", "bytes", R.reference.daemonMaxRss!, R.candidate.daemonMaxRss!);
+row("writes-daemon", `daemon maximum RSS (${process.platform === "linux" ? "VmHWM, polled" : "ru_maxrss"})`, "bytes", R.reference.daemonMaxRss!, R.candidate.daemonMaxRss!);
 const I = results["idle"]!;
 const V = I.variant;
 const vOf = (key: string): number | string | undefined => V?.[key];
@@ -690,7 +759,10 @@ if (I.reference.fileChecksPerSec !== undefined) {
   row("idle-syscalls", "all system calls", "calls/s", I.reference.syscallsPerSec!, I.candidate.syscallsPerSec!, vOf("syscallsPerSec"));
 }
 row("idle-cpu", "CPU of a 60 s idle daemon (600 sessions, 60 lanes, 30 runs)", "% of one core", I.reference.idleCpuPercent!, I.candidate.idleCpuPercent!, vOf("idleCpuPercent"));
-row("idle-cpu", "maximum RSS (ru_maxrss, scaled to bytes on Linux)", "bytes", I.reference.idleMaxRss!, I.candidate.idleMaxRss!, vOf("idleMaxRss"));
+row("idle-cpu", `maximum RSS (${process.platform === "linux" ? "VmHWM, polled every 50 ms" : "ru_maxrss"})`, "bytes", I.reference.idleMaxRss!, I.candidate.idleMaxRss!, vOf("idleMaxRss"));
+if (process.platform === "linux") {
+  row("idle-cpu", "maximum RSS as Bun's resourceUsage() reports it (ru_maxrss × 1024): not the daemon's figure, see rusage-check", "bytes", I.reference.idleBunMaxRss!, I.candidate.idleBunMaxRss!, vOf("idleBunMaxRss"));
+}
 row("idle-cpu", "disk writes while idle", outUnit, I.reference.idleWrites!, I.candidate.idleWrites!, vOf("idleWrites"));
 if (I.reference.memSamples !== undefined && Number(I.reference.memSamples) > 0) {
   const sampledAs = process.platform === "linux" ? "VmRSS from /proc" : "RSS from ps";
@@ -717,10 +789,15 @@ if (watchOnly) {
   const what = `a bare Bun ${Bun.version} script on the idle fixture's tree for 20 s, without fs.watch (reference column) and with fs.watch(recursive) on the ${w.with.roots} roots (candidate column)`;
   row("watch-only", `${what}: resident memory at the end`, "kB", w.without.rssEndKb!, w.with.rssEndKb!);
   row("watch-only", "the same: highest sample", "kB", w.without.rssPeakKb!, w.with.rssPeakKb!);
-  row("watch-only", "the same: maximum RSS (ru_maxrss)", "bytes", w.without.maxRss!, w.with.maxRss!);
+  row("watch-only", `the same: maximum RSS (${process.platform === "linux" ? "VmHWM, polled" : "ru_maxrss"})`, "bytes", w.without.maxRss!, w.with.maxRss!);
   row("watch-only", "the same: CPU time", "ms", w.without.cpuMs!, w.with.cpuMs!);
   row("watch-only", "directories under the roots", "directories", w.with.dirCount!, w.with.dirCount!);
   if (process.platform === "linux") row("watch-only", "inotify watches held at the end", "watches", w.without.inotifyWatchesEnd!, w.with.inotifyWatchesEnd!);
+}
+for (const [i, c] of rusageChecks.entries()) {
+  const when = i === 0 ? "first thing in the job" : "last thing in the job";
+  row("rusage-check", `a bare Bun child that touches ${c.touchedMb} MB, ${when}: VmHWM it read from its own /proc/self/status (reference column) and the figure Bun's resourceUsage().maxRSS gives its parent for it (candidate column)`, "kB", c.childOwnHwmKb!, c.bunMaxRssKb!);
+  row("rusage-check", `the same child: VmHWM polled by the parent (reference column) and the parent's own VmHWM when it read the child's rusage (candidate column)`, "kB", c.childPolledHwmKb!, c.parentHwmKb!);
 }
 const B = results["backoff"]!;
 row("workflow-retries", `refused workflow uploads in the ${B.reference.daemonSecs} s daemon-backoff run`, "requests", B.reference.workflowUploadsRefused!, B.candidate.workflowUploadsRefused!);
@@ -787,7 +864,7 @@ for (const [label, d] of Object.entries(memoryDetails)) {
 
 writeFileSync(
   join(out, "measurements.json"),
-  JSON.stringify({ platform: `${process.platform}-${process.arch}`, reference, candidate, variant: variant ?? null, variantName: variant ? variantName : null, environment: env, generatedAt: new Date().toISOString(), rows, raw: { ...results, watchOnly }, memory: memoryDetails }, null, 2),
+  JSON.stringify({ platform: `${process.platform}-${process.arch}`, reference, candidate, variant: variant ?? null, variantName: variant ? variantName : null, environment: env, generatedAt: new Date().toISOString(), rows, raw: { ...results, watchOnly, rusageChecks }, memory: memoryDetails }, null, 2),
 );
 writeFileSync(join(out, "measurements.md"), `${md.join("\n")}\n`);
 writeFileSync(join(out, "memory.md"), `${mem.join("\n")}\n`);
