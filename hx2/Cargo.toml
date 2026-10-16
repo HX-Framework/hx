@@ -4,7 +4,7 @@ version = "78.0.0"
 edition = "2021"
 rust-version = "1.80"
 publish = false
-description = "hx2: the hx client's hot path, ported to Rust as an exact copy of the TypeScript daemon (HX2 program, M3)"
+description = "hx2: the hx client's daemon, ported to Rust as an exact copy of the TypeScript client (HX2 program, M3 and M4)"
 license = "MIT"
 
 [[bin]]
@@ -26,6 +26,9 @@ libc = "0.2"
 # The catalog's maps keep discovery order, as the TypeScript client's Maps do:
 # the order a pass hands files to the upload pool is visible to a refusing gateway.
 indexmap = "2"
+# Codex keeps its session titles in ~/.codex/state_<N>.sqlite (codex-titles.ts
+# reads it with bun:sqlite); the bundled SQLite keeps the build self-contained.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
 opt-level = 3

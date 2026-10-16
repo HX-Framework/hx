@@ -25,7 +25,9 @@ impl Logger {
 
     pub fn log(&self, msg: &str) {
         self.last_log_ms.store(now_ms() as u64, Ordering::Relaxed);
-        let line = if self.stamped { format!("{} {}{}\n", Logger::stamp(), self.prefix, msg) } else { format!("{}{}\n", self.prefix, msg) };
+        // cli.ts: `localLog(msg)` is `log("[local] " + msg)` and the watch lanes
+        // wrap it as `stamped(localLog)`, so the prefix comes BEFORE the stamp.
+        let line = if self.stamped { format!("{}{} {}\n", self.prefix, Logger::stamp(), msg) } else { format!("{}{}\n", self.prefix, msg) };
         let _g = self.out.lock().unwrap_or_else(|e| e.into_inner());
         let stdout = std::io::stdout();
         let mut h = stdout.lock();

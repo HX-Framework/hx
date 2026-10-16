@@ -147,3 +147,73 @@ pub fn normalize_posix(p: &str) -> String {
         body
     }
 }
+
+/// The `E…` name and the text Node prints for an errno, for the messages the
+/// client logs when a write fails (`EACCES: permission denied, open '…'`).
+fn errno_name_text(code: i32) -> (String, String) {
+    let known: &[(i32, &str, &str)] = &[
+        (libc::EPERM, "EPERM", "operation not permitted"),
+        (libc::ENOENT, "ENOENT", "no such file or directory"),
+        (libc::EIO, "EIO", "i/o error"),
+        (libc::EBADF, "EBADF", "bad file descriptor"),
+        (libc::EACCES, "EACCES", "permission denied"),
+        (libc::EBUSY, "EBUSY", "resource busy or locked"),
+        (libc::EEXIST, "EEXIST", "file already exists"),
+        (libc::EXDEV, "EXDEV", "cross-device link not permitted"),
+        (libc::ENOTDIR, "ENOTDIR", "not a directory"),
+        (libc::EISDIR, "EISDIR", "illegal operation on a directory"),
+        (libc::EINVAL, "EINVAL", "invalid argument"),
+        (libc::EMFILE, "EMFILE", "too many open files"),
+        (libc::ENOSPC, "ENOSPC", "no space left on device"),
+        (libc::EROFS, "EROFS", "read-only file system"),
+        (libc::ENAMETOOLONG, "ENAMETOOLONG", "name too long"),
+        (libc::ENOTEMPTY, "ENOTEMPTY", "directory not empty"),
+        (libc::ELOOP, "ELOOP", "too many symbolic links encountered"),
+    ];
+    for (c, name, text) in known {
+        if *c == code {
+            return (name.to_string(), text.to_string());
+        }
+    }
+    (format!("E{}", code), std::io::Error::from_raw_os_error(code).to_string().to_lowercase())
+}
+
+/// A failed file operation the way the TypeScript runtime reports it:
+/// `EACCES: permission denied, open '/path'`.
+pub fn node_error(e: &std::io::Error, syscall: &str, path: &Path) -> String {
+    match e.raw_os_error() {
+        Some(code) => {
+            let (name, text) = errno_name_text(code);
+            format!("{}: {}, {} '{}'", name, text, syscall, path.to_string_lossy())
+        }
+        None => format!("{}, {} '{}'", e, syscall, path.to_string_lossy()),
+    }
+}
+
+/// `rename` failures name both paths: `ENOENT: no such file or directory, rename '/a' -> '/b'`.
+pub fn node_rename_error(e: &std::io::Error, from: &Path, to: &Path) -> String {
+    match e.raw_os_error() {
+        Some(code) => {
+            let (name, text) = errno_name_text(code);
+            format!("{}: {}, rename '{}' -> '{}'", name, text, from.to_string_lossy(), to.to_string_lossy())
+        }
+        None => format!("{}, rename '{}' -> '{}'", e, from.to_string_lossy(), to.to_string_lossy()),
+    }
+}
+
+/// `writeFile(path, text, { mode: 0o600 })` with the runtime's error text.
+pub fn write_file_0600_node(p: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_file_0600(p, bytes).map_err(|e| node_error(&e, "open", p))
+}
+
+/// `appendFile(path, text, { mode: 0o600 })` with the runtime's error text.
+pub fn append_file_0600_node(p: &Path, bytes: &[u8]) -> Result<(), String> {
+    append_file_0600(p, bytes).map_err(|e| node_error(&e, "open", p))
+}
+
+/// The tmp-then-rename write with the runtime's error text for whichever step failed.
+pub fn write_atomic_0600_node(p: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = PathBuf::from(format!("{}.tmp", p.to_string_lossy()));
+    write_file_0600(&tmp, bytes).map_err(|e| node_error(&e, "open", &tmp))?;
+    fs::rename(&tmp, p).map_err(|e| node_rename_error(&e, &tmp, p))
+}

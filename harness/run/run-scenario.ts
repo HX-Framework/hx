@@ -176,9 +176,9 @@ export async function runScenario(o: DriverOptions): Promise<RunMeta> {
       index,
       name: step.name,
       kind: step.kind,
-      seqFrom: cloud.record.length + 1,
+      seqFrom: cloud.requestCount + 1,
       seqTo: 0,
-      fortressSeqFrom: (fortress?.record.length ?? 0) + 1,
+      fortressSeqFrom: (fortress?.requestCount ?? 0) + 1,
       fortressSeqTo: 0,
       startedAtMs: Date.now(),
       endedAtMs: 0,
@@ -192,8 +192,11 @@ export async function runScenario(o: DriverOptions): Promise<RunMeta> {
       log(`[${o.name}]   error: ${rec.error}`);
     }
     rec.endedAtMs = Date.now();
-    rec.seqTo = cloud.record.length + 1;
-    rec.fortressSeqTo = (fortress?.record.length ?? 0) + 1;
+    // Nothing of the binary's runs between steps: a collection here returns
+    // the step's request buffers before the next step's burst.
+    Bun.gc(true);
+    rec.seqTo = cloud.requestCount + 1;
+    rec.fortressSeqTo = (fortress?.requestCount ?? 0) + 1;
     if (step.kind === "run" && step.expectExit !== undefined && rec.exitCode !== step.expectExit) {
       failures.push(`${step.name}: exit ${rec.exitCode ?? rec.signal}, expected ${step.expectExit}`);
     }

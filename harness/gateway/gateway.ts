@@ -136,7 +136,21 @@ function destKey(vaultOrgId: string | null): string {
 
 export class FakeGateway {
   readonly config: GatewayConfig;
+  /** Every request, kept in memory only when no `recordPath` is given (the
+   *  unit tests). With a recordPath the recording streams to the file and only
+   *  the counters stay: a 10,000-session scenario makes some 60,000 requests,
+   *  and holding them all made the driver one of the largest processes on
+   *  the runner by the time hot-10k ran. */
   readonly record: RecordedRequest[] = [];
+  private requests = 0;
+  private commits = 0;
+  private parentCommits = 0;
+  private puts = 0;
+
+  /** How many requests the gateway has recorded. */
+  get requestCount(): number {
+    return this.requests;
+  }
   private server: Server<undefined> | null = null;
   private startedAt = 0;
   private seq = 0;
@@ -182,15 +196,10 @@ export class FakeGateway {
     Object.assign(this.config, patch);
   }
 
-  /** Counts for the driver to wait on (kill -9 after N commits). */
-  stats(): { requests: number; commits: number; puts: number } {
-    let commits = 0;
-    let puts = 0;
-    for (const r of this.record) {
-      if (r.path === "/sessions/commit" || r.path === "/sessions/agent-commit") commits += 1;
-      if (r.method === "PUT") puts += 1;
-    }
-    return { requests: this.record.length, commits, puts };
+  /** Counts for the driver to wait on (kill -9 after N commits) and for the
+   *  measurements (`parentCommits`: /sessions/commit alone). */
+  stats(): { requests: number; commits: number; parentCommits: number; puts: number } {
+    return { requests: this.requests, commits: this.commits, parentCommits: this.parentCommits, puts: this.puts };
   }
 
   /** Everything the store holds, as a manifest the comparator can diff. */
@@ -218,8 +227,12 @@ export class FakeGateway {
 
   private note(entry: Omit<RecordedRequest, "seq" | "tMs" | "label">): void {
     const rec: RecordedRequest = { seq: ++this.seq, tMs: Date.now() - this.startedAt, label: this.config.label, ...entry };
-    this.record.push(rec);
+    this.requests += 1;
+    if (rec.path === "/sessions/commit") this.parentCommits += 1;
+    if (rec.path === "/sessions/commit" || rec.path === "/sessions/agent-commit") this.commits += 1;
+    if (rec.method === "PUT") this.puts += 1;
     if (this.config.recordPath) appendFileSync(this.config.recordPath, `${JSON.stringify(rec)}\n`);
+    else this.record.push(rec);
   }
 
   private async handle(req: Request): Promise<Response> {
@@ -293,7 +306,9 @@ export class FakeGateway {
       annotate.sessionKey = staged.sessionKey;
       if (staged.lane) annotate.lane = staged.lane;
       if (c.putDelayMs > 0) await new Promise((r) => setTimeout(r, c.putDelayMs));
-      staged.bytes = Buffer.from(raw);
+      // `raw` is this request's own buffer (nothing else writes it): staging
+      // it as it is saves one copy of every chunk.
+      staged.bytes = raw;
       return new Response(null, { status: 200 });
     }
 

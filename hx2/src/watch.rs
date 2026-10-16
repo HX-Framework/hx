@@ -1,26 +1,34 @@
-//! The watcher (src/watch.ts): the hot path of `hx watch`.
+//! The watcher (src/watch.ts): `hx watch`, long-running and one-shot.
 //!
 //! Per-file upload pipeline: read bytes from `offset → EOF`, request a signed
 //! PUT URL per destination, PUT the chunk (cut at the last newline, or the
 //! whole window when it has none), POST the commit, bump the offset. A tiered
 //! catalog (catalog.rs) tells each 1.5 s tick which files moved; the daemon
 //! takes file events as hints and keeps the full sweep as a 60 s safety net.
+//! After the parents, a pass uploads the child lanes and the workflow
+//! sidecars (children.rs) and the task/plan sidecars (sidecars.rs).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::activity::{append_activity, trim_activity};
 use crate::catalog::DiscoveryCatalog;
+use crate::ccd::{get_ccd_recents_by_cli_id, save_ccd_index_if_changed, CcdSessionMeta};
+use crate::children::{
+    build_child_parent_index, child_needs_pass, contested_child_lanes, discover_child_backfill, elect_child_uploaders, ingest_child_one, latch_child_lane_pause,
+    merge_child_backfill, plan_child_lane_resets, plan_workflow_sync, reconcile_child_parent, sync_workflow_run, workflow_lane_after_failure, WorkflowLane, WorkflowPlan,
+};
+use crate::codex_titles::{read_codex_title, CodexTitle};
 use crate::config::HxConfig;
-use crate::fsutil::{basename, now_ms, relative, stat_safe};
+use crate::fsutil::{basename, node_error, now_ms, relative, stat_safe};
 use crate::home::homedir;
-use crate::js::{math_round, num_to_string, JsStr};
-use crate::json::{obj, Json};
+use crate::js::{math_round, num_to_string, to_locale_time_string_en_us, JsStr};
+use crate::json::{obj, Json, OMap};
 use crate::logger::Logger;
 use crate::mirror::{sync_group_mirror, sync_team_mirror};
 use crate::net::{put_chunk, vault_blocker_from_destinations, Blocker, Gateway, HxHttpError, NetError};
@@ -28,19 +36,26 @@ use crate::orgnames::remember_org_names;
 use crate::parse::{summarise_chunk, ChunkSummary};
 use crate::pathnorm::collapse_home;
 use crate::reattribute::run_reattribute_sweep;
+use crate::report::{elect_uploaders, filter_watched, owed_summary, should_skip_entry, snapshot_from, SyncSnapshot};
 use crate::roots::{resolve_data_roots, roots_signature, DataRoot, ResolvedRoots};
 use crate::route::{resolve_route_shared, RouteCache, RouteMode};
-use crate::settings::{is_paused, read_settings, should_skip_file, tuning_int, tuning_value, FileSyncIdentity, HxSettings};
-use crate::sources::{derive_fallback_title, discover_claude_files, read_head, seeded_cwd, DiscoveredFile, HeadMeta, RECENT_WINDOW_MS};
-use crate::state::{dest_key, fs_min_offset, fs_offset_for, fs_offsets, DestinationReport, Store};
+use crate::settings::{is_paused, read_settings, tuning_int, tuning_value, HxSettings};
+use crate::sidecars::sync_artifacts;
+use crate::sources::{
+    derive_fallback_title, discover_claude_children, discover_claude_files, discover_codex_files, read_head, seeded_cwd, DiscoveredChildFile, DiscoveredFile,
+    DiscoveredWorkflowRun, HeadMeta, RECENT_WINDOW_MS,
+};
+use crate::state::{dest_key, fs_min_offset, fs_offset_for, DestinationReport, Store};
+use crate::title_sync::run_title_sync_sweep;
 
 pub const FAST_POLL_MS: f64 = 1_500.0;
 const UPLOAD_BACKOFF_BASE_MS: f64 = 5_000.0;
 const UPLOAD_BACKOFF_MAX_MS: f64 = 5.0 * 60_000.0;
-const FILE_RETRY_BASE_MS: f64 = 30_000.0;
+pub const FILE_RETRY_BASE_MS: f64 = 30_000.0;
 const SESSION_SKIP_RETRY_BASE_MS: f64 = 20_000.0;
 const PASS_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
 const FILE_CONCURRENCY_DEFAULT: usize = 4;
+const CHILD_CONCURRENCY_DEFAULT: usize = 4;
 const MAX_GROWN_CHUNK: u64 = 32 * 1024 * 1024;
 const UPLOAD_BYTES_CAP: u64 = 64 * 1024 * 1024;
 const DRAIN_ROUNDS_BACKSTOP: usize = 1024;
@@ -51,7 +66,9 @@ const SYNC_PROGRESS_MIN_MS: f64 = 1_000.0;
 const VERIFY_INTERVAL_MS: f64 = 30.0 * 60_000.0;
 const VERIFY_BATCH: usize = 1_000;
 const STUCK_LOG_INTERVAL_MS: f64 = 30.0 * 60_000.0;
-const DEFAULT_CHUNK_LIMIT: u64 = 4 * 1024 * 1024;
+pub const DEFAULT_CHUNK_LIMIT: u64 = 4 * 1024 * 1024;
+/// Chunks one backfilled child lane may send within a single pass.
+const SWEPT_LANE_MAX_CHUNKS: usize = 16;
 const BACKFILL_INTERVAL_MS: f64 = 60.0 * 60_000.0;
 const STATE_FLUSH_MS: f64 = 5_000.0;
 const PERF_LOG_MS: f64 = 60.0 * 60_000.0;
@@ -76,15 +93,18 @@ pub struct Ctx {
     pub store: Arc<Store>,
     pub log: Logger,
     pub name: String,
+    /// The upload lane: "main" or "local" (the `--local` tee).
+    pub scope: &'static str,
     pub routes: RouteCache,
-    stuck: Mutex<HashMap<String, (String, f64)>>,
-    shadowed: Mutex<HashSet<String>>,
     pub catalog: Mutex<DiscoveryCatalog>,
     self_heal: Mutex<Option<bool>>,
     backfill_last: Mutex<HashMap<String, f64>>,
     grown_chunk: Mutex<HashMap<String, u64>>,
     chunk_cap_logged: Mutex<HashSet<String>>,
-    semaphore: ByteSemaphore,
+    /// Child uploads paused until this time after a wholesale rejection.
+    pub child_pause_until: Mutex<f64>,
+    /// Per workflow run: the mtime gate and the retry backoff.
+    pub workflow_lanes: Mutex<HashMap<String, WorkflowLane>>,
     pub beat: Arc<AtomicU64>,
     pub last_log_ms: Arc<AtomicU64>,
     /// What the last pass saw and decided (see `tick_once`).
@@ -96,13 +116,15 @@ pub struct Ctx {
 /// nothing while all three stand still would pool nothing again: the next
 /// tick reuses its snapshot instead of walking every file. The TypeScript
 /// client walks them every tick; how often hx2 looks is its own business,
-/// the uploads and the reports are the same.
+/// the uploads and the reports are the same. A workflow lane sitting out a
+/// retry backoff bounds the reuse in time (`quiet_until`).
 struct TickCache {
     catalog_gen: u64,
     store_gen: u64,
     settings_sig: String,
     snapshot: SyncSnapshot,
     pooled_empty: bool,
+    quiet_until: f64,
 }
 
 /// The settings a pass decides on, as one string to compare across ticks.
@@ -132,21 +154,22 @@ fn tick_settings_signature(s: &HxSettings, roots: &ResolvedRoots) -> String {
 impl Ctx {
     pub fn new(cfg: HxConfig, store: Arc<Store>, log: Logger, name: &str, beat: Arc<AtomicU64>) -> Ctx {
         let gw = Gateway { base_url: cfg.gateway_base_url.clone(), token: cfg.access_token.clone().unwrap_or_default() };
+        let scope = cfg.scope;
         Ctx {
             cfg,
             gw,
             store,
             log,
             name: name.to_string(),
+            scope,
             routes: RouteCache::new(),
-            stuck: Mutex::new(HashMap::new()),
-            shadowed: Mutex::new(HashSet::new()),
             catalog: Mutex::new(DiscoveryCatalog::new()),
             self_heal: Mutex::new(None),
             backfill_last: Mutex::new(HashMap::new()),
             grown_chunk: Mutex::new(HashMap::new()),
             chunk_cap_logged: Mutex::new(HashSet::new()),
-            semaphore: ByteSemaphore::new(UPLOAD_BYTES_CAP),
+            child_pause_until: Mutex::new(0.0),
+            workflow_lanes: Mutex::new(HashMap::new()),
             beat,
             last_log_ms: Arc::new(AtomicU64::new(now_ms() as u64)),
             tick_cache: Mutex::new(None),
@@ -194,8 +217,18 @@ impl ByteSemaphore {
     }
 }
 
-/// `runPool`: workers dequeue from the same ordered list; a stop flag ends dequeueing.
-fn run_pool<T: Sync>(items: &[T], limit: usize, worker: &(dyn Fn(&T) + Sync), stopped: &AtomicBool) {
+/// The process-global in-flight chunk-buffer budget, shared across the tee lanes.
+fn upload_semaphore() -> &'static ByteSemaphore {
+    static SEMAPHORE: OnceLock<ByteSemaphore> = OnceLock::new();
+    SEMAPHORE.get_or_init(|| ByteSemaphore::new(UPLOAD_BYTES_CAP))
+}
+
+/// `runPool`: workers dequeue from the same ordered list; a stop flag ends
+/// dequeueing for every lane. A worker that returns false ends ITS lane
+/// only — the TypeScript lane whose worker threw rejects and stops while
+/// the other lanes keep dequeueing (with `uploadConcurrency: 1` the pass
+/// ends at the first throw).
+fn run_pool<T: Sync>(items: &[T], limit: usize, worker: &(dyn Fn(&T) -> bool + Sync), stopped: &AtomicBool) {
     if items.is_empty() {
         return;
     }
@@ -211,7 +244,9 @@ fn run_pool<T: Sync>(items: &[T], limit: usize, worker: &(dyn Fn(&T) + Sync), st
                 if i >= items.len() {
                     return;
                 }
-                worker(&items[i]);
+                if !worker(&items[i]) {
+                    return;
+                }
             });
         }
     });
@@ -223,7 +258,7 @@ fn short_id(sid: &str) -> String {
     sid.chars().take(8).collect()
 }
 
-fn read_slice(path: &str, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
+pub fn read_slice(path: &str, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
     let mut f = fs::File::open(path)?;
     f.seek(SeekFrom::Start(start))?;
     let mut out = vec![0u8; len as usize];
@@ -240,7 +275,7 @@ fn read_slice(path: &str, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
 }
 
 /// Trim a buffer at the last newline so no jsonl line is split across chunks.
-fn trim_at_last_newline(mut buf: Vec<u8>, start_offset: u64) -> (Vec<u8>, u64) {
+pub fn trim_at_last_newline(mut buf: Vec<u8>, start_offset: u64) -> (Vec<u8>, u64) {
     match buf.iter().rposition(|&b| b == 0x0A) {
         None => {
             let end = start_offset + buf.len() as u64;
@@ -254,10 +289,12 @@ fn trim_at_last_newline(mut buf: Vec<u8>, start_offset: u64) -> (Vec<u8>, u64) {
     }
 }
 
-/// `logStuck`: once per kind of reason per file per interval.
+/// `logStuck`: once per kind of reason per file per interval (module state in
+/// the TypeScript client, so the lanes share it).
 pub fn log_stuck(ctx: &Ctx, path: &str, key: &str, message: &str, now: f64) {
+    static STUCK: OnceLock<Mutex<HashMap<String, (String, f64)>>> = OnceLock::new();
     {
-        let mut m = ctx.stuck.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = STUCK.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
         if let Some((reason, at)) = m.get(path) {
             if reason == key && now - at < STUCK_LOG_INTERVAL_MS {
                 return;
@@ -291,21 +328,21 @@ fn upload_error_code(err: &HxHttpError) -> String {
 }
 
 /// `ensureFileState`: the seeded entry for a discovered file.
-fn ensure_file_state(ctx: &Ctx, file: &DiscoveredFile) -> Json {
+fn ensure_file_state(ctx: &Ctx, file: &DiscoveredFile) -> Result<Json, String> {
     if let Some(mut existing) = ctx.store.file(&file.path) {
         if existing.get("cwd").is_none() {
             let head = read_head(&file.path, file.source, true);
             existing.set("cwd", Json::str(&seeded_cwd(&head, &file.path)));
             existing.set("repoSlug", Json::opt_str(head.repo_slug.as_deref()));
-            ctx.store.upsert_file_state(existing.clone());
+            ctx.store.upsert_file_state(existing.clone())?;
         }
         let size = file.size as f64;
         if existing.get_f64("lastMtimeMs") != Some(file.mtime_ms) || existing.get_f64("lastKnownSize") != Some(size) {
             existing.set("lastMtimeMs", Json::num(file.mtime_ms));
             existing.set("lastKnownSize", Json::num(size));
-            ctx.store.upsert_file_state(existing.clone());
+            ctx.store.upsert_file_state(existing.clone())?;
         }
-        return existing;
+        return Ok(existing);
     }
     let head = read_head(&file.path, file.source, true);
     let session_id = head.session_id.clone().unwrap_or_else(|| basename(&file.path, ".jsonl"));
@@ -320,160 +357,8 @@ fn ensure_file_state(ctx: &Ctx, file: &DiscoveredFile) -> Json {
         ("lastMtimeMs", Json::num(file.mtime_ms)),
         ("lastUploadAtMs", Json::num(0.0)),
     ]);
-    ctx.store.upsert_file_state(seeded.clone());
-    seeded
-}
-
-/// `shouldSkipFile` over a state entry.
-fn should_skip_entry(settings: &HxSettings, fs: &Json) -> bool {
-    let family = fs.get_string("family").unwrap_or_default();
-    let cwd = fs.get_string("cwd");
-    let repo_slug: Option<Option<String>> = match fs.get("repoSlug") {
-        None => None,
-        Some(Json::Null) => Some(None),
-        Some(v) => Some(v.as_string()),
-    };
-    let attributed = fs.get("attributed").and_then(|a| a.as_bool());
-    let id = FileSyncIdentity { family: &family, cwd: cwd.as_deref(), repo_slug: repo_slug.as_ref().map(|r| r.as_deref()), attributed };
-    should_skip_file(settings, &id)
-}
-
-/// `filterWatched`: drop files the settings keep local and tombstoned sessions.
-fn filter_watched(files: Vec<DiscoveredFile>, state: &Json, settings: &HxSettings) -> Vec<DiscoveredFile> {
-    // With no tombstone and settings that keep nothing local, every file stays.
-    let has_deleted = state.get("deletedSessions").and_then(|m| m.as_obj()).map(|m| !m.is_empty()).unwrap_or(false);
-    let settings_can_skip = !settings.personal_sync || !settings.excluded_folders.is_empty() || !settings.exclude_rules.is_empty();
-    if !has_deleted && !settings_can_skip {
-        return files;
-    }
-    files
-        .into_iter()
-        .filter(|f| {
-            let fs = match state.get("files").and_then(|m| m.get(&f.path)) {
-                Some(fs) => fs,
-                None => return true,
-            };
-            let family = fs.get_string("family").unwrap_or_default();
-            let sid = fs.get_string("sessionId").unwrap_or_default();
-            if Store::is_deleted_session(state, &family, &sid) {
-                return false;
-            }
-            !should_skip_entry(settings, fs)
-        })
-        .collect()
-}
-
-/// `electUploaders`: one uploader per canonical, newest mtime wins (tie: largest).
-fn elect_uploaders(ctx: &Ctx, files: Vec<DiscoveredFile>, state: &Json, log: bool) -> Vec<DiscoveredFile> {
-    let mut by_key: Vec<(String, Vec<DiscoveredFile>)> = Vec::new();
-    let mut key_index: HashMap<String, usize> = HashMap::new();
-    let mut active: Vec<DiscoveredFile> = Vec::new();
-    for f in files {
-        let fs = match state.get("files").and_then(|m| m.get(&f.path)) {
-            Some(fs) => fs,
-            None => {
-                active.push(f);
-                continue;
-            }
-        };
-        let key = format!("{}:{}", fs.get_string("family").unwrap_or_default(), fs.get_string("sessionId").unwrap_or_default());
-        let i = *key_index.entry(key.clone()).or_insert_with(|| {
-            by_key.push((key.clone(), Vec::new()));
-            by_key.len() - 1
-        });
-        by_key[i].1.push(f);
-    }
-    for (_, mut list) in by_key {
-        list.sort_by(|a, b| b.mtime_ms.partial_cmp(&a.mtime_ms).unwrap_or(std::cmp::Ordering::Equal).then(b.size.cmp(&a.size)));
-        let winner = list.remove(0);
-        for twin in &list {
-            if log {
-                let fresh = ctx.shadowed.lock().unwrap_or_else(|e| e.into_inner()).insert(twin.path.clone());
-                if fresh {
-                    ctx.log(&format!("[hx] {} shadows {} (same session); not uploading the twin", twin.path, winner.path));
-                }
-            }
-        }
-        active.push(winner);
-    }
-    active
-}
-
-// ── The sync snapshot (ledger.ts reportableOffset) ─────────────────────────
-
-fn ever_written_keys(state: &Json) -> HashSet<&str> {
-    let mut out = HashSet::new();
-    if let Some(files) = state.get("files").and_then(|f| f.as_obj()) {
-        for (_, fs) in files.iter() {
-            if let Some(o) = fs.get("offsets").and_then(|o| o.as_obj()) {
-                for (k, v) in o.iter() {
-                    if v.as_f64().map(|n| n > 0.0).unwrap_or(false) {
-                        out.insert(k.as_str());
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-fn is_phantom_key(state: &Json, key: &str, offset: f64, ever_written: &HashSet<&str>) -> bool {
-    if offset > 0.0 || key == "letai" {
-        return false;
-    }
-    let registry = match state.get("destinations") {
-        Some(d) => d,
-        None => return false,
-    };
-    if ever_written.contains(key) {
-        return false;
-    }
-    registry.get(key).is_none()
-}
-
-fn reportable_offset(fs: &Json, state: &Json, ever_written: &HashSet<&str>) -> f64 {
-    let mut min = f64::INFINITY;
-    let mut any = false;
-    if let Some(o) = fs.get("offsets").and_then(|o| o.as_obj()) {
-        for (k, v) in o.iter() {
-            if let Some(off) = v.as_f64() {
-                if !is_phantom_key(state, k, off, ever_written) {
-                    any = true;
-                    if off < min {
-                        min = off;
-                    }
-                }
-            }
-        }
-    }
-    if any {
-        min
-    } else {
-        0.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SyncSnapshot {
-    pub total: u64,
-    pub done: u64,
-    pub total_bytes: u64,
-}
-
-fn snapshot_from(files: &[DiscoveredFile], state: &Json) -> SyncSnapshot {
-    let ever = ever_written_keys(state);
-    let mut done = 0u64;
-    let mut total_bytes = 0u64;
-    for f in files {
-        let fs = state.get("files").and_then(|m| m.get(&f.path));
-        let offset = fs.map(|e| reportable_offset(e, state, &ever)).unwrap_or(0.0);
-        let held = fs.and_then(|e| e.get("skipReason")).is_some();
-        if offset >= f.size as f64 && !held {
-            done += 1;
-        }
-        total_bytes += f.size;
-    }
-    SyncSnapshot { total: files.len() as u64, done, total_bytes }
+    ctx.store.upsert_file_state(seeded.clone())?;
+    Ok(seeded)
 }
 
 // ── Backfill (backfill.ts) ──────────────────────────────────────────────────
@@ -551,7 +436,7 @@ fn classify_upstream_error(err: &NetError, fortress: bool) -> Option<IngestError
             }
             None
         }
-        NetError::Other(_) => {
+        NetError::Other(_) | NetError::Timeout(_) => {
             if fortress {
                 Some(IngestError::Upstream { reason: "store_unreachable".to_string(), blocker: None })
             } else {
@@ -567,7 +452,7 @@ fn net_to_ingest(err: NetError, fortress: bool) -> IngestError {
     }
     match err {
         NetError::Http(e) => IngestError::Http(e),
-        NetError::Other(m) => IngestError::Other(m),
+        NetError::Other(m) | NetError::Timeout(m) => IngestError::Other(m),
     }
 }
 
@@ -630,16 +515,28 @@ struct TitleMeta {
     title_source: Option<&'static str>,
 }
 
-fn derive_title_meta(summary: &ChunkSummary, head: &HeadMeta, step_offset: u64) -> TitleMeta {
-    let mut title = summary.title.clone().or_else(|| head.title.clone());
-    let mut source: Option<&'static str> = if summary.title.is_some() {
+/// `deriveTitleMeta`: Claude Desktop's title, else the chunk's, else Codex's,
+/// else the rollout head's; a synthesized label on a from-zero upload.
+fn derive_title_meta(summary: &ChunkSummary, head: &HeadMeta, step_offset: u64, ccd: Option<&CcdSessionMeta>, codex: Option<&CodexTitle>) -> TitleMeta {
+    let ccd_title: Option<JsStr> = ccd.and_then(|m| m.title.clone()).filter(|t| !t.is_empty());
+    let mut title: Option<JsStr> = ccd_title
+        .clone()
+        .or_else(|| summary.title.clone())
+        .or_else(|| codex.map(|c| c.title.clone()))
+        .or_else(|| head.title.clone());
+    let mut source: Option<&'static str> = if ccd_title.is_some() {
+        ccd.and_then(|m| m.title_source)
+    } else if summary.title.is_some() {
         summary.title_source
+    } else if codex.is_some() {
+        codex.map(|c| c.source)
     } else if head.title.is_some() {
         Some("ai")
     } else {
         None
     };
-    if title.is_none() && step_offset == 0 {
+    let falsy = title.as_ref().map(|t| t.is_empty()).unwrap_or(true);
+    if falsy && step_offset == 0 {
         if let Some(derived) = derive_fallback_title(summary.first_user_text.as_deref(), head.cwd.as_deref(), head.repo_slug.as_deref()) {
             title = Some(derived);
             source = Some("fallback");
@@ -654,11 +551,12 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
         None => return Ok(false),
     };
     let fresh = DiscoveredFile { path: file.path.clone(), size: st.size, mtime_ms: st.mtime_ms, source: file.source, root_dir: file.root_dir.clone() };
-    let fstate = ensure_file_state(ctx, &fresh);
+    let fstate = ensure_file_state(ctx, &fresh).map_err(IngestError::Other)?;
     let base_offset = fs_min_offset(&fstate);
-    if (st.size as f64) <= base_offset && fstate.get("skipReason").is_none() {
+    let held = fstate.get("skipReason").map(|v| v.truthy()).unwrap_or(false);
+    if (st.size as f64) <= base_offset && !held {
         if fstate.get_f64("lastMtimeMs") != Some(st.mtime_ms) {
-            ctx.store.touch_mtime(&file.path, st.mtime_ms);
+            ctx.store.touch_mtime(&file.path, st.mtime_ms).map_err(IngestError::Other)?;
         }
         return Ok(false);
     }
@@ -673,7 +571,7 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
     if cached_slug.is_none() && head.repo_slug.is_some() {
         if let Some(mut f) = ctx.store.file(&file.path) {
             f.set("repoSlug", Json::opt_str(head.repo_slug.as_deref()));
-            ctx.store.upsert_file_state(f);
+            ctx.store.upsert_file_state(f).map_err(IngestError::Other)?;
         }
     }
 
@@ -684,10 +582,14 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
         if let Some(mut f) = ctx.store.file(&file.path) {
             if f.get("attributed").and_then(|a| a.as_bool()) != Some(attributed) {
                 f.set("attributed", Json::Bool(attributed));
-                ctx.store.upsert_file_state(f);
+                ctx.store.upsert_file_state(f).map_err(IngestError::Other)?;
             }
         }
     }
+
+    // Claude Desktop's title and group id, and Codex's own title: byte-independent, resolved once.
+    let ccd_meta: Option<CcdSessionMeta> = get_ccd_recents_by_cli_id(now_ms()).get(&session_id).cloned();
+    let codex_title: Option<CodexTitle> = if file.source == "codex" { read_codex_title(&file.root_dir, &session_id) } else { None };
 
     let mut any_progress = false;
     let mut last_unavailable: Option<HxHttpError> = None;
@@ -697,7 +599,7 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
     let mut sent_by_dest: HashMap<String, u64> = HashMap::new();
     let mut slice_summaries: HashMap<String, (u64, ChunkSummary)> = HashMap::new();
     let now_label = |v: Option<&str>| v.map(|s| s.to_string()).unwrap_or_else(|| "let.ai".to_string());
-
+    let open_err = |e: std::io::Error| NetError::Other(node_error(&e, "open", Path::new(&file.path)));
     let drain: Result<(), NetError> = (|| {
         for _round in 0..DRAIN_ROUNDS_BACKSTOP {
             ctx.beat();
@@ -707,7 +609,7 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
             held_blocker = vault_blocker_from_destinations(append.get("destinations"));
             if let Some(list) = append.get("destinations").and_then(|d| d.as_arr()) {
                 let keys: Vec<String> = list.iter().map(|d| dest_key(d.get_string("vaultOrgId").as_deref())).collect();
-                ctx.store.reconcile_destinations(&file.path, &keys);
+                ctx.store.reconcile_destinations(&file.path, &keys).map_err(NetError::Other)?;
                 let reports: Vec<DestinationReport> = list
                     .iter()
                     .map(|d| DestinationReport {
@@ -718,7 +620,7 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                         last_seen_at: d.get("lastSeenAt").and_then(|v| v.as_string()),
                     })
                     .collect();
-                ctx.store.record_destinations(&reports);
+                ctx.store.record_destinations(&reports).map_err(NetError::Other)?;
             }
             let live = ctx.store.file(&file.path).unwrap_or_else(|| fstate.clone());
             let steps: Vec<UploadStep> = plan_fanout(&append, &live)
@@ -739,9 +641,9 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                 if want == 0 {
                     continue;
                 }
-                let held = ctx.semaphore.acquire(want);
+                let held = upload_semaphore().acquire(want);
                 let result: Result<(), NetError> = (|| {
-                    let slice = read_slice(&file.path, step_offset, want).map_err(|e| NetError::Other(e.to_string()))?;
+                    let slice = read_slice(&file.path, step_offset, want).map_err(open_err)?;
                     let (mut trimmed, mut end_offset) = trim_at_last_newline(slice, step_offset);
                     if trimmed.is_empty() {
                         return Ok(());
@@ -764,7 +666,7 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                         // Growth probe: retry in place at the last-good rung.
                         let last_good = base_chunk.max(chunk_size / 2);
                         let shrunk_want = st.size.saturating_sub(step_offset).min(last_good);
-                        let shrunk_slice = read_slice(&file.path, step_offset, shrunk_want).map_err(|e| NetError::Other(e.to_string()))?;
+                        let shrunk_slice = read_slice(&file.path, step_offset, shrunk_want).map_err(open_err)?;
                         let (shrunk, shrunk_end) = trim_at_last_newline(shrunk_slice, step_offset);
                         if shrunk.is_empty() {
                             return Err(grow_err);
@@ -785,20 +687,20 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                             None => false,
                         };
                         if size_shaped {
-                            ctx.store.set_chunk_cap(&dk, last_good as f64);
+                            ctx.store.set_chunk_cap(&dk, last_good as f64).map_err(NetError::Other)?;
                             let fresh = ctx.chunk_cap_logged.lock().unwrap_or_else(|e| e.into_inner()).insert(dk.clone());
                             if fresh {
                                 ctx.log(&format!("[hx] chunk size settled at {} MB for {}", num_to_string(math_round(last_good as f64 / (1024.0 * 1024.0))), dk));
                             }
                         }
                     }
-                    let tm = derive_title_meta(&summary, &head, step_offset);
+                    let tm = derive_title_meta(&summary, &head, step_offset, ccd_meta.as_ref(), codex_title.as_ref());
                     let cwd_meta: Json = if ctx.cfg.evidence_upload == Some(false) { Json::Null } else { opt_js(&head.cwd) };
                     let meta = obj(vec![
                         ("sourcePath", Json::str(&file.path)),
                         ("title", opt_js(&tm.title)),
                         ("titleSource", Json::opt_str(tm.title_source)),
-                        ("ccdSessionId", Json::Null),
+                        ("ccdSessionId", ccd_meta.as_ref().map(|m| Json::str(&m.ccd_session_id)).unwrap_or(Json::Null)),
                         ("cwd", cwd_meta),
                         ("gitBranch", opt_js(&head.git_branch)),
                         ("repoSlug", Json::opt_str(repo_slug.as_deref())),
@@ -820,9 +722,9 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                     let live = ctx.store.file(&file.path).unwrap_or_else(|| fstate.clone());
                     let heal_paused_until = live.get_f64("healPausedUntilMs").unwrap_or(0.0);
                     if diverged && heal_paused_until > now_ms() {
-                        ctx.store.set_offset_for(&file.path, step.vault_org_id.as_deref(), end_offset as f64, st.mtime_ms);
+                        ctx.store.set_offset_for(&file.path, step.vault_org_id.as_deref(), end_offset as f64, st.mtime_ms).map_err(NetError::Other)?;
                     } else if diverged {
-                        let streak = ctx.store.record_heal(&file.path);
+                        let streak = ctx.store.record_heal(&file.path).map_err(NetError::Other)?;
                         ctx.log(&format!(
                             "  [heal] {}… canonical {}B ≠ uploaded {}B — re-uploading from zero",
                             short_id(&session_id),
@@ -833,17 +735,17 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                         if after.get_f64("healPausedUntilMs").unwrap_or(0.0) > now_ms() {
                             ctx.log(&format!("  [heal] {}… diverged {}x in a row — pausing self-heal for this file", short_id(&session_id), num_to_string(streak)));
                         }
-                        ctx.store.set_offset_for(&file.path, step.vault_org_id.as_deref(), 0.0, st.mtime_ms);
+                        ctx.store.set_offset_for(&file.path, step.vault_org_id.as_deref(), 0.0, st.mtime_ms).map_err(NetError::Other)?;
                     } else {
-                        ctx.store.set_offset_for(&file.path, step.vault_org_id.as_deref(), end_offset as f64, st.mtime_ms);
+                        ctx.store.set_offset_for(&file.path, step.vault_org_id.as_deref(), end_offset as f64, st.mtime_ms).map_err(NetError::Other)?;
                         if step_offset > 0 && live.get("healCount").is_some() {
-                            ctx.store.clear_heal(&file.path);
+                            ctx.store.clear_heal(&file.path).map_err(NetError::Other)?;
                         }
                     }
                     if artifact_text.is_none() {
                         artifact_text = Some(String::from_utf8_lossy(&trimmed).into_owned());
                     }
-                    ctx.store.clear_destination_upload_error(&dk);
+                    ctx.store.clear_destination_upload_error(&dk).map_err(NetError::Other)?;
                     any_progress = true;
                     round_progress = true;
                     *sent_by_dest.entry(dk.clone()).or_insert(0) += trimmed.len() as u64;
@@ -866,7 +768,7 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                     append_activity(now_ms(), &session_id, &family, trimmed.len() as u64, &dk);
                     Ok(())
                 })();
-                ctx.semaphore.release(held);
+                upload_semaphore().release(held);
                 if let Err(err) = result {
                     if let Some(h) = err.http() {
                         if h.server_unavailable() {
@@ -875,7 +777,8 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                             ctx.log(&format!("  [hx] destination {} unavailable ({}); will retry", now_label(step.vault_org_id.as_deref()), h.status));
                             continue;
                         }
-                        ctx.store.record_destination_upload_error(&dk, &upload_error_code(h));
+                        // `.catch(() => {})`: a failed latch write never masks the upload error.
+                        let _ = ctx.store.record_destination_upload_error(&dk, &upload_error_code(h));
                     }
                     return Err(err);
                 }
@@ -907,8 +810,13 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
         }
         return Ok(false);
     }
-    // Sidecars (tasks, plans) ride the next card; the hot path uploads transcripts.
-    let _ = artifact_text;
+    // Best-effort sidecar sync — a failure must never fail the transcript.
+    if let Some(text) = &artifact_text {
+        let live = ctx.store.file(&file.path).unwrap_or_else(|| fstate.clone());
+        if let Err(e) = sync_artifacts(ctx, &live, text, Some(&file.root_dir)) {
+            ctx.log(&format!("  [artifacts] {}…: {}", short_id(&session_id), e.message()));
+        }
+    }
     if let Some(hb) = held_blocker {
         return Err(IngestError::Upstream { reason: hb.reason.clone(), blocker: Some(hb) });
     }
@@ -938,24 +846,31 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
     ctx.beat();
     let store_gen = ctx.store.generation();
     let settings_sig = tick_settings_signature(&settings, &roots);
+    let parent_lane = ctx.scope.to_string();
+    let child_lane = format!("{}:children", ctx.scope);
+    let child_paused = now < *ctx.child_pause_until.lock().unwrap_or_else(|e| e.into_inner());
+    let log_fn = |m: &str| ctx.log(m);
     // Nothing moved since the last pass, which pooled nothing: the same
     // snapshot, no per-file work (TickCache).
-    if !legacy_sweep && opts.only.is_none() && !backfill_due(ctx, "main", now) && !backfill_due(ctx, "main:children", now) {
+    if !legacy_sweep && opts.only.is_none() && !child_paused && !backfill_due(ctx, &parent_lane, now) && !backfill_due(ctx, &child_lane, now) {
         let cached = {
             let cache = ctx.tick_cache.lock().unwrap_or_else(|e| e.into_inner());
             match &*cache {
-                Some(c) if c.pooled_empty && c.catalog_gen == cat_gen && c.store_gen == store_gen && c.settings_sig == settings_sig => Some(c.snapshot),
+                Some(c) if c.pooled_empty && c.catalog_gen == cat_gen && c.store_gen == store_gen && c.settings_sig == settings_sig && now < c.quiet_until => Some(c.snapshot),
                 _ => None,
             }
         };
         if let Some(snapshot) = cached {
             ctx.store.flush_if_dirty()?;
+            save_ccd_index_if_changed(now_ms(), opts.one_shot);
             on_progress(snapshot);
             return Ok(TickResult { uploaded: 0, failed: 0, snapshot });
         }
     }
     let mut files: Vec<DiscoveredFile> = if legacy_sweep {
-        discover_claude_files(&roots.claude, Some(RECENT_WINDOW_MS), now)
+        let mut v = discover_claude_files(&roots.claude, Some(RECENT_WINDOW_MS), now);
+        v.extend(discover_codex_files(&roots.codex, true, Some(RECENT_WINDOW_MS), now));
+        v
     } else {
         ctx.catalog.lock().unwrap_or_else(|e| e.into_inner()).list_files()
     };
@@ -964,9 +879,13 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
     }
 
     // The unwindowed sweep: once on start, then hourly.
-    if opts.only.is_none() && backfill_due(ctx, "main", now) {
-        mark_backfill_run(ctx, "main", now);
-        let owed = ctx.store.read(|state| select_backfill(discover_claude_files(&roots.claude, None, now), state));
+    if opts.only.is_none() && backfill_due(ctx, &parent_lane, now) {
+        mark_backfill_run(ctx, &parent_lane, now);
+        let owed = ctx.store.read(|state| {
+            let mut all = discover_claude_files(&roots.claude, None, now);
+            all.extend(discover_codex_files(&roots.codex, true, None, now));
+            select_backfill(all, state)
+        });
         if !owed.is_empty() {
             let seen: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
             let added: Vec<DiscoveredFile> = owed.into_iter().filter(|f| !seen.contains(&f.path)).collect();
@@ -991,20 +910,23 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
         }
     }
 
-    // Seed-then-elect: every file with no state entry is seeded before election.
+    // Seed-then-elect: every file with no state entry is seeded before
+    // election; an unreadable or unwritable seed is left for ingestOne's own
+    // error taxonomy (`.catch(() => {})`).
     let unseeded: Vec<DiscoveredFile> = ctx.store.read(|state| files.iter().filter(|f| state.get("files").and_then(|m| m.get(&f.path)).is_none()).cloned().collect());
     for f in &unseeded {
         ctx.beat();
         let _ = ensure_file_state(ctx, f);
     }
     let files: Vec<DiscoveredFile> = {
-        let elected = ctx.store.read(|state| elect_uploaders(ctx, files, state, true));
+        let elected = ctx.store.read(|state| elect_uploaders(files, state, Some(&log_fn)));
         ctx.store.read(|state| filter_watched(elected, state, &settings))
     };
     on_progress(ctx.store.read(|state| snapshot_from(&files, state)));
 
     let eff_opts = WatchOptions { chunk_growth: matches!(tuning_value(&settings, "chunkGrowth"), Some(Json::Bool(true))), ..opts.clone() };
     let file_concurrency = tuning_int(&settings, "uploadConcurrency", FILE_CONCURRENCY_DEFAULT);
+    let child_concurrency = tuning_int(&settings, "childConcurrency", CHILD_CONCURRENCY_DEFAULT);
 
     let uploaded = AtomicU64::new(0);
     let failed = AtomicU64::new(0);
@@ -1012,15 +934,18 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
     let stop_pass = AtomicBool::new(false);
     let personal_sync = settings.personal_sync;
 
-    let process_parent = |f: &DiscoveredFile| {
+    // One file of the pass. A state write that fails (an unwritable store)
+    // ends the pass the way the TypeScript client's awaited write does: the
+    // error is the pass's error, logged by the loop as `[hx] tick error`.
+    let process_parent = |f: &DiscoveredFile| -> Result<(), String> {
         ctx.beat();
         let now = now_ms();
         let pending = ctx.store.file(&f.path);
         if let Some(p) = &pending {
             if let Some(next) = p.get_f64("nextAttemptAtMs") {
-                if next > now {
+                if next != 0.0 && next > now {
                     let mins = math_round((next - now) / 60_000.0);
-                    let skip = p.get_string("skipReason");
+                    let skip = p.get_string("skipReason").filter(|s| !s.is_empty());
                     log_stuck(
                         ctx,
                         &f.path,
@@ -1033,7 +958,7 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
                         ),
                         now,
                     );
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -1041,14 +966,14 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
         if pending.is_none() || (!personal_sync && attributed_unknown) {
             let mut seeded = match &pending {
                 Some(p) => p.clone(),
-                None => ensure_file_state(ctx, f),
+                None => ensure_file_state(ctx, f)?,
             };
-            let seeded_slug = seeded.get("repoSlug").filter(|v| !v.is_null()).and_then(|v| v.as_string());
+            let seeded_slug = seeded.get("repoSlug").filter(|v| !v.is_null()).and_then(|v| v.as_string()).filter(|s| !s.is_empty());
             if !personal_sync && seeded_slug.is_some() && seeded.get("attributed").is_none() && ctx.cfg.access_token.is_some() {
                 let r = resolve_route_shared(seeded_slug.as_deref().unwrap_or(""), &ctx.gw, &ctx.routes);
                 if let Some(ids) = r.attributed_org_ids {
                     seeded.set("attributed", Json::Bool(!ids.is_empty()));
-                    ctx.store.upsert_file_state(seeded.clone());
+                    ctx.store.upsert_file_state(seeded.clone())?;
                 }
             }
             if should_skip_entry(&settings, &seeded) {
@@ -1069,7 +994,7 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
                     ),
                     now,
                 );
-                return;
+                return Ok(());
             }
         }
         if let Some(entry) = ctx.store.file(&f.path) {
@@ -1077,7 +1002,7 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
             let sid = entry.get_string("sessionId").unwrap_or_default();
             if ctx.store.read(|s| Store::is_deleted_session(s, &family, &sid)) {
                 log_stuck(ctx, &f.path, "deleted", "session was permanently deleted on the server — it will never upload again", now);
-                return;
+                return Ok(());
             }
         }
         match ingest_one(ctx, f, &eff_opts) {
@@ -1087,19 +1012,11 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
                 } else if pending.is_some() {
                     if let Some(after) = ctx.store.file(&f.path) {
                         if after.get("lastKnownSize").is_some() && fs_min_offset(&after) < f.size as f64 {
-                            let owed: Vec<String> = fs_offsets(&after)
-                                .into_iter()
-                                .filter(|(_, v)| f.size as f64 - v > 0.0)
-                                .map(|(k, v)| format!("{} at {}/{}", k, num_to_string(v), f.size))
-                                .collect();
                             log_stuck(
                                 ctx,
                                 &f.path,
                                 "no-plan",
-                                &format!(
-                                    "owes bytes but the gateway planned no upload for it — {}. The destination may no longer exist.",
-                                    if owed.is_empty() { "no destinations recorded".to_string() } else { owed.join(", ") }
-                                ),
+                                &format!("owes bytes but the gateway planned no upload for it — {}. The destination may no longer exist.", owed_summary(&after, f.size)),
                                 now_ms(),
                             );
                         }
@@ -1107,7 +1024,7 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
                 }
                 if let Some(p) = &pending {
                     if p.get("consecutiveFailures").is_some() || p.get("nextAttemptAtMs").is_some() {
-                        ctx.store.clear_file_failure(&f.path);
+                        ctx.store.clear_file_failure(&f.path)?;
                     }
                 }
             }
@@ -1120,15 +1037,15 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
                             let names: Vec<(String, Option<String>)> = b.destinations.iter().map(|d| (d.vault_org_id.clone(), d.org_name.clone())).collect();
                             remember_org_names(&names);
                         }
-                        let delay = ctx.store.record_file_failure(&f.path, SESSION_SKIP_RETRY_BASE_MS, Some(&reason), blocker.as_ref());
+                        let delay = ctx.store.record_file_failure(&f.path, SESSION_SKIP_RETRY_BASE_MS, Some(&reason), blocker.as_ref())?;
                         ctx.log(&format!("  [hx] {}; retrying {} in {}s", describe_skip(&reason), basename(&f.path, ""), num_to_string(math_round(delay / 1000.0))));
                     }
                     IngestError::Http(h) if h.session_deleted() => {
                         if let Some(entry) = ctx.store.file(&f.path) {
                             let family = entry.get_string("family").unwrap_or_default();
                             let sid = entry.get_string("sessionId").unwrap_or_default();
-                            ctx.store.record_deleted_session(&family, &sid);
-                            ctx.store.clear_file_failure(&f.path);
+                            ctx.store.record_deleted_session(&family, &sid)?;
+                            ctx.store.clear_file_failure(&f.path)?;
                             ctx.log(&format!("  [hx] {}… permanently deleted on the server — uploads stopped (local file kept)", short_id(&sid)));
                         }
                     }
@@ -1142,17 +1059,18 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
                             if !stop_pass.swap(true, Ordering::SeqCst) {
                                 ctx.log(&format!("  [hx] gateway unavailable ({}) on {} files; pausing this pass", h.status, count));
                             }
-                            return;
+                            return Ok(());
                         }
-                        ctx.store.bench_file_probe(&f.path, FILE_RETRY_BASE_MS);
+                        ctx.store.bench_file_probe(&f.path, FILE_RETRY_BASE_MS)?;
                         ctx.log(&format!("  [hx] 5xx ({}) on one file; probing another before pausing the pass", h.status));
                     }
                     _ => {
-                        ctx.store.record_file_failure(&f.path, FILE_RETRY_BASE_MS, None, None);
+                        ctx.store.record_file_failure(&f.path, FILE_RETRY_BASE_MS, None, None)?;
                     }
                 }
             }
         }
+        Ok(())
     };
 
     // The parent-file gate: pool only files with something to do.
@@ -1167,7 +1085,7 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
                         Some(fs) => fs,
                         None => return true,
                     };
-                    if fs.get("skipReason").is_some() {
+                    if fs.get("skipReason").map(|v| v.truthy()).unwrap_or(false) {
                         return true;
                     }
                     if fs.get("consecutiveFailures").is_some() || fs.get("nextAttemptAtMs").is_some() {
@@ -1191,26 +1109,251 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
                 .collect()
         })
     };
+    let first_error: Mutex<Option<String>> = Mutex::new(None);
     let last_progress = Mutex::new(now_ms());
-    let worker = |f: &DiscoveredFile| {
-        process_parent(f);
+    let worker = |f: &DiscoveredFile| -> bool {
+        if let Err(e) = process_parent(f) {
+            let mut fe = first_error.lock().unwrap_or_else(|x| x.into_inner());
+            if fe.is_none() {
+                *fe = Some(e);
+            }
+            // The lane that threw is done; the others finish their items.
+            return false;
+        }
         let mut lp = last_progress.lock().unwrap_or_else(|e| e.into_inner());
         if now_ms() - *lp >= SYNC_PROGRESS_MIN_MS {
             *lp = now_ms();
             drop(lp);
             on_progress(ctx.store.read(|state| snapshot_from(&files, state)));
         }
+        true
     };
     run_pool(&pooled, file_concurrency, &worker, &stop_pass);
-
-    // Child lanes and workflow sidecars (the next card). The child sweep's
-    // first-pass line is what a tree without lanes produces.
-    if opts.only.is_none() && !legacy_sweep && backfill_due(ctx, "main:children", now_ms()) {
-        mark_backfill_run(ctx, "main:children", now_ms());
-        ctx.log("[hx] child backfill: swept, no lane outside the live sweep owes bytes");
+    // runPool rejects with the first lane's error once the lanes still
+    // running have finished their items, which the scoped pool above did.
+    if let Some(e) = first_error.into_inner().unwrap_or_else(|x| x.into_inner()) {
+        return Err(e);
     }
 
+    // Child lanes + workflow sidecars (Claude only). After the parent pass so
+    // a brand-new session's parent commit lands first.
+    let mut children_quiet = true;
+    let mut quiet_until = f64::INFINITY;
+    let pause_until = *ctx.child_pause_until.lock().unwrap_or_else(|e| e.into_inner());
+    if opts.only.is_none() && now_ms() >= pause_until {
+        let outcome: Result<(), String> = (|| {
+            let index = ctx.store.read(build_child_parent_index);
+            let mut swept_lanes: HashSet<String> = HashSet::new();
+            let (mut children, mut runs): (Vec<DiscoveredChildFile>, Vec<DiscoveredWorkflowRun>) = if legacy_sweep {
+                discover_claude_children(&roots.claude, Some(RECENT_WINDOW_MS), now_ms())
+            } else {
+                ctx.catalog.lock().unwrap_or_else(|e| e.into_inner()).list_children()
+            };
+            // The child sweep, on its own hourly lane (catalog only).
+            if !legacy_sweep && backfill_due(ctx, &child_lane, now_ms()) {
+                mark_backfill_run(ctx, &child_lane, now_ms());
+                let (swept_children, swept_runs) = ctx.store.read(|state| discover_child_backfill(&roots.claude, state, now_ms()));
+                let merged = merge_child_backfill(children, runs, swept_children, swept_runs);
+                if !merged.added.is_empty() {
+                    let unseen = ctx.store.read(|state| merged.added.iter().filter(|c| state.get("files").and_then(|m| m.get(&c.path)).is_none()).count());
+                    ctx.log(&format!(
+                        "[hx] child backfill: {} lane{} the live sweep did not reach still owe bytes ({} never ingested) — queueing",
+                        merged.added.len(),
+                        if merged.added.len() == 1 { "" } else { "s" },
+                        unseen
+                    ));
+                } else {
+                    ctx.log("[hx] child backfill: swept, no lane outside the live sweep owes bytes");
+                }
+                for c in &merged.added {
+                    swept_lanes.insert(c.path.clone());
+                }
+                let at = now_ms();
+                {
+                    let mut cat = ctx.catalog.lock().unwrap_or_else(|e| e.into_inner());
+                    for c in &merged.added {
+                        cat.adopt_session_dir(c, at);
+                    }
+                }
+                children = merged.children;
+                runs = merged.runs;
+            }
+            let elected = elect_child_uploaders(&children, Some(&log_fn));
+            let contested = contested_child_lanes(&children);
+            let prev: OMap = ctx.store.read(|state| state.get("childUploaders").and_then(|m| m.as_obj()).cloned().unwrap_or_else(OMap::new));
+            let plan = plan_child_lane_resets(&elected, &prev, &contested);
+            if plan.changed {
+                for p in &plan.reset_paths {
+                    let mut reset_offsets = false;
+                    ctx.store.mutate(|state| {
+                        if let Some(fs) = state.as_obj_mut().and_then(|o| o.get_mut("files")).and_then(|f| f.as_obj_mut()).and_then(|f| f.get_mut(p)) {
+                            let has_offsets = fs.get("offsets").and_then(|o| o.as_obj()).map(|o| !o.is_empty()).unwrap_or(false);
+                            if has_offsets {
+                                fs.set("offsets", Json::obj());
+                                reset_offsets = true;
+                            }
+                            fs.remove("consecutiveFailures");
+                            fs.remove("nextAttemptAtMs");
+                            fs.remove("skipReason");
+                        }
+                    });
+                    if reset_offsets {
+                        ctx.log(&format!("[hx] child lane uploader switched — re-uploading {} from zero", basename(p, "")));
+                    }
+                }
+                let next_map = plan.next_map.clone();
+                ctx.store.mutate(|state| state.set("childUploaders", Json::Obj(next_map)));
+                ctx.store.persist_state()?;
+            }
+            // Identity repair for EVERY elected lane, pooled or not.
+            for c in &elected {
+                let current = match ctx.store.file(&c.path) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                if let Some(reconciled) = reconcile_child_parent(&current, index.get(&c.parent_session_id)) {
+                    ctx.store.upsert_file_state(reconciled)?;
+                }
+            }
+            let pooled_children: Vec<DiscoveredChildFile> = if legacy_sweep {
+                elected.clone()
+            } else {
+                ctx.store.read(|state| elected.iter().filter(|c| child_needs_pass(c, state.get("files").and_then(|m| m.get(&c.path)))).cloned().collect())
+            };
+            if !pooled_children.is_empty() {
+                children_quiet = false;
+            }
+            let stop_children = AtomicBool::new(false);
+            let child_error: Mutex<Option<String>> = Mutex::new(None);
+            let process_child = |c: &DiscoveredChildFile| -> Result<(), String> {
+                ctx.beat();
+                let pending = ctx.store.file(&c.path);
+                if let Some(p) = &pending {
+                    if let Some(next) = p.get_f64("nextAttemptAtMs") {
+                        if next != 0.0 && next > now_ms() {
+                            return Ok(());
+                        }
+                    }
+                }
+                let family = pending.as_ref().and_then(|p| p.get_string("family")).unwrap_or_default();
+                let sid = pending.as_ref().and_then(|p| p.get_string("sessionId")).unwrap_or_else(|| c.parent_session_id.clone());
+                if ctx.store.read(|s| Store::is_deleted_session(s, &family, &sid)) {
+                    return Ok(());
+                }
+                let attempt: Result<(), NetError> = (|| {
+                    let did = ingest_child_one(ctx, c, &index, opts)?;
+                    if did {
+                        uploaded.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // Drain a rescued lane in place, bounded; the extra chunks do not count as uploads.
+                    if did && swept_lanes.contains(&c.path) {
+                        for _ in 1..SWEPT_LANE_MAX_CHUNKS {
+                            if stop_children.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            if !ingest_child_one(ctx, c, &index, opts)? {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(())
+                })();
+                match attempt {
+                    Ok(()) => {
+                        if let Some(p) = &pending {
+                            if p.get("consecutiveFailures").is_some() || p.get("nextAttemptAtMs").is_some() {
+                                ctx.store.clear_file_failure(&c.path)?;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        failed.fetch_add(1, Ordering::SeqCst);
+                        ctx.log(&format!("  [error] {}: {}", c.path, err.message()));
+                        if let Some(h) = err.http() {
+                            if h.session_deleted() {
+                                let fam = if family.is_empty() { "claude-cli".to_string() } else { family.clone() };
+                                ctx.store.record_deleted_session(&fam, &sid)?;
+                                ctx.store.clear_file_failure(&c.path)?;
+                                return Ok(());
+                            }
+                            if h.vault_offline() {
+                                ctx.store.record_file_failure(&c.path, SESSION_SKIP_RETRY_BASE_MS, Some(h.vault_block_reason().unwrap_or("vault_offline")), h.blocker.as_ref())?;
+                                return Ok(());
+                            }
+                        }
+                        if latch_child_lane_pause(ctx, &err) {
+                            stop_children.store(true, Ordering::SeqCst);
+                            return Ok(());
+                        }
+                        if err.http().map(|h| h.server_unavailable()).unwrap_or(false) {
+                            stop_children.store(true, Ordering::SeqCst);
+                            return Ok(());
+                        }
+                        ctx.store.record_file_failure(&c.path, FILE_RETRY_BASE_MS, None, None)?;
+                    }
+                }
+                Ok(())
+            };
+            let child_worker = |c: &DiscoveredChildFile| -> bool {
+                if let Err(e) = process_child(c) {
+                    let mut ce = child_error.lock().unwrap_or_else(|x| x.into_inner());
+                    if ce.is_none() {
+                        *ce = Some(e);
+                    }
+                    return false;
+                }
+                true
+            };
+            run_pool(&pooled_children, child_concurrency, &child_worker, &stop_children);
+            if let Some(e) = child_error.into_inner().unwrap_or_else(|x| x.into_inner()) {
+                return Err(e);
+            }
+            for r in &runs {
+                let lane_key = format!("{}:{}", r.parent_session_id, r.run_id);
+                let lane = ctx.workflow_lanes.lock().unwrap_or_else(|e| e.into_inner()).get(&lane_key).copied();
+                match plan_workflow_sync(lane.as_ref(), r.mtime_ms, now_ms()) {
+                    WorkflowPlan::SkipUnchanged => continue,
+                    WorkflowPlan::SkipBackoff => {
+                        if let Some(l) = &lane {
+                            quiet_until = quiet_until.min(l.next_attempt_at_ms);
+                        }
+                        continue;
+                    }
+                    WorkflowPlan::Sync => {
+                        children_quiet = false;
+                        match sync_workflow_run(ctx, r, &index) {
+                            Ok(()) => {
+                                ctx.workflow_lanes
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(lane_key, WorkflowLane { hashed_mtime_ms: r.mtime_ms, consecutive_failures: 0.0, next_attempt_at_ms: 0.0 });
+                            }
+                            Err(e) => {
+                                ctx.workflow_lanes.lock().unwrap_or_else(|x| x.into_inner()).insert(lane_key, workflow_lane_after_failure(lane.as_ref(), now_ms()));
+                                if latch_child_lane_pause(ctx, &e) {
+                                    break;
+                                }
+                                ctx.log(&format!("  [error] workflow {}: {}", r.run_id, e.message()));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            ctx.log(&format!("[hx] child discovery error: {}", e));
+            children_quiet = false;
+        }
+    } else if opts.only.is_none() {
+        // Paused: the lanes are tried again once the pause lapses.
+        quiet_until = quiet_until.min(pause_until);
+    }
+
+    // Flush point: end of every pass. The Claude Desktop index saves on the
+    // same beat: forced in a one-shot pass, interval-gated in the daemon.
     ctx.store.flush_if_dirty()?;
+    save_ccd_index_if_changed(now_ms(), opts.one_shot);
     let snapshot = ctx.store.read(|state| snapshot_from(&files, state));
     on_progress(snapshot);
     let uploaded_n = uploaded.load(Ordering::SeqCst);
@@ -1223,7 +1366,8 @@ pub fn tick_once(ctx: &Ctx, opts: &WatchOptions, on_progress: &(dyn Fn(SyncSnaps
             store_gen,
             settings_sig,
             snapshot,
-            pooled_empty: pooled.is_empty() && uploaded_n == 0 && failed_n == 0,
+            pooled_empty: pooled.is_empty() && uploaded_n == 0 && failed_n == 0 && children_quiet,
+            quiet_until,
         });
     }
     Ok(TickResult { uploaded: uploaded_n, failed: failed_n, snapshot })
@@ -1236,11 +1380,14 @@ fn audit_canonicals(ctx: &Ctx, opts: &WatchOptions) -> Result<(), NetError> {
         return Ok(());
     }
     let roots = resolve_data_roots(&read_settings());
-    let mut files = discover_claude_files(&roots.claude, None, now_ms());
+    let now = now_ms();
+    // UNWINDOWED: the question does not expire after 30 days.
+    let mut files = discover_claude_files(&roots.claude, None, now);
+    files.extend(discover_codex_files(&roots.codex, true, None, now));
     if let Some(only) = &opts.only {
         files.retain(|f| f.path == *only);
     }
-    let files = ctx.store.read(|state| elect_uploaders(ctx, files, state, false));
+    let files = ctx.store.read(|state| elect_uploaders(files, state, None));
     let candidates: Vec<(String, Json)> = ctx.store.read(|state| {
         files
             .iter()
@@ -1290,7 +1437,7 @@ fn audit_canonicals(ctx: &Ctx, opts: &WatchOptions) -> Result<(), NetError> {
             let r = results.iter().find(|r| r.get_string("family").as_deref() == Some(family.as_str()) && r.get_string("sessionId").as_deref() == Some(sid.as_str()));
             let status = r.and_then(|r| r.get_string("status"));
             if status.as_deref() == Some("deleted") {
-                ctx.store.record_deleted_session(&family, &sid);
+                ctx.store.record_deleted_session(&family, &sid).map_err(NetError::Other)?;
                 ctx.log(&format!("[hx] {}… was permanently deleted on the server — uploads stopped (local file kept)", short_id(&sid)));
                 continue;
             }
@@ -1301,7 +1448,7 @@ fn audit_canonicals(ctx: &Ctx, opts: &WatchOptions) -> Result<(), NetError> {
                 continue;
             }
             healed += 1;
-            ctx.store.record_heal(path);
+            ctx.store.record_heal(path).map_err(NetError::Other)?;
             let store_bytes = r.and_then(|r| r.get_f64("storeBytes")).unwrap_or(0.0);
             ctx.log(&format!(
                 "  [heal] {}… canonical {}B ≠ uploaded {}B — re-uploading from zero",
@@ -1309,7 +1456,7 @@ fn audit_canonicals(ctx: &Ctx, opts: &WatchOptions) -> Result<(), NetError> {
                 num_to_string(store_bytes),
                 num_to_string(fs_offset_for(fs, None))
             ));
-            ctx.store.set_offset_for(path, None, 0.0, fs.get_f64("lastMtimeMs").unwrap_or(0.0));
+            ctx.store.set_offset_for(path, None, 0.0, fs.get_f64("lastMtimeMs").unwrap_or(0.0)).map_err(NetError::Other)?;
         }
     }
     if healed > 0 {
@@ -1396,8 +1543,8 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
         ctx.catalog.lock().unwrap_or_else(|e| e.into_inner()).enable_file_events(log_fn);
     }
 
-    {
-        let (keys, nfiles) = ctx.store.prune_stranded_offsets();
+    // Best-effort (a try/catch in startWatch): an unreadable state file surfaces through the normal pass.
+    if let Ok((keys, nfiles)) = ctx.store.prune_stranded_offsets() {
         if keys > 0 {
             ctx.log(&format!(
                 "[hx] dropped {} offset key{} for unknown destinations across {} session{} no longer on disk",
@@ -1407,17 +1554,20 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
                 if nfiles == 1 { "" } else { "s" }
             ));
         }
-        let dropped = ctx.store.clear_generic_backoffs();
-        if dropped > 0 {
-            ctx.log(&format!("[hx] cleared {} stale retry backoff{} on start", dropped, if dropped == 1 { "" } else { "s" }));
+        if let Ok(dropped) = ctx.store.clear_generic_backoffs() {
+            if dropped > 0 {
+                ctx.log(&format!("[hx] cleared {} stale retry backoff{} on start", dropped, if dropped == 1 { "" } else { "s" }));
+            }
         }
     }
 
     let mut last_roots_sig = String::new();
     let mut last_stamp_at = 0.0f64;
     let mut stamp_failure_logged = false;
+    // Gated to the main lane's persistent daemon: one-shot runs and the
+    // `--local` tee run with an arbitrary shell env and must not overwrite it.
     let publish_roots = |settings: &HxSettings, last_sig: &mut String, last_at: &mut f64, failure_logged: &mut bool| {
-        if opts.one_shot {
+        if opts.one_shot || ctx.scope != "main" {
             return;
         }
         let roots = resolve_data_roots(settings);
@@ -1493,9 +1643,9 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
         } else if is_paused(&settings, now_ms()) {
             if !*was_paused {
                 *was_paused = true;
-                let until = settings.pause.and_then(|p| p);
+                let until = settings.pause.and_then(|p| p).filter(|ms| *ms != 0.0);
                 let suffix = match until {
-                    Some(ms) => format!(" until {}", local_time_string(ms)),
+                    Some(ms) => format!(" until {}", to_locale_time_string_en_us(ms)),
                     None => " until resumed".to_string(),
                 };
                 ctx.log(&format!("[hx] sync paused{}", suffix));
@@ -1569,9 +1719,12 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
     if let Err(e) = run_reattribute_sweep(&ctx.cfg, &ctx.store, &ctx.gw, &log_fn, false) {
         ctx.log(&format!("[hx] attribution sweep error: {}", e.message()));
     }
+    // One-shot codex title backfill (title-sync.ts) — no-ops when every codex
+    // file already carries the current TITLE_SYNC_VERSION stamp.
+    if let Err(e) = run_title_sync_sweep(&ctx.cfg, &ctx.store, &ctx.gw, &log_fn, false) {
+        ctx.log(&format!("[hx] title sweep error: {}", e.message()));
+    }
     release_freed_memory();
-    // The codex title sweep (title-sync.ts) reads no file and sends nothing
-    // on a tree without Codex rollouts; Codex rides the next card.
     if opts.one_shot {
         // Every write the pass asked for is on disk before the process exits.
         ctx.store.drain();
@@ -1683,9 +1836,11 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
         std::thread::sleep(Duration::from_millis(wait as u64));
     }
 
-    // stop(): close events, a parting checkpoint, back to flush-through.
+    // stop(): close events, a parting checkpoint, the index saved once more,
+    // back to flush-through.
     ctx.catalog.lock().unwrap_or_else(|e| e.into_inner()).disable_file_events();
     let _ = ctx.store.checkpoint_state();
+    save_ccd_index_if_changed(now_ms(), true);
     ctx.store.disarm_coalesced();
     ctx.store.drain();
 }
@@ -1708,17 +1863,5 @@ fn release_freed_memory() {
     #[cfg(target_os = "macos")]
     unsafe {
         malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-    }
-}
-
-/// `new Date(ms).toLocaleTimeString()` under en-US, e.g. "9:12:34 PM".
-fn local_time_string(ms: f64) -> String {
-    use chrono::TimeZone;
-    match chrono::Local.timestamp_millis_opt(ms as i64).single() {
-        Some(t) => {
-            let s = t.format("%-I:%M:%S %p").to_string();
-            s
-        }
-        None => String::new(),
     }
 }

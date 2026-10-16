@@ -1,5 +1,7 @@
-//! Source-path discovery and family classification (src/sources.ts), for the
-//! Claude Code transcripts the hot path uploads.
+//! Source-path discovery and family classification (src/sources.ts): the
+//! Claude Code transcripts, the Codex rollouts, and the child execution
+//! lanes (subagent and workflow-agent transcripts, workflow runs) under a
+//! session's artifact directory.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -8,7 +10,7 @@ use std::path::Path;
 use crate::fsutil::{basename, join, readdir_safe, resolve, stat_safe};
 use crate::js::{js, lossy, JsStr};
 use crate::json::Json;
-use crate::roots::{claude_projects_dir, DataRoot};
+use crate::roots::{claude_projects_dir, codex_archived_dir, codex_sessions_dir, DataRoot};
 
 pub const RECENT_WINDOW_MS: f64 = 30.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 
@@ -438,4 +440,293 @@ pub fn derive_fallback_title(first_user_text: Option<&[u16]>, cwd: Option<&[u16]
     } else {
         Some(js(&base))
     }
+}
+
+// ── Codex rollouts ──────────────────────────────────────────────────────────
+
+/// All recent Codex rollout jsonls (sessions + archived) across the roots,
+/// with the same date-dir mtime prune as the walk of the TypeScript client.
+/// `max_age_ms` None lifts the 30-day window.
+pub fn discover_codex_files(roots: &[DataRoot], include_archived: bool, max_age_ms: Option<f64>, now: f64) -> Vec<DiscoveredFile> {
+    let max_age = max_age_ms.unwrap_or(f64::INFINITY);
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    fn walk(dir: &str, root_dir: &str, now: f64, max_age: f64, candidates: &mut Vec<(String, String)>) {
+        let rd = match fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut subdirs: Vec<String> = Vec::new();
+        for e in rd.filter_map(|e| e.ok()) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let full = join(dir, &name);
+            let ft = match e.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                subdirs.push(full);
+            } else if ft.is_file() && name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                candidates.push((full, root_dir.to_string()));
+            }
+        }
+        for d in subdirs {
+            let st = match stat_safe(Path::new(&d)) {
+                Some(s) if s.is_dir => s,
+                _ => continue,
+            };
+            if now - st.mtime_ms > max_age {
+                continue;
+            }
+            walk(&d, root_dir, now, max_age, candidates);
+        }
+    }
+    for root in roots {
+        walk(&codex_sessions_dir(&root.config_dir), &root.config_dir, now, max_age, &mut candidates);
+        if include_archived {
+            walk(&codex_archived_dir(&root.config_dir), &root.config_dir, now, max_age, &mut candidates);
+        }
+    }
+    let mut out = Vec::new();
+    for (path, root_dir) in candidates {
+        let st = match stat_safe(Path::new(&path)) {
+            Some(st) => st,
+            None => continue,
+        };
+        if st.is_dir || st.size == 0 {
+            continue;
+        }
+        if now - st.mtime_ms > max_age {
+            continue;
+        }
+        out.push(DiscoveredFile { path, size: st.size, mtime_ms: st.mtime_ms, source: "codex", root_dir });
+    }
+    out
+}
+
+// ── Child execution lanes (subagents + workflow agents) ─────────────────────
+//
+//   <projects>/<slug>/<sessionId>/subagents/agent-<agentId>.jsonl (+ .meta.json)
+//   <projects>/<slug>/<sessionId>/subagents/workflows/<runId>/agent-<agentId>.jsonl
+//   <projects>/<slug>/<sessionId>/subagents/workflows/<runId>/journal.jsonl
+//   <projects>/<slug>/<sessionId>/workflows/scripts/<name>-<runId>.js
+//
+// The artifact dir follows the session's CURRENT cwd while the main jsonl
+// stays under the slug of the cwd at session start, so children are found by
+// scanning every project dir for session-id subdirectories.
+
+#[derive(Clone, Debug)]
+pub struct DiscoveredChildFile {
+    pub path: String,
+    pub size: u64,
+    pub mtime_ms: f64,
+    /// The parent Claude session id (the <sessionId>/ dir the child lives under).
+    pub parent_session_id: String,
+    pub agent_id: String,
+    /// Workflow run id when the child lives under subagents/workflows/<runId>/.
+    pub run_id: Option<String>,
+    /// Sibling agent-<agentId>.meta.json path, if present.
+    pub meta_path: Option<String>,
+    pub root_dir: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiscoveredWorkflowRun {
+    pub parent_session_id: String,
+    pub run_id: String,
+    pub journal_path: Option<String>,
+    /// Newest mtime across journal + script.
+    pub mtime_ms: f64,
+    pub script_path: Option<String>,
+    /// The workflow's meta.name, recovered from the script filename.
+    pub script_name: Option<String>,
+}
+
+/// The session-artifact dir a child lane lives under: everything before the
+/// first `/subagents/` component (either separator).
+pub fn session_dir_of_lane(child_path: &str) -> Option<String> {
+    let b = child_path.as_bytes();
+    let needle = b"subagents";
+    let mut i = 0;
+    while i + needle.len() + 2 <= b.len() {
+        if (b[i] == b'/' || b[i] == b'\\') && &b[i + 1..i + 1 + needle.len()] == needle {
+            let after = b[i + 1 + needle.len()];
+            if after == b'/' || after == b'\\' {
+                return Some(child_path[..i].to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `/^agent-([a-zA-Z0-9_-]+)\.jsonl$/`.
+fn agent_file_id(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("agent-")?;
+    let id = rest.strip_suffix(".jsonl")?;
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// `/^(.+)-(wf_[a-zA-Z0-9-]+)\.js$/` → (name, runId). The greedy `(.+)` means
+/// the LAST `-wf_` whose tail is `[a-zA-Z0-9-]+` wins.
+fn script_file_parts(name: &str) -> Option<(String, String)> {
+    let stem = name.strip_suffix(".js")?;
+    let mut search_end = stem.len();
+    loop {
+        let at = stem[..search_end].rfind("-wf_")?;
+        let id = &stem[at + 1..];
+        let tail = &id[3..];
+        if at > 0 && !tail.is_empty() && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Some((stem[..at].to_string(), id.to_string()));
+        }
+        if at == 0 {
+            return None;
+        }
+        search_end = at;
+    }
+}
+
+/// Collect agent-*.jsonl files in one directory into `out`, windowed by `max_age_ms`.
+fn collect_agent_files(dir: &str, parent_session_id: &str, run_id: Option<&str>, now: f64, root_dir: &str, out: &mut Vec<DiscoveredChildFile>, max_age_ms: f64) {
+    for f in readdir_safe(Path::new(dir)) {
+        let id = match agent_file_id(&f) {
+            Some(i) => i,
+            None => continue,
+        };
+        let p = join(dir, &f);
+        let st = match stat_safe(Path::new(&p)) {
+            Some(s) if !s.is_dir && s.size > 0 => s,
+            _ => continue,
+        };
+        if now - st.mtime_ms > max_age_ms {
+            continue;
+        }
+        let meta_path = join(dir, &format!("agent-{}.meta.json", id));
+        let meta = if stat_safe(Path::new(&meta_path)).is_some() { Some(meta_path) } else { None };
+        out.push(DiscoveredChildFile {
+            path: p,
+            size: st.size,
+            mtime_ms: st.mtime_ms,
+            parent_session_id: parent_session_id.to_string(),
+            agent_id: id,
+            run_id: run_id.map(|r| r.to_string()),
+            meta_path: meta,
+            root_dir: root_dir.to_string(),
+        });
+    }
+}
+
+/// Scan ONE session-artifact directory for child transcripts and workflow
+/// runs, appending into the caller's shared vectors (the runs merge below
+/// folds a run split across project dirs or roots into one entry).
+pub fn scan_session_artifacts(
+    session_dir: &str,
+    session_id: &str,
+    root_dir: &str,
+    now: f64,
+    children: &mut Vec<DiscoveredChildFile>,
+    runs: &mut Vec<DiscoveredWorkflowRun>,
+    max_age_ms: f64,
+) {
+    let subagents_dir = join(session_dir, "subagents");
+    collect_agent_files(&subagents_dir, session_id, None, now, root_dir, children, max_age_ms);
+
+    let wf_root = join(&subagents_dir, "workflows");
+    for run_id in readdir_safe(Path::new(&wf_root)) {
+        let run_dir = join(&wf_root, &run_id);
+        let rst = match stat_safe(Path::new(&run_dir)) {
+            Some(s) if s.is_dir => s,
+            _ => continue,
+        };
+        collect_agent_files(&run_dir, session_id, Some(&run_id), now, root_dir, children, max_age_ms);
+        let journal_path = join(&run_dir, "journal.jsonl");
+        let jst = stat_safe(Path::new(&journal_path));
+        if let Some(existing) = runs.iter_mut().find(|r| r.parent_session_id == session_id && r.run_id == run_id) {
+            if let Some(j) = &jst {
+                if !j.is_dir {
+                    if existing.journal_path.is_none() {
+                        existing.journal_path = Some(journal_path.clone());
+                    }
+                    existing.mtime_ms = existing.mtime_ms.max(j.mtime_ms);
+                }
+            }
+            continue;
+        }
+        runs.push(DiscoveredWorkflowRun {
+            parent_session_id: session_id.to_string(),
+            run_id: run_id.clone(),
+            journal_path: match &jst {
+                Some(j) if !j.is_dir => Some(journal_path.clone()),
+                _ => None,
+            },
+            mtime_ms: jst.map(|j| j.mtime_ms).unwrap_or(rst.mtime_ms),
+            script_path: None,
+            script_name: None,
+        });
+    }
+
+    let scripts_dir = join(&join(session_dir, "workflows"), "scripts");
+    for f in readdir_safe(Path::new(&scripts_dir)) {
+        let (name, rid) = match script_file_parts(&f) {
+            Some(x) => x,
+            None => continue,
+        };
+        let script_path = join(&scripts_dir, &f);
+        let sstat = match stat_safe(Path::new(&script_path)) {
+            Some(s) if !s.is_dir => s,
+            _ => continue,
+        };
+        if let Some(existing) = runs.iter_mut().find(|r| r.parent_session_id == session_id && r.run_id == rid) {
+            existing.script_path = Some(script_path);
+            existing.script_name = Some(name);
+            existing.mtime_ms = existing.mtime_ms.max(sstat.mtime_ms);
+        } else {
+            runs.push(DiscoveredWorkflowRun {
+                parent_session_id: session_id.to_string(),
+                run_id: rid,
+                journal_path: None,
+                mtime_ms: sstat.mtime_ms,
+                script_path: Some(script_path),
+                script_name: Some(name),
+            });
+        }
+    }
+}
+
+/// All recent child-lane transcripts and workflow runs across every project
+/// dir of the roots. `max_age_ms` None lifts the window.
+pub fn discover_claude_children(roots: &[DataRoot], max_age_ms: Option<f64>, now: f64) -> (Vec<DiscoveredChildFile>, Vec<DiscoveredWorkflowRun>) {
+    let max_age = max_age_ms.unwrap_or(f64::INFINITY);
+    let mut children: Vec<DiscoveredChildFile> = Vec::new();
+    let mut runs: Vec<DiscoveredWorkflowRun> = Vec::new();
+    for root in roots {
+        let projects = claude_projects_dir(&root.config_dir);
+        for dir in readdir_safe(Path::new(&projects)) {
+            if dir.starts_with('.') || dir == "memory" {
+                continue;
+            }
+            let project_dir = join(&projects, &dir);
+            let pst = match stat_safe(Path::new(&project_dir)) {
+                Some(s) if s.is_dir => s,
+                _ => continue,
+            };
+            if now - pst.mtime_ms > max_age {
+                continue;
+            }
+            for entry in readdir_safe(Path::new(&project_dir)) {
+                if entry.ends_with(".jsonl") || entry.starts_with('.') {
+                    continue;
+                }
+                let session_dir = join(&project_dir, &entry);
+                match stat_safe(Path::new(&session_dir)) {
+                    Some(s) if s.is_dir => {}
+                    _ => continue,
+                }
+                scan_session_artifacts(&session_dir, &entry, &root.config_dir, now, &mut children, &mut runs, max_age);
+            }
+        }
+    }
+    (children, runs)
 }

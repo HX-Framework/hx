@@ -2,7 +2,7 @@
 // with the candidate, compare the two runs, and write a report.
 //
 //   bun harness/run/run-harness.ts --reference <bin> --candidate <bin> [--candidate-name hx2]
-//       [--scenarios all|a,b] [--out <dir>] [--work <dir>] [--expect pass|fail]
+//       [--scenarios all|main|hot-path|daemon|daemon-main|a,b] [--out <dir>] [--work <dir>] [--expect pass|fail]
 //       [--goldens <dir>] [--write-goldens <dir>]
 //
 // Exit code 0 means the outcome matched --expect: with "pass" (the default),
@@ -19,7 +19,7 @@ import { compareRuns, coverageCheck, fixtureExpectationChecks, loadRun } from ".
 import { goldenChecks, writeGoldens } from "../lib/goldens.js";
 import type { BinaryName, CheckResult, HarnessReport, RunMeta, ScenarioReport } from "../lib/types.js";
 import { runScenario } from "./run-scenario.js";
-import { selectScenarios } from "./scenarios.js";
+import { M5_PROTOCOL_CALLS, selectScenarios } from "./scenarios.js";
 
 function arg(name: string, fallback?: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -43,7 +43,8 @@ const out = arg("out", join(process.cwd(), ".harness-out")) ?? "";
 const workDir = arg("work", join(process.cwd(), ".harness-work")) ?? "";
 const goldensDir = arg("goldens");
 const writeGoldensDir = arg("write-goldens");
-const scenarios = selectScenarios(arg("scenarios", "all"));
+const spec = arg("scenarios", "all") ?? "all";
+const scenarios = selectScenarios(spec);
 const verbose = has("verbose");
 
 mkdirSync(out, { recursive: true });
@@ -65,8 +66,14 @@ for (const scenario of scenarios) {
   log(`\n=== ${scenario.name}: ${scenario.description}`);
   const t0 = Date.now();
   refMeta = await runScenario({ binary: reference, name: referenceName, scenario, outDir: refDir, home, workDir, log: verbose ? log : () => {} });
+  // One process drives every scenario; a full collection between runs
+  // returns the previous run's gateway store and request buffers before the
+  // next fixture home is generated, so the driver's heap does not carry
+  // 10,000-session runs into the ones that follow.
+  Bun.gc(true);
   const t1 = Date.now();
   candMeta = await runScenario({ binary: candidate, name: candidateName, scenario, outDir: candDir, home, workDir, log: verbose ? log : () => {} });
+  Bun.gc(true);
   const t2 = Date.now();
   referenceDirs.push(refDir);
 
@@ -81,11 +88,15 @@ for (const scenario of scenarios) {
   if (writeGoldensDir) writeGoldens(scenario, ref, candidateName, [ref.meta.version, cand.meta.version], writeGoldensDir);
   const ok = checks.every((c) => c.ok);
   reports.push({ scenario: scenario.name, ok, checks, referenceMs: t1 - t0, candidateMs: t2 - t1 });
+  Bun.gc(true);
   log(`=== ${scenario.name}: ${ok ? "identical" : "DIFFERENT"} (${checks.filter((c) => !c.ok).length} failing checks; reference ${Math.round((t1 - t0) / 1000)} s, candidate ${Math.round((t2 - t1) / 1000)} s)`);
   for (const c of checks.filter((x) => !x.ok)) log(`    ✗ ${c.name}\n${indent(c.details)}`);
 }
 
-const coverage = coverageCheck(referenceDirs, (arg("scenarios", "all") ?? "all") === "all");
+// Coverage is required when the selection can reach every call: `all`,
+// `main` (all but the hot shapes, which add no call) and `daemon` (all but
+// the M5 steps, whose four calls are excluded).
+const coverage = coverageCheck(referenceDirs, ["all", "main", "daemon", "daemon-main"].includes(spec), spec.startsWith("daemon") ? M5_PROTOCOL_CALLS : []);
 const allOk = reports.every((r) => r.ok) && coverage.ok;
 const report: HarnessReport = {
   generatedAt: new Date().toISOString(),

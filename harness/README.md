@@ -19,7 +19,10 @@ harness/
   run/            scenarios.ts (the catalog), run-scenario.ts (drive one
                   binary), run-harness.ts (reference vs candidate + report),
                   measure.ts (the design-fix numbers and hx2's exit check:
-                  rusage, strace, per-second RSS and CPU samples)
+                  rusage, strace, sampled memory), watch-only.ts (a bare
+                  fs.watch, for measure.ts)
+  variants/       patches that change one design choice for a measurement
+                  (no-file-events: the daemon polls, as 77.11 did)
   golden/<os>/    committed, normalized CLI outputs per scenario step
   broken/         patches that make a candidate differ on purpose
   ci/build.sh     one binary from one source checkout, as release.yml does it
@@ -148,15 +151,56 @@ lanes, no sidecars), with the steps hx2 answers:
 
 `--scenarios hot-path` selects them. Every comparison above applies to them
 unchanged; hx2 is passed as `--candidate-name hx2`, so its name is a
-normalization rule and not a diff. What the hot shapes leave out is what the
-next card ports (Codex and its SQLite titles, the Claude Desktop index and
-leveldb scan, child lanes and sidecars, verify and self-heal beyond the
-audit the daemon already runs, reattribute and retitle, the group and team
-mirrors beyond the empty ones a store-less machine uploads); once those land,
-hx2 runs the full scenario list. A fourth shape, `founder`, is the
+normalization rule and not a diff. A fourth shape, `founder`, is the
 measurement tree: 4,800 transcripts over 700 project directories and 36,000
 Claude Desktop session files, the size of the founder's laptop
 (`measure.ts --only founder`).
+
+The hot shapes have jobs of their own for the TypeScript binaries too
+(`self-hot`, `differential-hot`): on Linux the runner shut the combined jobs
+down 16 to 21 minutes in, during or after `hot-10k` ("The runner has
+received a shutdown signal"), so the hot jobs run apart from the rest
+(`--scenarios main` is every scenario but the hot ones) and sample the
+machine's memory every 10 s into the step log and `harness-out/memory.log`.
+
+### The daemon surface (hx2, M4)
+
+After M4 hx2 carries the rest of the daemon: Codex rollouts and their
+SQLite titles, the Claude Desktop session-metadata index (saved as
+`ccd-index.json`) and the leveldb scan behind the group mirror, child lanes
+and workflow sidecars, tasks and plans, verify and self-heal, reattribute
+and the codex title sweep, the ledger and `hx status` / `hx status
+--detailed` / `hx doctor sync`, `hx tick`, `hx backfill`, `hx reattribute`,
+`hx retry` and the `--local` tee. What it does not carry yet is the next
+card's: the hx ui API, `hx update`, `hx connect`, `hx disconnect` and the
+service commands.
+
+`--scenarios daemon` runs the full catalog with exactly those steps removed
+(the `ui` steps and the `run` steps of `update`, `connect` and `disconnect`),
+on both binaries alike, and drops the goldens of the removed steps. The
+coverage check then requires every protocol call but the four only those
+steps make (`devices/code`, `devices/poll`, `devices/disconnect`, the
+`/download/…` pair). The jobs split it the way the TypeScript jobs are
+split: `hx2-differential` and `hx2-self` run `--scenarios daemon-main` (the
+daemon surface without the hot-path shapes), `hx2-differential-hot` and
+`hx2-self-hot` run `--scenarios hot-path`, all four sampling the runner's
+memory; `hx2-measure` runs `--only founder,idle,idle-hot,ccd-index`.
+
+The split is there because the driver is one bun process hosting the fake
+gateway, and on a 16 GB Linux runner it was the process that ran out of room:
+the TypeScript all-scenario jobs ended in "The runner has received a shutdown
+signal" 16 to 21 minutes in, during or after `hot-10k`, and the first hx2
+all-scenario job two minutes into `hot-10k` after fifteen scenarios in the
+same process. The driver now streams the recording to disk instead of
+holding every request (`FakeGateway.record` stays in memory only without a
+`recordPath`), stages a PUT's bytes without copying them, and collects
+garbage between the runs of a scenario; `memory.log` in each job's artifact
+shows what that leaves.
+
+`measure.ts` reports the macOS daemon's `phys_footprint` beside its `ps` RSS
+(`harness/run/phys-footprint.c`, compiled once per run with `cc`): RSS counts
+pages the allocator has handed back through `malloc_zone_pressure_relief`,
+the footprint does not.
 
 ### Goldens
 
@@ -188,10 +232,32 @@ A fourth job, `measure`, runs `harness/run/measure.ts` with both binaries
 on each OS and attaches `measurements.json` and `measurements.md`: disk
 writes per one-shot pass and per 45 s of daemon with a 5 MB state and growing
 transcripts, file checks per second of an idle daemon under `strace -c`
-(Linux), its CPU and RSS, refused workflow uploads and `[stuck]` lines in the
+(Linux, the per-syscall summaries attached as `idle-<run>-strace.txt`), its
+CPU and RSS, refused workflow uploads and `[stuck]` lines in the
 `daemon-backoff` run, and (macOS) the second pass over 10,000 Claude Desktop
 files. Every number is the operating system's view of the process (rusage,
-strace); nothing is instrumented inside the binary.
+strace, /proc, ps); nothing is instrumented inside the binary.
+
+The idle daemon's resident memory is also sampled once a second from outside
+the process (`idle-memory` rows; `/proc/<pid>/status` and `smaps_rollup` on
+Linux, `ps` on macOS): VmRSS at the end and at its highest, VmHWM, RssAnon,
+RssFile, AnonHugePages, threads, inotify instances and watches, and any child
+process, with every sample in `<run>-memory.jsonl`, the mappings behind the
+peak in `<run>-smaps-peak.txt` and `memory.md`, and the runner's kernel,
+transparent-hugepage setting and inotify limits recorded with the numbers.
+On Linux the `maximum RSS` rows are the process's `VmHWM`, read from
+`/proc/<pid>/status` every 50 ms while it runs: `ru_maxrss` as Bun's
+`resourceUsage()` returns it there is not the child's figure (it grows with
+the measuring process's own life; the `rusage-check` rows, a bare child that
+touches 300 MB beside what Bun reports for it, show the gap on every run), and
+the field is kilobytes on Linux and bytes on macOS besides. macOS keeps
+`ru_maxrss`, which `ps` agrees with. On Linux a third binary joins the idle
+measurements: the candidate built with `harness/variants/no-file-events.patch`
+applied (the daemon never arms file events, so it polls as 77.11 did), in a
+third column, so the memory of the recursive watch is read off the table. A
+`watch-only` row runs `harness/run/watch-only.ts`, a bare Bun script holding
+`fs.watch(recursive)` on the same tree for 20 s, with and without the watch:
+the runtime's watcher by itself, apart from anything hx does with the events.
 
 To test any binary — an hx2 release asset, say — start the workflow by hand
 (`Actions › Differential harness › Run workflow`) with `candidate_url_linux`
