@@ -602,8 +602,13 @@ const memoryDetails: Record<string, { samples: MemSample[]; peakMappings: Return
 
 /** Sample a daemon once a second; keep the smaps of its highest VmRSS. The
  *  samples stay reachable through `samples` for the window summaries. */
-function memorySampler(label: string): { sampler: Sampler; samples: MemSample[]; finish: () => Measurement } {
+/** `vmmapAtMs`: moments (ms after start) at which, on macOS, `vmmap
+ *  --summary` records the malloc zones behind the footprint — how much of it
+ *  is allocated and how much is freed memory the allocator still holds —
+ *  into <label>-vmmap-<s>s.txt. */
+function memorySampler(label: string, vmmapAtMs: number[] = []): { sampler: Sampler; samples: MemSample[]; finish: () => Measurement } {
   const samples: MemSample[] = [];
+  const vmmapDue = [...vmmapAtMs];
   let peakRssKb = -1;
   let peakSmaps = "";
   return {
@@ -617,6 +622,11 @@ function memorySampler(label: string): { sampler: Sampler; samples: MemSample[];
         if (process.platform === "linux" && s.rssKb > peakRssKb) {
           peakRssKb = s.rssKb;
           peakSmaps = readOr(`/proc/${pid}/smaps`);
+        }
+        while (process.platform === "darwin" && vmmapDue.length > 0 && atMs >= vmmapDue[0]!) {
+          const at = vmmapDue.shift()!;
+          const r = Bun.spawnSync(["vmmap", "--summary", String(pid)]);
+          writeFileSync(join(out, `${label}-vmmap-${Math.round(at / 1000)}s.txt`), `${r.stdout.toString()}${r.stderr.toString()}`);
         }
       },
     },
@@ -900,7 +910,8 @@ async function measureFounder(binary: string, who: Who): Promise<Measurement> {
   try {
     const first = await runOnce([binary, "watch", "--once"], h.env, 1_800_000);
     const second = await runOnce([binary, "watch", "--once"], h.env, 1_800_000);
-    const memory = memorySampler(`founder-${who}`);
+    // The zones at the end of the warm-up and near the end of the idle window.
+    const memory = memorySampler(`founder-${who}`, [20_000, 140_000]);
     const daemon = await runDaemon([binary, "watch"], h.env, FOUNDER_WARMUP_MS + FOUNDER_IDLE_MS, undefined, memory.sampler);
     const commits = h.gateway.stats().parentCommits;
     const summary = memory.finish();
