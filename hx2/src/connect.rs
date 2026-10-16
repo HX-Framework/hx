@@ -444,6 +444,9 @@ pub fn auto_start_daemon(args: &[String], token_refreshed: bool) {
                 ops.stop()?;
             }
             ops.install(&bin_path, consent)?;
+            if let Some(o) = other {
+                say(&format!("Moved the background service from {} to {}.", o, name));
+            }
             let after = ops.state();
             report_started(&ops, &after, consent);
             say(&format!("  status: {} status   logs: {} logs   stop: {} stop", name, name, name));

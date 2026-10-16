@@ -215,18 +215,21 @@ files byte for byte (and with the client's snapshot file). One service slot
 binary's path alone.
 
 `hx2-switch` runs the service for real: `harness/run/switch.ts` moves a
-device's slot from hx to hx2 and back through launchd (macOS), systemd and
-the container shell hook (Linux), against a recording fake gateway.
-`hx start` uploads the `small` fixture; `hx2 start` takes the slot and a
-transcript grows; hx takes it back (`hx restart` up to 77.12, `hx start`
-from 77.13.0 on) and another transcript grows. It checks that every fixture
+device's slot between hx and hx2 through launchd (macOS), systemd and the
+container shell hook (Linux), against a recording fake gateway. `hx start`
+uploads the `small` fixture; `hx2 connect` (the saved login, no pairing)
+moves the device to hx2; hx takes it back (`hx restart` up to 77.12,
+`hx start` from 77.13.0 on); `hx2 start` takes it again; hx takes it back
+again; a transcript grows after every switch. It checks that every fixture
 session is in the store; that after each switch every object got exactly
 the bytes it was missing (the bytes PUT equal how much the store grew, and
 no commit replaced an object the store already held); that each grown
 transcript is stored byte for byte and went up through the client that held
-the slot; that the recording is one stretch of hx, one of hx2, one of hx (by
+the slot; that the daemon traffic is one stretch per phase in order (by
 User-Agent) and each phase ends with exactly one `watch` process, the right
-client's; and that `status` names the expected manager. The same job then
+client's; and that `status` names the expected manager. Last, with hx in the
+slot, `hx2 status`, `hx2 restart`, `hx2 update` and `hx2 stop` must leave
+the slot with hx and say so, hx's daemon process unchanged. The same job then
 runs `harness/run/service-commands.ts`: each client in turn runs `start`,
 `status`, `restart`, `stop` (twice), `start`, `logs` (ended with SIGINT) and
 `uninstall` through the same manager from the same starting state, and every
