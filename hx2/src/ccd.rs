@@ -259,8 +259,13 @@ fn session_record(raw: &[u8]) -> Option<CcdSessionMeta> {
 
 // ── Paths ───────────────────────────────────────────────────────────────────
 
-/// The directory part of a path with no "/" in it.
+/// The directory part of a path with no separator in it.
 const NO_DIR: u32 = u32::MAX;
+
+/// The separator `path.join` puts between a directory and a name: the
+/// client builds every path in the index with it, so the saved index holds
+/// `\` on Windows.
+const SEP: u8 = if cfg!(windows) { b'\\' } else { b'/' };
 
 /// A path in the index: its directory, interned (a store has a handful),
 /// and its file name, shared between the index and the directory's listing.
@@ -289,9 +294,9 @@ impl DirTable {
         &self.dirs[id as usize]
     }
 
-    /// A whole path, split at its last "/".
+    /// A whole path, split at its last separator.
     fn split(&mut self, full: &[u8]) -> PathKey {
-        match full.iter().rposition(|&c| c == b'/') {
+        match full.iter().rposition(|&c| c == SEP) {
             Some(at) => PathKey { dir: self.intern(&full[..at]), name: Arc::from(&full[at + 1..]) },
             None => PathKey { dir: NO_DIR, name: Arc::from(full) },
         }
@@ -306,19 +311,19 @@ impl DirTable {
         let dir = wtf8::lossy(self.get(k.dir));
         let mut s = String::with_capacity(dir.len() + 1 + name.len());
         s.push_str(&dir);
-        s.push('/');
+        s.push(SEP as char);
         s.push_str(&name);
         s
     }
 
     /// The path as `JSON.stringify` writes it. A surrogate pair cannot
-    /// straddle the "/", so the escapes of the two parts are the escapes of
+    /// straddle the separator, so the escapes of the two parts are the escapes of
     /// the whole.
     fn write_json(&self, out: &mut String, k: &PathKey) {
         out.push('"');
         if k.dir != NO_DIR {
             wtf8::write_json_body(out, self.get(k.dir));
-            out.push('/');
+            wtf8::write_json_body(out, &[SEP]);
         }
         wtf8::write_json_body(out, &k.name);
         out.push('"');
@@ -466,7 +471,7 @@ impl CcdIndex {
             Ok(b) => b,
             Err(_) => return,
         };
-        let under = format!("{}/", dir);
+        let under = format!("{}{}", dir, SEP as char);
         let saved = match parse_saved_index(&raw, under.as_bytes(), &mut self.paths) {
             Some(s) => s,
             None => return,
