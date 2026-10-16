@@ -69,11 +69,14 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # One retry for the install: on 10-15 a fresh Windows runner failed to
+      # extract @esbuild/win32-x64's tarball here ("Fail extracting tarball"),
+      # 1 of 35 runs since 10-14. A real install error fails twice.
       - name: Build web UI
         shell: bash
         run: |
           cd ui
-          bun install --frozen-lockfile
+          bun install --frozen-lockfile || bun install --frozen-lockfile
           bun run build
           cd ..
           bun run gen:ui
