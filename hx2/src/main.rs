@@ -33,6 +33,7 @@ mod net;
 mod orgnames;
 mod parse;
 mod pathnorm;
+mod platform;
 mod probe;
 mod reattribute;
 mod report;
@@ -45,6 +46,7 @@ mod state;
 mod title_sync;
 mod watch;
 mod watchdog;
+mod winpath;
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};

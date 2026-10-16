@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use indexmap::{IndexMap, IndexSet};
 
 use crate::fsevents::FileEventSource;
-use crate::fsutil::{basename, dirname, join, readdir_safe, stat_safe};
+use crate::fsutil::{basename, dirname, join, readdir_safe, stat_safe, SEP};
 use crate::json::Json;
 use crate::roots::{claude_projects_dir, codex_archived_dir, codex_sessions_dir, roots_signature, ResolvedRoots};
 use crate::sources::{scan_session_artifacts, session_dir_of_lane, DiscoveredChildFile, DiscoveredFile, DiscoveredWorkflowRun, RECENT_WINDOW_MS};
@@ -109,12 +109,7 @@ fn stagger_for(p: &str, interval: f64) -> f64 {
 }
 
 fn pid_alive(pid: i64) -> bool {
-    // SAFETY: signal 0 only probes the process.
-    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if r == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    crate::platform::probe_pid(pid) != crate::platform::PidProbe::Gone
 }
 
 pub struct DiscoveryCatalog {
@@ -387,7 +382,7 @@ impl DiscoveryCatalog {
         let root_of_claude_dir = |dir_path: &str| -> Option<String> {
             for r in &roots.claude {
                 let projects = claude_projects_dir(&r.config_dir);
-                if dir_path.starts_with(&format!("{}/", projects)) {
+                if dir_path.starts_with(&format!("{}{}", projects, SEP)) {
                     return Some(r.config_dir.clone());
                 }
             }
@@ -435,9 +430,9 @@ impl DiscoveryCatalog {
             // Under nothing known: a new project dir, a tracker, a codex dir, or noise.
             for r in &roots.claude {
                 let projects = claude_projects_dir(&r.config_dir);
-                let prefix = format!("{}/", projects);
+                let prefix = format!("{}{}", projects, SEP);
                 if p.starts_with(&prefix) {
-                    let name = p[prefix.len()..].split('/').next().unwrap_or("").to_string();
+                    let name = p[prefix.len()..].split(SEP).next().unwrap_or("").to_string();
                     if !name.is_empty() && !name.starts_with('.') && name != "memory" {
                         new_project_dirs.insert(join(&projects, &name), r.config_dir.clone());
                     }
@@ -445,7 +440,7 @@ impl DiscoveryCatalog {
                     break;
                 }
                 let sessions = join(&r.config_dir, "sessions");
-                if p == sessions || p.starts_with(&format!("{}/", sessions)) {
+                if p == sessions || p.starts_with(&format!("{}{}", sessions, SEP)) {
                     trackers_due = true;
                     claimed = true;
                     break;
@@ -456,7 +451,7 @@ impl DiscoveryCatalog {
             }
             'codex: for r in &roots.codex {
                 for base in [codex_sessions_dir(&r.config_dir), codex_archived_dir(&r.config_dir)] {
-                    if p == base || p.starts_with(&format!("{}/", base)) {
+                    if p == base || p.starts_with(&format!("{}{}", base, SEP)) {
                         codex_due.insert(base, r.config_dir.clone());
                         break 'codex;
                     }
@@ -469,7 +464,7 @@ impl DiscoveryCatalog {
             codex_due.shift_remove(&d);
             for r in &roots.codex {
                 for base in [codex_sessions_dir(&r.config_dir), codex_archived_dir(&r.config_dir)] {
-                    if d == base || d.starts_with(&format!("{}/", base)) {
+                    if d == base || d.starts_with(&format!("{}{}", base, SEP)) {
                         codex_due.insert(base, r.config_dir.clone());
                     }
                 }
@@ -584,7 +579,7 @@ impl DiscoveryCatalog {
                 };
                 self.apply_claude_dir_stat(&dir_path, &root.config_dir, Some(st.mtime_ms), now_ms);
             }
-            let prefix = format!("{}/", projects);
+            let prefix = format!("{}{}", projects, SEP);
             let gone: Vec<String> = self.dirs.keys().filter(|d| d.starts_with(&prefix) && !seen.contains(*d)).cloned().collect();
             for dir_path in gone {
                 self.drop_dir_members(&dir_path);
@@ -626,7 +621,7 @@ impl DiscoveryCatalog {
 
     /// Forget a dir and everything under it.
     fn drop_dir_members(&mut self, dir_path: &str) {
-        let prefix = format!("{}/", dir_path);
+        let prefix = format!("{}{}", dir_path, SEP);
         self.parents.retain(|p, _| !p.starts_with(&prefix));
         self.excluded.retain(|p, _| !p.starts_with(&prefix));
         self.children.retain(|p, _| !p.starts_with(&prefix));
@@ -1008,7 +1003,7 @@ impl DiscoveryCatalog {
         }
 
         // The walk is authoritative for its own subtree: replace it wholesale.
-        let prefix = format!("{}/", session_dir);
+        let prefix = format!("{}{}", session_dir, SEP);
         let walked: HashSet<String> = walk_children.iter().map(|c| c.path.clone()).collect();
         self.children.retain(|p, _| !(p.starts_with(&prefix) && !walked.contains(p)));
         for c in walk_children {

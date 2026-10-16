@@ -40,7 +40,7 @@ pub fn build_child_parent_index(state: &Json) -> HashMap<String, ChildParentIden
             if !path.ends_with(".jsonl") {
                 continue;
             }
-            if path.split('/').any(|seg| seg == "subagents") {
+            if path.split(crate::fsutil::SEP).any(|seg| seg == "subagents") {
                 continue;
             }
             let artifact_session_id = basename(&path, ".jsonl");

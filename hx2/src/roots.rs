@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use crate::fsutil::{exists, join};
+use crate::fsutil::{exists, join, SEP};
 use crate::home::homedir;
 use crate::json::{obj, Json};
 use crate::pathnorm::normalize_data_dir;
@@ -105,7 +105,7 @@ pub fn roots_signature(r: &ResolvedRoots) -> String {
 /// True when `p` is (or sits under) one of the roots' config dirs.
 pub fn is_under_roots(p: &str, roots: &[DataRoot]) -> bool {
     roots.iter().any(|r| {
-        let base = if r.config_dir.ends_with('/') { r.config_dir.clone() } else { format!("{}/", r.config_dir) };
+        let base = if r.config_dir.ends_with(SEP) { r.config_dir.clone() } else { format!("{}{}", r.config_dir, SEP) };
         p == r.config_dir || p.starts_with(&base)
     })
 }

@@ -28,12 +28,27 @@ pub const CCD_FULL_STAT_INTERVAL_MS: f64 = 60_000.0;
 pub const CCD_INDEX_SAVE_INTERVAL_MS: f64 = 10.0 * 60_000.0;
 const CCD_INDEX_FORMAT: f64 = 1.0;
 
-/// Claude Desktop's per-user data directory, where it ships.
+/// Claude Desktop's per-user data directory, where it ships: under
+/// `~/Library/Application Support` on macOS and %APPDATA% (Roaming) on
+/// Windows, else nowhere.
 pub fn ccd_app_dir() -> Option<String> {
     if cfg!(target_os = "macos") {
         return Some(homedir().join("Library").join("Application Support").join("Claude").to_string_lossy().into_owned());
     }
+    if cfg!(windows) {
+        return Some(ccd_app_dir_win32(std::env::var("APPDATA").ok().as_deref(), &homedir().to_string_lossy()));
+    }
     None
+}
+
+/// `winPath.join(env.APPDATA || winPath.join(home, "AppData", "Roaming"), "Claude")`:
+/// %APPDATA% is Roaming, and its canonical place stands in when it is unset.
+fn ccd_app_dir_win32(appdata: Option<&str>, home: &str) -> String {
+    let roaming = match appdata.filter(|v| !v.is_empty()) {
+        Some(a) => a.to_string(),
+        None => crate::winpath::join(&[home, "AppData", "Roaming"]),
+    };
+    crate::winpath::join(&[&roaming, "Claude"])
 }
 
 /// `<app data>/claude-code-sessions`.
@@ -242,7 +257,7 @@ impl CcdIndex {
             Some(f) => f.clone(),
             None => return,
         };
-        let under = format!("{}/", dir);
+        let under = format!("{}{}", dir, crate::fsutil::SEP);
         for (d, listing) in dirs.iter() {
             if !d.starts_with(&under) {
                 continue;
@@ -477,4 +492,22 @@ pub fn title_text(meta: &CcdSessionMeta) -> Option<String> {
 #[allow(dead_code)]
 pub fn js_title(s: &str) -> JsStr {
     js(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ccd_app_dir_win32;
+
+    // src/ccd.test.ts: ccdAppDir on win32.
+
+    #[test]
+    fn finds_claude_desktop_under_appdata_on_windows() {
+        assert_eq!(ccd_app_dir_win32(Some("C:\\Users\\me\\AppData\\Roaming"), "C:\\Users\\me"), "C:\\Users\\me\\AppData\\Roaming\\Claude");
+    }
+
+    #[test]
+    fn falls_back_to_the_roaming_path_when_appdata_is_unset() {
+        assert_eq!(ccd_app_dir_win32(None, "C:\\Users\\me"), "C:\\Users\\me\\AppData\\Roaming\\Claude");
+        assert_eq!(ccd_app_dir_win32(Some(""), "C:\\Users\\me"), "C:\\Users\\me\\AppData\\Roaming\\Claude");
+    }
 }
