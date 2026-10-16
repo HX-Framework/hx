@@ -394,7 +394,7 @@ jobs:
         run: ./hx2/release/check-install.ps1 -ReleaseDir "$PWD/release" -Version $env:VERSION -Work "$env:RUNNER_TEMP/hx2-install" -Engine powershell -ExpectAsset $env:ASSET
 
       - name: install-hx2.ps1 in PowerShell 7
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
         shell: pwsh
         run: ./hx2/release/check-install.ps1 -ReleaseDir "$PWD/release" -Version $env:VERSION -Work "$env:RUNNER_TEMP/hx2-install" -Engine pwsh
 

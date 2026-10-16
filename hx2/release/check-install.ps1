@@ -8,9 +8,9 @@
 # Usage: check-install.ps1 -ReleaseDir <dir> -Version <x.y.z> -Work <dir> -Engine powershell|pwsh [-ExpectAsset <name>]
 # -Engine is the PowerShell the installer runs in: Windows PowerShell 5.1 or
 # PowerShell 7. -ExpectAsset fails the run when the installer, in that
-# PowerShell, would pick a different build than the one named. The run happens under <Work>\home, which stands in for
-# %USERPROFILE%; the PATH and Apps & features entries are the runner's own
-# (HKCU), and the run checks that they end as they began.
+# PowerShell, would pick a different build than the one named. The install goes
+# into the runner's own profile and registry (HKCU), as a person's would, and
+# the run checks that both end as they began; <Work> holds only the logs.
 param(
   [Parameter(Mandatory)] [string] $ReleaseDir,
   [Parameter(Mandatory)] [string] $Version,
@@ -21,9 +21,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Spelled the way Windows spells them (a workflow passes `$RUNNER_TEMP/...`),
-# so %USERPROFILE% and the PATH entry derived from it carry no forward slash
-# the installer did not put there itself.
+# Spelled the way Windows spells them: a workflow passes `$RUNNER_TEMP/...`.
 $ReleaseDir = [IO.Path]::GetFullPath($ReleaseDir)
 $Work = [IO.Path]::GetFullPath($Work)
 
@@ -36,6 +34,7 @@ if (-not $py) { throw 'no python on PATH (the workflow sets one up)' }
 function Fail([string] $msg) { throw "FAIL: $msg" }
 function Pass([string] $msg) { Write-Host "ok: $msg" }
 function Same-Path([string] $a, [string] $b) { $a.Replace('/', '\').TrimEnd('\') -eq $b.Replace('/', '\').TrimEnd('\') }
+function Path-Entries([string] $p) { @($p -split ';' | Where-Object { $_ }) }
 
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 $log = Join-Path $Work 'requests.log'
@@ -93,15 +92,32 @@ try {
   Write-Host "engine: $Engine, PROCESSOR_ARCHITECTURE=$engineArch, expecting $asset"
   if ($ExpectAsset -and $ExpectAsset -ne $asset) { Fail "the installer in $Engine picks $asset here, not $ExpectAsset" }
 
-  $env:USERPROFILE = Join-Path $Work "home-$Engine"
-  if (Test-Path $env:USERPROFILE) { Remove-Item -Recurse -Force $env:USERPROFILE }
-  New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
-  $installDir = Join-Path $env:USERPROFILE '.let\bin'
-  $hxDir = Join-Path $env:USERPROFILE '.let\hx'
+  $letDir = Join-Path $env:USERPROFILE '.let'
+  $installDir = Join-Path $letDir 'bin'
+  $hxDir = Join-Path $letDir 'hx'
   $hxExe = Join-Path $installDir 'hx2.exe'
   $svcExe = Join-Path $installDir 'hx2-svc.exe'
+
+  # What hx uninstall removes on Windows (src/uninstall.ts): both binaries, the
+  # Apps & features entry and the PATH entry, compared as it compares them.
+  function Remove-AsHxUninstallDoes {
+    Remove-Item -LiteralPath $hxExe, $svcExe -Force -ErrorAction SilentlyContinue
+    & reg delete 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\hx2' /f 2>&1 | Out-Null
+    $ps = "`$d='$($installDir.Replace("'", "''"))';" +
+      "`$p=[Environment]::GetEnvironmentVariable('Path','User');" +
+      "if (`$p) { `$n=(`$p -split ';' | Where-Object { `$_ -and `$_.TrimEnd('\') -ne `$d.TrimEnd('\') }) -join ';';" +
+      "[Environment]::SetEnvironmentVariable('Path',`$n,'User') }"
+    & powershell -NoProfile -NonInteractive -Command $ps
+  }
+
+  # Each run starts from a machine without hx2: an earlier run that failed
+  # half way is cleaned up first.
+  if ((Test-Path $hxExe) -or (Test-Path $svcExe) -or (Test-Path $arpKey) -or (Test-Path $hxDir)) {
+    Write-Host 'hx2 is here from an earlier run; removing it first'
+    Remove-AsHxUninstallDoes
+    Remove-Item -Recurse -Force $hxDir -ErrorAction SilentlyContinue
+  }
   $pathBefore = [string][Environment]::GetEnvironmentVariable('Path', 'User')
-  if (Test-Path $arpKey) { Fail "an Apps & features entry for hx2 exists before the install" }
 
   # 1. Nothing published.
   Start-StandIn @('--empty')
@@ -186,29 +202,29 @@ try {
   Write-Host $text
   if ($code -eq 64 -and $text -match 'is not available in this build') {
     Write-Host 'hx2 has no uninstall command in this build; removing what hx uninstall removes'
-    Remove-Item -LiteralPath $hxExe, $svcExe -Force
-    & reg delete 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\hx2' /f | Out-Null
-    $d = Join-Path (Join-Path $env:USERPROFILE '.let') 'bin'
-    $ps = "`$d='$($d.Replace("'", "''"))';" +
-      "`$p=[Environment]::GetEnvironmentVariable('Path','User');" +
-      "if (`$p) { `$n=(`$p -split ';' | Where-Object { `$_ -and `$_.TrimEnd('\') -ne `$d.TrimEnd('\') }) -join ';';" +
-      "[Environment]::SetEnvironmentVariable('Path',`$n,'User') }"
-    & powershell -NoProfile -NonInteractive -Command $ps
+    Remove-AsHxUninstallDoes
   } elseif ($code -ne 0) {
     Fail "hx2 uninstall exited $code"
   }
   foreach ($exe in @($hxExe, $svcExe)) { if (Test-Path $exe) { Fail "$exe is still there after the uninstall" } }
   if (Test-Path $arpKey) { Fail 'the Apps & features entry is still there after the uninstall' }
+  # The entries must come back as they were. An empty entry (a trailing ';')
+  # does not: the installer appends ';<dir>' and the removal drops empty
+  # entries, as hx's own uninstall does.
   $pathAfter = [string][Environment]::GetEnvironmentVariable('Path', 'User')
-  if ($pathAfter -ne $pathBefore) { Fail "the user PATH did not come back: before '$pathBefore', after '$pathAfter'" }
+  if (((Path-Entries $pathAfter) -join ';') -ne ((Path-Entries $pathBefore) -join ';')) { Fail "the user PATH entries did not come back: before '$pathBefore', after '$pathAfter'" }
+  if ($pathAfter -ne $pathBefore) { Write-Host "the user PATH lost only empty entries: before '$pathBefore', after '$pathAfter'" }
   if (-not (Test-Path (Join-Path $hxDir 'config.json'))) { Fail 'the uninstall removed ~/.let/hx without --purge' }
   Pass 'uninstalled: both binaries, the Apps & features entry and the PATH entry are gone; ~/.let/hx stays'
 
-  # --purge removes ~/.let/hx too; after it no file of hx2's is left.
+  # --purge removes ~/.let/hx too; after it no file of hx2's is left, in
+  # ~/.let or among the installer's temporary files.
   Remove-Item -Recurse -Force $hxDir
-  $left = @(Get-ChildItem -Path $env:USERPROFILE -Recurse -File -Force -ErrorAction SilentlyContinue)
+  $left = @(Get-ChildItem -Path $letDir -Recurse -File -Force -ErrorAction SilentlyContinue)
   if ($left.Count -ne 0) { Fail "files left after the uninstall: $($left.FullName -join ', ')" }
-  Pass 'nothing of hx2 is left under the home'
+  $temp = @(Get-ChildItem -Path $env:TEMP -Filter 'hx2-windows-*' -File -ErrorAction SilentlyContinue)
+  if ($temp.Count -ne 0) { Fail "the installer left temporary files: $($temp.FullName -join ', ')" }
+  Pass 'nothing of hx2 is left in ~/.let or in %TEMP%'
   Write-Host "all install checks passed for $asset $Version in $Engine"
 } finally {
   Stop-StandIn
