@@ -1116,7 +1116,10 @@ async function cmdStart(): Promise<void> {
   const binPath = process.execPath;
   const dotfileConsent = await resolveDotfileConsent(ops);
   // The one command that moves a device whose service runs hx2 back to hx.
+  // hx2 is stopped first: a container's install alone leaves a supervisor
+  // that is already running (launchd, systemd and Task Scheduler replace it).
   const fromHx2 = slotRunsHx2(ops) !== null;
+  if (fromHx2) await ops.stop();
   await ops.install({ binPath, dotfileConsent });
   if (fromHx2) log(`Moved the background service from hx2 back to hx.`);
   const ds = await ops.state();
