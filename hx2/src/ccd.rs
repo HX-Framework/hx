@@ -21,6 +21,7 @@
 //! byte of that text is what the client writes for the same index: the
 //! harness compares the two files entry by entry.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,6 +58,102 @@ pub fn ccd_leveldb_dir() -> Option<String> {
     ccd_app_dir().map(|r| join(&join(&r, "Local Storage"), "leveldb"))
 }
 
+// ── Ids ─────────────────────────────────────────────────────────────────────
+
+/// A canonical UUID — 8-4-4-4-12 lowercase hex digits, the way Claude Desktop
+/// and Claude Code write every session id — as its 16 bytes. Only that one
+/// spelling is packed, so unpacking gives the same text back, two packed ids
+/// are equal exactly when their texts are, and they order as their texts do
+/// (a lowercase hex digit sorts as its value).
+type Uuid = [u8; 16];
+
+const SESSION_PREFIX: &[u8] = b"local_";
+const SESSION_SUFFIX: &[u8] = b".json";
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn parse_uuid(b: &[u8]) -> Option<Uuid> {
+    if b.len() != 36 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    let (mut i, mut j) = (0, 0);
+    while i < 36 {
+        if i == 8 || i == 13 || i == 18 || i == 23 {
+            if b[i] != b'-' {
+                return None;
+            }
+            i += 1;
+            continue;
+        }
+        out[j] = (hex_digit(b[i])? << 4) | hex_digit(b[i + 1])?;
+        i += 2;
+        j += 1;
+    }
+    Some(out)
+}
+
+fn push_uuid(out: &mut Vec<u8>, u: &Uuid) {
+    for (k, byte) in u.iter().enumerate() {
+        if k == 4 || k == 6 || k == 8 || k == 10 {
+            out.push(b'-');
+        }
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 0xF) as usize]);
+    }
+}
+
+fn uuid_text(u: &Uuid) -> [u8; 36] {
+    let mut v = Vec::with_capacity(36);
+    push_uuid(&mut v, u);
+    let mut out = [0u8; 36];
+    out.copy_from_slice(&v);
+    out
+}
+
+/// An id as the index compares it: packed when it is a canonical UUID (with
+/// the `local_` prefix for a Claude Desktop id), else its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IdKey<'a> {
+    Uuid(Uuid),
+    Text(&'a [u8]),
+}
+
+/// The key of a `ccdSessionId` text.
+pub fn ccd_id_key(b: &[u8]) -> IdKey<'_> {
+    if b.len() == SESSION_PREFIX.len() + 36 && b.starts_with(SESSION_PREFIX) {
+        if let Some(u) = parse_uuid(&b[SESSION_PREFIX.len()..]) {
+            return IdKey::Uuid(u);
+        }
+    }
+    IdKey::Text(b)
+}
+
+/// The key of a `cliSessionId` text.
+fn cli_id_key(b: &[u8]) -> IdKey<'_> {
+    match parse_uuid(b) {
+        Some(u) => IdKey::Uuid(u),
+        None => IdKey::Text(b),
+    }
+}
+
+/// Two cli-id keys in the order of their texts.
+fn cmp_cli(a: &IdKey<'_>, b: &IdKey<'_>) -> std::cmp::Ordering {
+    match (a, b) {
+        (IdKey::Uuid(x), IdKey::Uuid(y)) => x.cmp(y),
+        (IdKey::Text(x), IdKey::Text(y)) => x.cmp(y),
+        (IdKey::Uuid(x), IdKey::Text(y)) => uuid_text(x)[..].cmp(*y),
+        (IdKey::Text(x), IdKey::Uuid(y)) => (*x).cmp(&uuid_text(y)[..]),
+    }
+}
+
 // ── Records ─────────────────────────────────────────────────────────────────
 
 const HAS_CLI: u8 = 1;
@@ -64,10 +161,15 @@ const HAS_TITLE: u8 = 2;
 const ARCHIVED: u8 = 4;
 const SOURCE_USER: u8 = 8;
 const SOURCE_AI: u8 = 16;
+/// `ccdSessionId` is `local_` and a canonical UUID, held as its 16 bytes.
+const CCD_PACKED: u8 = 32;
+/// `cliSessionId` is a canonical UUID, held as its 16 bytes.
+const CLI_PACKED: u8 = 64;
 
 /// One session's metadata (`CcdSessionMeta` in ccd.ts): `ccdSessionId`,
-/// `cliSessionId` and `title` one after another in one WTF-8 buffer, so a
-/// record costs one allocation for its text.
+/// `cliSessionId` and `title` one after another in one WTF-8 buffer, each
+/// id packed to 16 bytes when it is a canonical UUID, so a record costs one
+/// small allocation for its text.
 #[derive(Debug)]
 pub struct CcdSessionMeta {
     text: Box<[u8]>,
@@ -79,21 +181,35 @@ pub struct CcdSessionMeta {
 
 impl CcdSessionMeta {
     fn new(ccd: &[u8], cli: Option<&[u8]>, title: Option<&[u8]>, title_source: Option<&'static str>, is_archived: bool, last_activity_at: f64) -> Self {
-        let mut text = Vec::with_capacity(ccd.len() + cli.map_or(0, |c| c.len()) + title.map_or(0, |t| t.len()));
-        text.extend_from_slice(ccd);
+        let mut flags = 0u8;
+        let ccd_key = ccd_id_key(ccd);
+        let cli_key = cli.map(cli_id_key);
+        let len_of = |k: &IdKey<'_>| match k {
+            IdKey::Uuid(_) => 16,
+            IdKey::Text(t) => t.len(),
+        };
+        let mut text = Vec::with_capacity(len_of(&ccd_key) + cli_key.as_ref().map_or(0, len_of) + title.map_or(0, |t| t.len()));
+        match ccd_key {
+            IdKey::Uuid(u) => {
+                text.extend_from_slice(&u);
+                flags |= CCD_PACKED;
+            }
+            IdKey::Text(t) => text.extend_from_slice(t),
+        }
         let cli_at = text.len() as u32;
-        if let Some(c) = cli {
-            text.extend_from_slice(c);
+        if let Some(k) = cli_key {
+            flags |= HAS_CLI;
+            match k {
+                IdKey::Uuid(u) => {
+                    text.extend_from_slice(&u);
+                    flags |= CLI_PACKED;
+                }
+                IdKey::Text(t) => text.extend_from_slice(t),
+            }
         }
         let title_at = text.len() as u32;
         if let Some(t) = title {
             text.extend_from_slice(t);
-        }
-        let mut flags = 0u8;
-        if cli.is_some() {
-            flags |= HAS_CLI;
-        }
-        if title.is_some() {
             flags |= HAS_TITLE;
         }
         if is_archived {
@@ -107,18 +223,59 @@ impl CcdSessionMeta {
         CcdSessionMeta { text: text.into_boxed_slice(), cli_at, title_at, flags, last_activity_at }
     }
 
+    fn packed(b: &[u8]) -> Uuid {
+        let mut u = [0u8; 16];
+        u.copy_from_slice(b);
+        u
+    }
+
+    /// The key of `ccdSessionId`, without unpacking it.
+    pub fn ccd_key(&self) -> IdKey<'_> {
+        let raw = &self.text[..self.cli_at as usize];
+        if self.flags & CCD_PACKED != 0 {
+            IdKey::Uuid(Self::packed(raw))
+        } else {
+            IdKey::Text(raw)
+        }
+    }
+
+    /// The key of `cliSessionId`, without unpacking it; None for null.
+    fn cli_key(&self) -> Option<IdKey<'_>> {
+        if self.flags & HAS_CLI == 0 {
+            return None;
+        }
+        let raw = &self.text[self.cli_at as usize..self.title_at as usize];
+        Some(if self.flags & CLI_PACKED != 0 { IdKey::Uuid(Self::packed(raw)) } else { IdKey::Text(raw) })
+    }
+
+    /// `if (r.cliSessionId)`: a cli id that is there and not empty.
+    pub fn has_cli_id(&self) -> bool {
+        match self.cli_key() {
+            Some(IdKey::Uuid(_)) => true,
+            Some(IdKey::Text(t)) => !t.is_empty(),
+            None => false,
+        }
+    }
+
     /// `ccdSessionId`, WTF-8.
-    pub fn ccd_session_id(&self) -> &[u8] {
-        &self.text[..self.cli_at as usize]
+    pub fn ccd_session_id(&self) -> Cow<'_, [u8]> {
+        match self.ccd_key() {
+            IdKey::Uuid(u) => {
+                let mut v = Vec::with_capacity(SESSION_PREFIX.len() + 36);
+                v.extend_from_slice(SESSION_PREFIX);
+                push_uuid(&mut v, &u);
+                Cow::Owned(v)
+            }
+            IdKey::Text(t) => Cow::Borrowed(t),
+        }
     }
 
     /// `cliSessionId`, WTF-8; None for null.
-    pub fn cli_session_id(&self) -> Option<&[u8]> {
-        if self.flags & HAS_CLI != 0 {
-            Some(&self.text[self.cli_at as usize..self.title_at as usize])
-        } else {
-            None
-        }
+    pub fn cli_session_id(&self) -> Option<Cow<'_, [u8]>> {
+        Some(match self.cli_key()? {
+            IdKey::Uuid(u) => Cow::Owned(uuid_text(&u).to_vec()),
+            IdKey::Text(t) => Cow::Borrowed(t),
+        })
     }
 
     /// `title`, WTF-8; None for null.
@@ -158,16 +315,21 @@ impl CcdSessionMeta {
 
     /// `ccdSessionId` as the client holds it, in UTF-16 code units.
     pub fn ccd_session_id_units(&self) -> JsStr {
-        wtf8::to_units(self.ccd_session_id())
+        wtf8::to_units(&self.ccd_session_id())
+    }
+
+    /// `cliSessionId` as the client holds it, in UTF-16 code units.
+    pub fn cli_session_id_units(&self) -> Option<JsStr> {
+        self.cli_session_id().map(|c| wtf8::to_units(&c))
     }
 
     /// The record as `JSON.stringify` writes the client's object.
     fn write_json(&self, out: &mut String) {
         out.push_str("{\"ccdSessionId\":");
-        wtf8::write_json(out, self.ccd_session_id());
+        wtf8::write_json(out, &self.ccd_session_id());
         out.push_str(",\"cliSessionId\":");
         match self.cli_session_id() {
-            Some(c) => wtf8::write_json(out, c),
+            Some(c) => wtf8::write_json(out, &c),
             None => out.push_str("null"),
         }
         out.push_str(",\"title\":");
@@ -267,13 +429,44 @@ const NO_DIR: u32 = u32::MAX;
 /// `\` on Windows.
 const SEP: u8 = if cfg!(windows) { b'\\' } else { b'/' };
 
+/// A file name in the index: `local_<uuid>.json` with a canonical UUID
+/// packed to its 16 bytes, any other name as its WTF-8 text, shared between
+/// the index and its directory's listing (a saved index can name any string).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Name {
+    Session(Uuid),
+    Other(Arc<[u8]>),
+}
+
+impl Name {
+    fn of(b: &[u8]) -> Name {
+        let n = SESSION_PREFIX.len();
+        if b.len() == n + 36 + SESSION_SUFFIX.len() && b.starts_with(SESSION_PREFIX) && b.ends_with(SESSION_SUFFIX) {
+            if let Some(u) = parse_uuid(&b[n..n + 36]) {
+                return Name::Session(u);
+            }
+        }
+        Name::Other(Arc::from(b))
+    }
+
+    fn push_to(&self, out: &mut Vec<u8>) {
+        match self {
+            Name::Session(u) => {
+                out.extend_from_slice(SESSION_PREFIX);
+                push_uuid(out, u);
+                out.extend_from_slice(SESSION_SUFFIX);
+            }
+            Name::Other(b) => out.extend_from_slice(b),
+        }
+    }
+}
+
 /// A path in the index: its directory, interned (a store has a handful),
-/// and its file name, shared between the index and the directory's listing.
-/// WTF-8, because a saved index can name any string.
+/// and its file name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PathKey {
     dir: u32,
-    name: Arc<[u8]>,
+    name: Name,
 }
 
 /// Every directory a path in the index has named, by number.
@@ -297,36 +490,32 @@ impl DirTable {
     /// A whole path, split at its last separator.
     fn split(&mut self, full: &[u8]) -> PathKey {
         match full.iter().rposition(|&c| c == SEP) {
-            Some(at) => PathKey { dir: self.intern(&full[..at]), name: Arc::from(&full[at + 1..]) },
-            None => PathKey { dir: NO_DIR, name: Arc::from(full) },
+            Some(at) => PathKey { dir: self.intern(&full[..at]), name: Name::of(&full[at + 1..]) },
+            None => PathKey { dir: NO_DIR, name: Name::of(full) },
         }
+    }
+
+    /// The whole path, WTF-8.
+    fn path_bytes(&self, k: &PathKey, out: &mut Vec<u8>) {
+        out.clear();
+        if k.dir != NO_DIR {
+            out.extend_from_slice(self.get(k.dir));
+            out.push(SEP);
+        }
+        k.name.push_to(out);
     }
 
     /// The path as the operating system is handed it.
     fn path_string(&self, k: &PathKey) -> String {
-        let name = wtf8::lossy(&k.name);
-        if k.dir == NO_DIR {
-            return name.into_owned();
-        }
-        let dir = wtf8::lossy(self.get(k.dir));
-        let mut s = String::with_capacity(dir.len() + 1 + name.len());
-        s.push_str(&dir);
-        s.push(SEP as char);
-        s.push_str(&name);
-        s
+        let mut b = Vec::new();
+        self.path_bytes(k, &mut b);
+        wtf8::lossy(&b).into_owned()
     }
 
-    /// The path as `JSON.stringify` writes it. A surrogate pair cannot
-    /// straddle the separator, so the escapes of the two parts are the escapes of
-    /// the whole.
-    fn write_json(&self, out: &mut String, k: &PathKey) {
-        out.push('"');
-        if k.dir != NO_DIR {
-            wtf8::write_json_body(out, self.get(k.dir));
-            wtf8::write_json_body(out, &[SEP]);
-        }
-        wtf8::write_json_body(out, &k.name);
-        out.push('"');
+    /// The path as `JSON.stringify` writes it; `scratch` is a buffer to reuse.
+    fn write_json(&self, out: &mut String, k: &PathKey, scratch: &mut Vec<u8>) {
+        self.path_bytes(k, scratch);
+        wtf8::write_json(out, scratch);
     }
 }
 
@@ -354,17 +543,20 @@ pub struct CcdByCli {
 
 impl CcdByCli {
     fn build(records: &[Arc<CcdSessionMeta>]) -> CcdByCli {
-        let mut sorted: Vec<Arc<CcdSessionMeta>> = records.iter().filter(|r| r.cli_session_id().map_or(false, |c| !c.is_empty())).cloned().collect();
-        sorted.sort_by(|a, b| a.cli_session_id().cmp(&b.cli_session_id()));
+        let mut sorted: Vec<Arc<CcdSessionMeta>> = records.iter().filter(|r| r.has_cli_id()).cloned().collect();
+        sorted.sort_by(|a, b| match (a.cli_key(), b.cli_key()) {
+            (Some(x), Some(y)) => cmp_cli(&x, &y),
+            _ => std::cmp::Ordering::Equal,
+        });
         CcdByCli { sorted }
     }
 
     /// The record for a CLI session id.
     pub fn get(&self, cli: &str) -> Option<&Arc<CcdSessionMeta>> {
-        let key = Some(cli.as_bytes());
-        let end = self.sorted.partition_point(|r| r.cli_session_id() <= key);
+        let q = cli_id_key(cli.as_bytes());
+        let end = self.sorted.partition_point(|r| r.cli_key().map_or(true, |k| cmp_cli(&k, &q) != std::cmp::Ordering::Greater));
         let r = self.sorted.get(end.checked_sub(1)?)?;
-        if r.cli_session_id() == key {
+        if r.cli_key().map_or(false, |k| cmp_cli(&k, &q) == std::cmp::Ordering::Equal) {
             Some(r)
         } else {
             None
@@ -533,7 +725,7 @@ impl CcdIndex {
                             continue;
                         }
                     }
-                    let mut present: Vec<PathKey> = readdir_safe(Path::new(d)).into_iter().filter(|f| is_session_file(f)).map(|f| PathKey { dir: id, name: Arc::from(f.as_bytes()) }).collect();
+                    let mut present: Vec<PathKey> = readdir_safe(Path::new(d)).into_iter().filter(|f| is_session_file(f)).map(|f| PathKey { dir: id, name: Name::of(f.as_bytes()) }).collect();
                     present.shrink_to_fit();
                     if let Some(k) = self.org_dirs.get(&id) {
                         let present_set: HashSet<&PathKey> = present.iter().collect();
@@ -620,6 +812,7 @@ impl CcdIndex {
     /// of the client's maps, written in one pass.
     fn saved_text(&self, now_ms: f64) -> String {
         let mut out = String::with_capacity(self.last_save_len + self.last_save_len / 16 + 4096);
+        let mut scratch: Vec<u8> = Vec::new();
         out.push_str("{\"v\":1,\"savedAtMs\":");
         write_num(&mut out, now_ms);
         out.push_str(",\"dirs\":{");
@@ -635,7 +828,7 @@ impl CcdIndex {
                 if j > 0 {
                     out.push(',');
                 }
-                self.paths.write_json(&mut out, p);
+                self.paths.write_json(&mut out, p, &mut scratch);
             }
             out.push_str("]}");
         }
@@ -644,7 +837,7 @@ impl CcdIndex {
             if i > 0 {
                 out.push(',');
             }
-            self.paths.write_json(&mut out, p);
+            self.paths.write_json(&mut out, p, &mut scratch);
             out.push_str(":{\"size\":");
             write_num(&mut out, f.size);
             out.push_str(",\"mtimeMs\":");
@@ -1017,6 +1210,48 @@ mod tests {
         assert_eq!(record_json("[{\"sessionId\":\"x\"}]"), None);
         assert_eq!(record_json("{\"sessionId\":\"x\"} trailing"), None);
         assert_eq!(record_json("{\"sessionId\":\"x\",}"), None);
+    }
+
+    #[test]
+    fn packed_ids_and_names_give_their_text_back() {
+        let canon = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b";
+        // Canonical: packed. Anything else — upper case, braces, no dashes,
+        // a wrong length, a lone surrogate — stays as its text.
+        let others = ["0F1E2D3C-4B5A-6978-8A9B-0C1D2E3F4A5B", "{0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b}", "0f1e2d3c4b5a69788a9b0c1d2e3f4a5b", "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5", "0f1e2d3c-4b5a-6978-8a9b_0c1d2e3f4a5b", ""];
+        let ccd = format!("local_{}", canon);
+        let r = CcdSessionMeta::new(ccd.as_bytes(), Some(canon.as_bytes()), Some(b"T"), Some("ai"), false, 1.0);
+        assert!(matches!(r.ccd_key(), IdKey::Uuid(_)) && matches!(r.cli_key(), Some(IdKey::Uuid(_))));
+        assert_eq!(&*r.ccd_session_id(), ccd.as_bytes());
+        assert_eq!(r.cli_session_id().as_deref(), Some(canon.as_bytes()));
+        assert_eq!(r.text.len(), 16 + 16 + 1);
+        for o in others {
+            let ccd_o = format!("local_{}", o);
+            let r = CcdSessionMeta::new(ccd_o.as_bytes(), Some(o.as_bytes()), None, None, false, 0.0);
+            assert!(matches!(r.ccd_key(), IdKey::Text(_)) && matches!(r.cli_key(), Some(IdKey::Text(_))), "{}", o);
+            assert_eq!(&*r.ccd_session_id(), ccd_o.as_bytes());
+            assert_eq!(r.cli_session_id().as_deref(), Some(o.as_bytes()));
+        }
+        let lone = crate::wtf8::from_units(&[0x6C, 0xD800]);
+        let r = CcdSessionMeta::new(&lone, None, None, None, false, 0.0);
+        assert_eq!(&*r.ccd_session_id(), lone.as_slice());
+        // File names.
+        let mut paths = DirTable::default();
+        for name in [format!("local_{}.json", canon), format!("local_{}.json", others[0]), "local_x.json".to_string(), "notes.txt".to_string()] {
+            let full = format!("/s/a/o/{}", name);
+            let k = paths.split(full.as_bytes());
+            assert_eq!(matches!(k.name, Name::Session(_)), name.contains(canon), "{}", name);
+            assert_eq!(paths.path_string(&k), full);
+        }
+    }
+
+    #[test]
+    fn packed_ids_order_as_their_text() {
+        let ids = ["00000000-0000-0000-0000-000000000000", "0000000a-0000-0000-0000-000000000000", "00000009-ffff-ffff-ffff-ffffffffffff", "a0000000-0000-0000-0000-000000000000", "9fffffff-ffff-ffff-ffff-ffffffffffff", "0000000A-0000-0000-0000-000000000000", "0000", "zz", "-"];
+        for a in ids {
+            for b in ids {
+                assert_eq!(cmp_cli(&cli_id_key(a.as_bytes()), &cli_id_key(b.as_bytes())), a.as_bytes().cmp(b.as_bytes()), "{} {}", a, b);
+            }
+        }
     }
 
     #[test]

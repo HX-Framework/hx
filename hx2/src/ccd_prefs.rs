@@ -10,9 +10,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::ccd::{ccd_leveldb_dir, read_ccd_recents_cached, refresh_ccd_index};
+use crate::ccd::{ccd_id_key, ccd_leveldb_dir, read_ccd_recents_cached, refresh_ccd_index, CcdSessionMeta, IdKey};
 use crate::ccd_leveldb::LeveldbScan;
 use crate::fsutil::stat_safe;
 use crate::js::{is_space, js, lossy, num_to_string, trim, JsStr};
@@ -258,15 +258,16 @@ pub fn build_group_mirror(now_ms: f64) -> Json {
     // client's Map: the last record with an id wins, and an empty cli id
     // (falsy) maps nothing.
     let records = read_ccd_recents_cached(now_ms);
-    let mut cli_by_ccd: HashMap<&[u8], &[u8]> = HashMap::with_capacity(records.len());
+    let mut cli_by_ccd: HashMap<IdKey<'_>, &Arc<CcdSessionMeta>> = HashMap::with_capacity(records.len());
     for r in records.iter() {
-        if let Some(cli) = r.cli_session_id().filter(|c| !c.is_empty()) {
-            cli_by_ccd.insert(r.ccd_session_id(), cli);
+        if r.has_cli_id() {
+            cli_by_ccd.insert(r.ccd_key(), r);
         }
     }
     let to_cli = |local_id: &JsStr| -> JsStr {
-        match cli_by_ccd.get(wtf8::from_units(local_id).as_slice()) {
-            Some(cli) => wtf8::to_units(cli),
+        let id = wtf8::from_units(local_id);
+        match cli_by_ccd.get(&ccd_id_key(&id)).and_then(|r| r.cli_session_id_units()) {
+            Some(cli) => cli,
             None => local_id.clone(),
         }
     };
