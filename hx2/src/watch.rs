@@ -37,7 +37,7 @@ use crate::parse::{summarise_chunk, ChunkSummary};
 use crate::pathnorm::collapse_home;
 use crate::reattribute::run_reattribute_sweep;
 use crate::report::{elect_uploaders, filter_watched, owed_summary, should_skip_entry, snapshot_from, SyncSnapshot};
-use crate::roots::{resolve_data_roots, roots_signature, DataRoot, ResolvedRoots};
+use crate::roots::{invalidate_roots_memo, resolve_data_roots, roots_signature, DataRoot, ResolvedRoots};
 use crate::route::{resolve_route_shared, RouteCache, RouteMode};
 use crate::settings::{is_paused, read_settings, tuning_int, tuning_value, HxSettings};
 use crate::sidecars::sync_artifacts;
@@ -1632,6 +1632,9 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
             return;
         }
         *pass_started.lock().unwrap_or_else(|e| e.into_inner()) = now_ms();
+        // Every tick observes the root set fresh: a mirror or audit timer
+        // must not leave the sub-tick memo warm across a tick boundary.
+        invalidate_roots_memo();
         let pass_start = now_ms();
         let settings = read_settings();
         *watchdog_limit_ms = resolve_watchdog_ms(&settings);
