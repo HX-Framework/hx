@@ -1353,7 +1353,9 @@ mod tests {
     /// The definitions are byte-identical to the TypeScript client's: the
     /// expected text is the client's own snapshot file.
     fn snapshot(name: &str) -> String {
-        let snap = include_str!("../../src/__snapshots__/daemon.test.ts.snap");
+        // A Windows checkout may turn the file's line endings into CRLF; the
+        // committed file has none of its own.
+        let snap = include_str!("../../src/__snapshots__/daemon.test.ts.snap").replace("\r\n", "\n");
         let head = format!("exports[`{}`] = `\n\"", name);
         let start = snap.find(&head).expect("snapshot present") + head.len();
         let end = snap[start..].find("\"\n`;").expect("snapshot end") + start;

@@ -85,9 +85,12 @@ fn fd_is_tty(fd: i32) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
+/// Windows: standard output through the platform's console check (libuv's
+/// answer); stdin and stderr only feed the container hook's prompt and the
+/// update progress bar, which keep their plain non-TTY form there.
 #[cfg(not(unix))]
-fn fd_is_tty(_fd: i32) -> bool {
-    false
+fn fd_is_tty(fd: i32) -> bool {
+    fd == 1 && crate::platform::stdout_is_tty()
 }
 
 pub fn stdout_is_tty() -> bool {

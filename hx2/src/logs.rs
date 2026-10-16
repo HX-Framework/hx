@@ -341,7 +341,14 @@ pub fn tail_logs(lines_back: f64) -> Result<(), String> {
         }
     }
     let stopped = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
     let _ = signal_hook::flag::register(signal_hook::consts::signal::SIGINT, stopped.clone());
+    // Windows: Bun's SIGINT is Ctrl+C in the console (crate::daemon does the same).
+    #[cfg(windows)]
+    {
+        let flag = stopped.clone();
+        let _ = crate::platform::on_ctrl_c(Box::new(move || flag.store(true, Ordering::SeqCst)));
+    }
     while !stopped.load(Ordering::SeqCst) {
         for (i, p) in files.iter().enumerate() {
             let mut f = match File::open(p) {

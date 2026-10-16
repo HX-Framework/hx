@@ -889,8 +889,24 @@ pub fn cmd_ui(name: &str, args: &[String]) -> Result<i32, String> {
     if !in_container && !no_open {
         crate::connect::open_browser(&launch_url);
     }
-    let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::signal::SIGINT, signal_hook::consts::signal::SIGTERM]).map_err(|e| e.to_string())?;
-    if signals.forever().next().is_some() {
+    #[cfg(unix)]
+    {
+        let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::signal::SIGINT, signal_hook::consts::signal::SIGTERM]).map_err(|e| e.to_string())?;
+        if signals.forever().next().is_some() {
+            remove_server_info();
+        }
+    }
+    // Windows: Bun's SIGINT is Ctrl+C in the console, and nothing delivers
+    // SIGTERM there (crate::daemon does the same).
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        let _ = crate::platform::on_ctrl_c(Box::new(move || flag.store(true, Ordering::SeqCst)));
+        while !stopped.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         remove_server_info();
     }
     Ok(0)
