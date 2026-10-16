@@ -1417,13 +1417,12 @@ export function clientOfBinary(path: string): "hx" | "hx2" | null {
 /** The hx2 binary the installed definition runs, or null when the slot is
  *  empty, runs hx, or runs anything else. */
 export function slotRunsHx2(ops: DaemonOps): string | null {
-  let bin: string | null = null;
   try {
-    bin = ops.slotBinary?.() ?? null;
+    const bin = ops.slotBinary?.() ?? null;
+    return bin !== null && clientOfBinary(bin) === "hx2" ? bin : null;
   } catch {
     return null;
   }
-  return bin !== null && clientOfBinary(bin) === "hx2" ? bin : null;
 }
 
 // ─────────────── Keeping the installed definition current ───────────────
