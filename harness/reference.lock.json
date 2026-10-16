@@ -1,5 +1,5 @@
 {
-  "commit": "a89c7f5ed4fce013cd58607e02b395fd2787f5a9",
-  "version": "77.11.0",
-  "note": "The reference build for the differential harness: the TypeScript client every candidate (a later TypeScript build, or hx2 from the hx-2.0 branch) is compared against. Move it only when a deliberate, reviewed behavior change lands on main."
+  "commit": "2067617f9bc5815985a9ccfd8f7bb565bade3f89",
+  "version": "77.12.0",
+  "note": "The reference build for the differential harness: the TypeScript client every candidate (a later TypeScript build, or hx2 from the hx-2.0 branch) is compared against. 77.12.0 is the head of hx2/m2-design-fixes (PR #12), the fixed design the Rust port copies. Move it only when a deliberate, reviewed behavior change lands on main."
 }
