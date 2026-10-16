@@ -18,6 +18,11 @@ name: Differential harness
 #                 file checks per second at idle, refused workflow retries,
 #                 the Claude Desktop index — the numbers behind the design
 #                 fixes (harness/run/measure.ts), attached as an artifact.
+#                 The idle daemon's resident memory is sampled once a second
+#                 from /proc (Linux) or ps (macOS); on Linux a third binary,
+#                 the candidate with file events patched off
+#                 (harness/variants/no-file-events.patch), is measured beside
+#                 the two, so the recursive watch's memory stands on its own.
 #
 # The candidate is any binary: built from the pull request by default, or —
 # on a manual run — from another ref, or downloaded from a URL (an hx2
@@ -334,13 +339,41 @@ jobs:
           name: hx-candidate-${{ matrix.os }}
           path: bin/candidate
 
+      # The variant: the candidate's source with file events patched off,
+      # built here (Linux only; a downloaded candidate has no source to patch).
+      # A patch that no longer applies skips the variant with a warning rather
+      # than failing the measurement.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: runner.os == 'Linux' && github.event.inputs.candidate_url_linux == ''
+        with:
+          ref: ${{ github.event.inputs.candidate_ref || github.ref }}
+          path: variant-src
+
+      - name: Build the candidate with file events off
+        if: runner.os == 'Linux' && github.event.inputs.candidate_url_linux == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch="$PWD/harness/variants/no-file-events.patch"
+          if git -C variant-src apply --check "$patch"; then
+            git -C variant-src apply --verbose "$patch"
+            bash harness/ci/build.sh "$PWD/variant-src" "$PWD/bin/variant/hx"
+          else
+            echo "::warning::harness/variants/no-file-events.patch does not apply to the candidate; the variant is skipped"
+          fi
+
       - name: Measure
         shell: bash
         run: |
           set -euo pipefail
           chmod +x bin/reference/hx bin/candidate/hx
+          extra=()
+          if [ -x bin/variant/hx ]; then
+            extra=(--variant bin/variant/hx --variant-name "file events off")
+          fi
           bun harness/run/measure.ts \
             --reference bin/reference/hx --candidate bin/candidate/hx \
+            ${extra[@]+"${extra[@]}"} \
             --out measure-out --work "$RUNNER_TEMP/hx-measure"
 
       - name: Report
