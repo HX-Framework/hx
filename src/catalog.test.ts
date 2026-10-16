@@ -76,13 +76,20 @@ function mkFile(project: string, name: string, bytes: number, mtimeMs: number, d
   return p;
 }
 
+/** Write a codex rollout with a controlled mtime, given to its date dir and
+ *  every dir above it up to sessions/ as well. Creating a dir moves its
+ *  parent's mtime to the current time, but on the Windows CI runner a dir's
+ *  mtime advances in steps up to 16 ms apart: a day dir created a few ms
+ *  after the previous one can leave the month dir's mtime where it was, and
+ *  the walk, which re-lists a dir only when its mtime moved, never sees it. */
 function mkCodex(day: string, name: string, bytes: number, mtimeMs: number): string {
-  const dir = join(base, "codex", "sessions", "2026", "08", day);
+  const sessions = join(base, "codex", "sessions");
+  const dir = join(sessions, "2026", "08", day);
   mkdirSync(dir, { recursive: true });
   const p = join(dir, name);
   writeFileSync(p, "y".repeat(bytes));
   touch(p, mtimeMs);
-  touch(dir, mtimeMs);
+  for (const d of [dir, join(sessions, "2026", "08"), join(sessions, "2026"), sessions]) touch(d, mtimeMs);
   return p;
 }
 
