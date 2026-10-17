@@ -364,6 +364,9 @@ jobs:
           # a shutdown signal"). Sample the machine every 10 s into the step
           # log (live, so it survives a shutdown) and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -436,6 +439,9 @@ jobs:
           # a shutdown signal"). Sample the machine every 10 s into the step
           # log (live, so it survives a shutdown) and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -708,6 +714,9 @@ jobs:
           # every 10 s into the step log (live, so it survives a shutdown)
           # and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -777,6 +786,9 @@ jobs:
           # every 10 s into the step log (live, so it survives a shutdown)
           # and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -850,6 +862,9 @@ jobs:
           # every 10 s into the step log (live, so it survives a shutdown)
           # and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -918,6 +933,9 @@ jobs:
           # every 10 s into the step log (live, so it survives a shutdown)
           # and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
