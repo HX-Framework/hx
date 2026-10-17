@@ -14,8 +14,9 @@
 //                     long-running daemon step, whose repetition counts are
 //                     cadence)
 //   hx ui             each probe's status and normalized JSON body
-//   ccd-index.json    the saved Claude Desktop index, normalized, when the
-//                     reference writes one (a candidate may not drop it)
+//   ccd-index.json    the saved Claude Desktop index, when the reference
+//                     writes one (a candidate may not drop it): normalized,
+//                     and byte for byte per entry (ccdIndexByteDiffs)
 //   state journal     empty or absent at the end of every run
 //   expectations      facts the fixture manifest promises (the group mirror)
 
@@ -111,6 +112,73 @@ function diffText(a: string, b: string, limit = 40): string[] {
       out.push(`@${i + 1}`);
       if (la[i] !== undefined) out.push(`- ${la[i]}`);
       if (lb[i] !== undefined) out.push(`+ ${lb[i]}`);
+    }
+  }
+  return out;
+}
+
+/** Where two strings first differ, with a little context on each side. */
+function firstDifference(a: string, b: string): string {
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  const from = Math.max(0, i - 40);
+  return `at character ${i}: …${a.slice(from, i + 40)}… ≠ …${b.slice(from, i + 40)}…`;
+}
+
+/**
+ * The saved Claude Desktop index, byte for byte, entry by entry.
+ *
+ * Equality of the whole files is not a contract the reference keeps with
+ * itself: it writes `files` in the order its 32 parallel stat-and-read
+ * workers complete (two reference runs on one tree differ), and `savedAtMs`
+ * is the save's clock. Everything else is compared as bytes:
+ *   • each file is exactly what JSON.stringify writes for its own content —
+ *     no `1.0` for `1`, no other escaping, no whitespace, no other digits;
+ *   • both files carry the same top-level keys in the same order;
+ *   • every `dirs` and `files` entry is byte-identical to the reference's
+ *     entry for the same path, and neither file has an entry the other lacks.
+ * Given the first rule, the JSON.stringify of a parsed entry is the entry's
+ * own text in the file, so comparing those strings compares the bytes.
+ * `nameOf` turns a path into what a report shows.
+ */
+export function ccdIndexByteDiffs(refText: string, candText: string, nameOf: (key: string) => string): string[] {
+  const out: string[] = [];
+  let a: Record<string, unknown>;
+  let b: Record<string, unknown>;
+  try {
+    a = JSON.parse(refText) as Record<string, unknown>;
+  } catch {
+    return ["the reference's file is not JSON"];
+  }
+  try {
+    b = JSON.parse(candText) as Record<string, unknown>;
+  } catch {
+    return ["the candidate's file is not JSON"];
+  }
+  const ra = JSON.stringify(a);
+  const rb = JSON.stringify(b);
+  if (ra !== refText) out.push(`reference: not what JSON.stringify writes for its own content, ${firstDifference(ra, refText)}`);
+  if (rb !== candText) out.push(`candidate: not what JSON.stringify writes for its own content, ${firstDifference(rb, candText)}`);
+  const ka = Object.keys(a).join(",");
+  const kb = Object.keys(b).join(",");
+  if (ka !== kb) out.push(`top-level keys: ${ka} ≠ ${kb}`);
+  const clip = (s: string): string => (s.length > 300 ? `${s.slice(0, 297)}…` : s);
+  for (const section of ["dirs", "files"]) {
+    const ea = (a[section] ?? {}) as Record<string, unknown>;
+    const eb = (b[section] ?? {}) as Record<string, unknown>;
+    for (const k of Object.keys(ea)) {
+      if (out.length >= 40) return out;
+      if (!Object.hasOwn(eb, k)) {
+        out.push(`${section}: ${nameOf(k)}: only in the reference`);
+        continue;
+      }
+      const ta = JSON.stringify(ea[k]);
+      const tb = JSON.stringify(eb[k]);
+      if (ta !== tb) out.push(`${section}: ${nameOf(k)}: ${clip(ta)} ≠ ${clip(tb)}`);
+    }
+    for (const k of Object.keys(eb)) {
+      if (out.length >= 40) return out;
+      if (!Object.hasOwn(ea, k)) out.push(`${section}: ${nameOf(k)}: only in the candidate`);
     }
   }
   return out;
@@ -224,7 +292,13 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     if (a === null && b === null) checks.push({ name: "ccd-index.json", ok: true, details: "neither run wrote one (no Claude Desktop store on this platform, or a client that predates the saved index)" });
     else if (a === null) checks.push({ name: "ccd-index.json", ok: true, details: "the reference predates the saved index; the candidate's is not compared" });
     else if (b === null) checks.push({ name: "ccd-index.json", ok: false, details: "the reference wrote ccd-index.json and the candidate did not" });
-    else checks.push(check("ccd-index.json", deepDiff(normalizeJson(a, ctxRef), normalizeJson(b, ctxCand), tolS), "identical after normalization"));
+    else {
+      checks.push(check("ccd-index.json", deepDiff(normalizeJson(a, ctxRef), normalizeJson(b, ctxCand), tolS), "identical after normalization"));
+      const refText = readFileSync(join(ref.dir, "ccd-index.json"), "utf8");
+      const candText = readFileSync(join(cand.dir, "ccd-index.json"), "utf8");
+      const entries = Object.keys((a as { files?: object }).files ?? {}).length;
+      checks.push(check("ccd-index.json bytes", ccdIndexByteDiffs(refText, candText, (k) => normalizeText(k, ctxRef)), `every entry byte-identical (${entries} files); entry order and savedAtMs not compared: the reference writes files in the order its parallel reads complete`));
+    }
   }
 
   // The offsets journal (state.journal.jsonl, since 77.12) is folded into

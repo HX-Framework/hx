@@ -35,11 +35,13 @@ name: Differential harness
 # on a manual run — from another ref, or downloaded from a URL (an hx2
 # release asset, say) with `candidate_name: hx2`.
 #
-# On the hx-2.0 branch five more jobs run the Rust port (hx2/, the whole
+# On the hx-2.0 branch six more jobs run the Rust port (hx2/, the whole
 # client since M5) against the same reference:
-#   hx2-build         the web UI (bun), then cargo build --release and the
-#                     unit tests on both runners; the tests check the service
-#                     definitions against the TypeScript client's renderings;
+#   hx2-build         the web UI (bun), then cargo build --release on both
+#                     runners;
+#   hx2-test          the crate's unit tests beside the build, among them the
+#                     service definitions against the TypeScript client's
+#                     renderings for the same binary path;
 #   hx2-differential  the reference compared with hx2 on every scenario but
 #                     the hot-path shapes (`--scenarios main`: the daemon, the
 #                     CLI, the hx ui API, update, connect and disconnect),
@@ -649,9 +651,35 @@ jobs:
           ls -l bin/hx2
           bin/hx2 --version
 
-      # The unit tests, among them the service definitions against the
-      # TypeScript client's own renderings for the same binary and HOME
-      # (one service slot: the files may differ in the binary's path alone).
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hx2-${{ matrix.os }}
+          path: bin/hx2
+          if-no-files-found: error
+
+  hx2-test:
+    name: hx2 unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: hx2
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # Among the unit tests, the service definitions against the TypeScript
+      # client's own renderings for the same binary and HOME (one service
+      # slot: the files may differ in the binary's path alone).
       - name: Test
         shell: bash
         run: |
@@ -661,12 +689,6 @@ jobs:
           defs="$RUNNER_TEMP/service-defs"
           bun harness/run/service-defs.ts --out "$defs"
           HX2_TS_SERVICE_DEFS="$defs" cargo test --manifest-path hx2/Cargo.toml
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: hx2-${{ matrix.os }}
-          path: bin/hx2
-          if-no-files-found: error
 
   hx2-differential:
     name: Reference vs hx2 (${{ matrix.os }})

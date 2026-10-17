@@ -11,6 +11,14 @@
 // never embeds `now`, so the bytes the gateway stores are the same in every
 // run.
 //
+// The Claude Desktop session store is the exception: its files and its org
+// directory get FIXED mtimes, with sub-millisecond fractions (ccdMtimeSec).
+// The client reads those mtimes for one purpose only — the saved index
+// (`ccd-index.json`) records each one to tell a changed file from an
+// unchanged one — so no age window depends on them, and with the same
+// stamps in every run the two binaries' saved indexes can be compared byte
+// for byte, the fractional mtimes the client prints included.
+//
 // What a shape contains (all three share the curated core; the two larger
 // ones add generated bulk):
 //   • Claude Code transcripts under .claude/projects/<encoded cwd>/<id>.jsonl —
@@ -96,13 +104,30 @@ const DAY = 24 * HOUR;
 // the clock. Sessions get consecutive minutes from here.
 const CONTENT_EPOCH = Date.UTC(2026, 0, 5, 9, 0, 0);
 
+/** The fixed mtime of the `i`-th Claude Desktop file, in seconds: a minute
+ *  apart from CONTENT_EPOCH on, with a fraction that differs per file, so
+ *  the stamps the client stats carry nanoseconds and print with three or
+ *  four decimals as milliseconds. Computed, not drawn from the seed's PRNG:
+ *  drawing would shift every value generated after it. */
+export function ccdMtimeSec(i: number): number {
+  return CONTENT_EPOCH / 1000 + i * 60 + ((i * 7_919 + 104_729) % 999_983) / 999_983;
+}
+
+/** The fixed mtime of a Claude Desktop org directory, in seconds. */
+export const CCD_DIR_MTIME_SEC = CONTENT_EPOCH / 1000 + 0.123_456_7;
+
 interface Ctx {
   home: string;
   now: number;
   rng: Prng;
   manifest: Manifest;
-  /** Paths whose mtime to set, applied after all writes (writes bump dirs). */
-  mtimes: Array<{ path: string; offsetMs: number; kind: "file" | "dir" }>;
+  /** Paths whose mtime to set, applied after all writes (writes bump dirs):
+   *  `offsetMs` from `now`, or a fixed `atSec` (the Claude Desktop store). */
+  mtimes: Array<{ path: string; offsetMs: number; atSec?: number; kind: "file" | "dir" }>;
+  /** Claude Desktop files written so far: the index into ccdMtimeSec. */
+  ccdFiles: number;
+  /** Claude Desktop org directories already queued for their fixed stamp. */
+  ccdDirs: Set<string>;
 }
 
 function iso(ms: number): string {
@@ -127,6 +152,21 @@ function dirMtime(ctx: Ctx, rel: string, mtimeOffsetMs: number): void {
   const p = join(ctx.home, rel);
   mkdirSync(p, { recursive: true });
   ctx.mtimes.push({ path: p, offsetMs: mtimeOffsetMs, kind: "dir" });
+}
+
+/** A Claude Desktop session file, stamped with the next fixed mtime; its
+ *  org directory gets the fixed directory stamp once all writes are done. */
+function writeCcd(ctx: Ctx, rel: string, content: string): string {
+  const p = join(ctx.home, rel);
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, content);
+  ctx.mtimes.push({ path: p, offsetMs: 0, atSec: ccdMtimeSec(ctx.ccdFiles++), kind: "file" });
+  const dir = dirname(p);
+  if (!ctx.ccdDirs.has(dir)) {
+    ctx.ccdDirs.add(dir);
+    ctx.mtimes.push({ path: dir, offsetMs: 0, atSec: CCD_DIR_MTIME_SEC, kind: "dir" });
+  }
+  return p;
 }
 
 // ── Claude Code transcript lines ────────────────────────────────────────────
@@ -557,11 +597,10 @@ function writeCore(ctx: Ctx, hot = false): Core {
   // disk: the client still resolves the group member to that CLI id.
   const unknownCli = rng.uuid();
   const ccdFile = (localId: string, cliSessionId: string | null, title: string, titleSource: "user" | "ai", isArchived: boolean, idx: number): void => {
-    write(
+    writeCcd(
       ctx,
       `${ccdRoot}/claude-code-sessions/${account}/${org}/${localId}.json`,
       JSON.stringify({ sessionId: localId, ...(cliSessionId ? { cliSessionId } : {}), title, titleSource, isArchived, lastActivityAt: CONTENT_EPOCH + idx * HOUR, cwd: repo }),
-      -(60 + idx) * MIN,
     );
   };
   ccdFile(localIds.repoCli, repoCli.sessionId, "Offsets journal design (desktop name)", "ai", false, 0);
@@ -675,7 +714,7 @@ function writeBulk(ctx: Ctx, opts: { sessions: number; dirs: number; lanes: numb
     }
     if (ccdWritten < opts.ccdFiles) {
       ccdWritten += 1;
-      write(ctx, `${ccdRoot}/local_${rng.uuid()}.json`, JSON.stringify({ sessionId: `local_${rng.uuid()}`, cliSessionId: sid, title: rng.sentence(5), titleSource: rng.pick(["user", "ai"]), isArchived: false, lastActivityAt: CONTENT_EPOCH + i * MIN, cwd }), mtimeOffsetMs);
+      writeCcd(ctx, `${ccdRoot}/local_${rng.uuid()}.json`, JSON.stringify({ sessionId: `local_${rng.uuid()}`, cliSessionId: sid, title: rng.sentence(5), titleSource: rng.pick(["user", "ai"]), isArchived: false, lastActivityAt: CONTENT_EPOCH + i * MIN, cwd }));
     }
   }
   // A long-lived machine keeps far more Claude Desktop session files than it
@@ -683,12 +722,12 @@ function writeBulk(ctx: Ctx, opts: { sessions: number; dirs: number; lanes: numb
   // the rest name sessions whose transcripts are gone.
   while (ccdWritten < opts.ccdFiles) {
     ccdWritten += 1;
-    write(
-      ctx,
-      `${ccdRoot}/local_${rng.uuid()}.json`,
-      JSON.stringify({ sessionId: `local_${rng.uuid()}`, cliSessionId: rng.uuid(), title: rng.sentence(5), titleSource: "ai", isArchived: ccdWritten % 5 === 0, lastActivityAt: CONTENT_EPOCH + ccdWritten * MIN, cwd: dirs[ccdWritten % dirs.length] }),
-      -rng.int(20 * MIN, 29 * DAY),
-    );
+    const rel = `${ccdRoot}/local_${rng.uuid()}.json`;
+    const content = JSON.stringify({ sessionId: `local_${rng.uuid()}`, cliSessionId: rng.uuid(), title: rng.sentence(5), titleSource: "ai", isArchived: ccdWritten % 5 === 0, lastActivityAt: CONTENT_EPOCH + ccdWritten * MIN, cwd: dirs[ccdWritten % dirs.length] });
+    // The draw that once made this file's mtime: kept, so every value
+    // generated after it stays what it was.
+    rng.int(20 * MIN, 29 * DAY);
+    writeCcd(ctx, rel, content);
   }
 }
 
@@ -710,6 +749,8 @@ export function generateHome(opts: GenOptions): Manifest {
       expectations: { groupMirror: { groupingEnabled: false, groups: [], unreadIds: [] }, codexTitles: {} },
     },
     mtimes: [],
+    ccdFiles: 0,
+    ccdDirs: new Set(),
   };
   writeCore(ctx, isHotShape(opts.shape));
   if (opts.shape === "claude-like") {
@@ -735,8 +776,9 @@ export function generateHome(opts: GenOptions): Manifest {
   // child's.
   const files = ctx.mtimes.filter((m) => m.kind === "file");
   const dirs = ctx.mtimes.filter((m) => m.kind === "dir").sort((a, b) => b.path.length - a.path.length);
+  // A fixed stamp goes in as seconds: a Date would round it to the millisecond.
   for (const m of files) {
-    const t = new Date(now + m.offsetMs);
+    const t = m.atSec ?? new Date(now + m.offsetMs);
     utimesSync(m.path, t, t);
   }
   // Every directory a discovered session lives in reads as recently touched
@@ -751,7 +793,7 @@ export function generateHome(opts: GenOptions): Manifest {
     utimesSync(dir, t, t);
   }
   for (const m of dirs) {
-    const t = new Date(now + m.offsetMs);
+    const t = m.atSec ?? new Date(now + m.offsetMs);
     utimesSync(m.path, t, t);
   }
   const manifestPath = `${opts.out}.manifest.json`;

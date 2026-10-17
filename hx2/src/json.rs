@@ -597,7 +597,7 @@ fn write_js_key(out: &mut String, k: &str) {
 
 /// A number the way `JSON.stringify` prints it; the integers that fill the
 /// state (offsets, sizes, millisecond stamps) take the direct path.
-fn write_num(out: &mut String, n: f64) {
+pub fn write_num(out: &mut String, n: f64) {
     if n == 0.0 {
         out.push('0');
     } else if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {

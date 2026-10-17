@@ -21,7 +21,12 @@
 //   writes-daemon        the same growth fed to a running daemon for 45 s
 //   idle-syscalls        a daemon idle for 75 s on a 600-session tree under
 //                        strace -c (Linux): file checks per second (file
-//                        events + the lane and workflow gates)
+//                        events + the lane and workflow gates); then a second
+//                        daemon traced for 45 s with every stat-family,
+//                        readlink and openat call's path
+//                        (harness/lib/stat-trace.ts),
+//                        the first 15 s — the start-up pass — counted apart,
+//                        into <label>-<who>-stat-paths.txt
 //   idle-cpu             the same daemon without strace: CPU% and RSS
 //   idle-memory          that daemon's resident memory over its 60 s: VmRSS,
 //                        VmHWM, RssAnon, RssFile, AnonHugePages, threads,
@@ -35,8 +40,10 @@
 //                        uploads and [stuck] lines in 50 s (the backoff and
 //                        the dedupe key)
 //   ccd-index            a one-shot pass with 10,000 Claude Desktop files,
-//                        second run: block reads, CPU, RSS (the saved index,
-//                        macOS only — the store exists only there)
+//                        then the pass after it, five times: block reads,
+//                        CPU, RSS and wall time, each the median of the five
+//                        (the saved index, macOS only — the store exists
+//                        only there)
 //   idle-hot             idle-syscalls + idle-cpu + idle-memory on the
 //                        hot-path shape (600 parent transcripts, nothing else)
 //   founder              the hx2 exit check: a tree the size of the founder's
@@ -62,12 +69,14 @@
 // runs it in the `measure` jobs and attaches measurements.json / .md, the
 // per-second memory samples, the strace summaries and the smaps of the peak.
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { release as osRelease, totalmem } from "node:os";
 import { join } from "node:path";
 
 import { FakeGateway } from "../gateway/gateway.js";
-import { generateHome, type Manifest } from "../fixtures/gen-home.js";
+import { CCD_DIR_MTIME_SEC, ccdMtimeSec, generateHome, type Manifest } from "../fixtures/gen-home.js";
+import { ccdIndexByteDiffs } from "../lib/compare.js";
+import { summarizeStatTrace } from "../lib/stat-trace.js";
 import { Prng } from "../lib/prng.js";
 import type { BinaryName } from "../lib/types.js";
 import { appendTranscriptLines, binaryVersion, clientEnv, runScenario, writeClientFiles } from "./run-scenario.js";
@@ -190,6 +199,30 @@ async function runOnce(cmd: string[], env: Record<string, string>, timeoutMs: nu
   clearInterval(poll);
   if (proc.signalCode || code !== 0) log(`    ${cmd.slice(1).join(" ")}: exit ${proc.signalCode ?? code}\n${stderr.slice(0, 800)}`);
   return { ...usageOf(proc, startedAt, proc.signalCode ?? String(code), hwm), stdout };
+}
+
+/** The one-shot pass after the first, on a tree nothing changes between
+ *  runs: SECOND_PASSES runs, and each figure is the median of theirs. One
+ *  run's wall time on a shared macOS runner moved by a factor of two between
+ *  two runs of the same binaries. */
+const SECOND_PASSES = 5;
+
+async function medianPass(cmd: string[], env: Record<string, string>, timeoutMs: number): Promise<Usage> {
+  const runs: Usage[] = [];
+  for (let i = 0; i < SECOND_PASSES; i++) runs.push(await runOnce(cmd, env, timeoutMs));
+  const median = (of: (u: Usage) => number): number => {
+    const v = runs.map(of).sort((a, b) => a - b);
+    return v[Math.floor(v.length / 2)]!;
+  };
+  return {
+    elapsedMs: median((u) => u.elapsedMs),
+    cpuMs: median((u) => u.cpuMs),
+    maxRssBytes: median((u) => u.maxRssBytes),
+    bunMaxRssBytes: median((u) => u.bunMaxRssBytes),
+    blocksIn: median((u) => u.blocksIn),
+    blocksOut: median((u) => u.blocksOut),
+    exit: runs.find((u) => u.exit !== "0")?.exit ?? "0",
+  };
 }
 
 /** Something to do while the daemon runs: on a schedule (`during`), or a
@@ -596,8 +629,13 @@ const memoryDetails: Record<string, { samples: MemSample[]; peakMappings: Return
 
 /** Sample a daemon once a second; keep the smaps of its highest VmRSS. The
  *  samples stay reachable through `samples` for the window summaries. */
-function memorySampler(label: string): { sampler: Sampler; samples: MemSample[]; finish: () => Measurement } {
+/** `vmmapAtMs`: moments (ms after start) at which, on macOS, `vmmap
+ *  --summary` records the malloc zones behind the footprint — how much of it
+ *  is allocated and how much is freed memory the allocator still holds —
+ *  into <label>-vmmap-<s>s.txt. */
+function memorySampler(label: string, vmmapAtMs: number[] = []): { sampler: Sampler; samples: MemSample[]; finish: () => Measurement } {
   const samples: MemSample[] = [];
+  const vmmapDue = [...vmmapAtMs];
   let peakRssKb = -1;
   let peakSmaps = "";
   return {
@@ -611,6 +649,14 @@ function memorySampler(label: string): { sampler: Sampler; samples: MemSample[];
         if (process.platform === "linux" && s.rssKb > peakRssKb) {
           peakRssKb = s.rssKb;
           peakSmaps = readOr(`/proc/${pid}/smaps`);
+        }
+        while (process.platform === "darwin" && vmmapDue.length > 0 && atMs >= vmmapDue[0]!) {
+          const at = vmmapDue.shift()!;
+          // Reading another process's zones can need privileges: then sudo
+          // (passwordless on the CI runner).
+          let r = Bun.spawnSync(["vmmap", "--summary", String(pid)]);
+          if (r.exitCode !== 0) r = Bun.spawnSync(["sudo", "-n", "vmmap", "--summary", String(pid)]);
+          writeFileSync(join(out, `${label}-vmmap-${Math.round(at / 1000)}s.txt`), `${r.stdout.toString()}${r.stderr.toString()}`);
         }
       },
     },
@@ -681,6 +727,12 @@ function parseStraceSummary(text: string): Record<string, number> {
   return counts;
 }
 
+/** The second idle daemon of the idle measurements, traced with every
+ *  stat-family, readlink and openat call's path; its first
+ *  PATH_TRACE_STARTUP_MS hold the start-up pass. */
+const PATH_TRACE_MS = 45_000;
+const PATH_TRACE_STARTUP_MS = 15_000;
+
 /** The idle daemon on one shape: `label` names the measurement (its home,
  *  its strace summary and memory samples), so `idle` and `idle-hot` keep
  *  their files apart. */
@@ -725,6 +777,26 @@ async function measureIdle(binary: string, who: Who, shape: Manifest["shape"], l
         syscallsPerSec: Math.round(total / secs),
         fileChecksPerSec: Math.round((stat + open + dents) / secs),
       });
+      // Which paths those stat calls take, from a second traced daemon: each
+      // stat-family, readlink and openat call with its path and a timestamp
+      // (an open shows which file a stat of a descriptor was for), the
+      // start-up pass apart from the idle time after it (the summary above
+      // counts both). Not for the variant, whose question is memory.
+      if (who !== "variant") {
+        const trace = join(workDir, `${label}-${who}-stat-trace.txt`);
+        rmSync(trace, { force: true });
+        await runDaemon(
+          [strace, "-f", "-ttt", "-s", "4096", "-e", "trace=%%stat,readlink,readlinkat,openat", "-o", trace, timeout, "-s", "TERM", String(PATH_TRACE_MS / 1000), binary, "watch"],
+          h.env,
+          PATH_TRACE_MS + 30_000,
+        );
+        if (existsSync(trace)) {
+          const paths = summarizeStatTrace(readFileSync(trace, "utf8"), h.home, PATH_TRACE_STARTUP_MS, PATH_TRACE_MS);
+          writeFileSync(join(out, `${label}-${who}-stat-paths.txt`), `${label}, ${who}: stat-family, readlink and openat calls by path (strace -f -ttt, ${PATH_TRACE_MS / 1000} s; the first ${PATH_TRACE_STARTUP_MS / 1000} s hold the daemon's start-up pass)\n\n${paths.text}`);
+          Object.assign(result, { idleStatPerSec: paths.idleStatPerSec, idleReadlinkPerSec: paths.idleReadlinkPerSec, idleOpenPerSec: paths.idleOpenPerSec, startupStatCalls: paths.startupStatCalls });
+          rmSync(trace, { force: true });
+        }
+      }
     } else {
       result.strace = "not available";
     }
@@ -818,7 +890,10 @@ async function measureBackoff(binary: string, who: Who): Promise<Measurement> {
 
 // ── ccd-index (the saved Claude Desktop index; macOS only) ──────────────────
 
-async function measureCcdIndex(binary: string): Promise<Measurement> {
+/** Each binary's saved index, kept for the byte comparison in the report. */
+const savedCcdIndex: Partial<Record<Who, string>> = {};
+
+async function measureCcdIndex(binary: string, who: Who): Promise<Measurement> {
   const h = await prepareHome(binary, "ccd", "small");
   try {
     const org = join(h.home, "Library", "Application Support", "Claude", "claude-code-sessions", "acct_measure", "org_measure");
@@ -827,14 +902,19 @@ async function measureCcdIndex(binary: string): Promise<Measurement> {
     const N = 10_000;
     for (let i = 0; i < N; i++) {
       const sid = rng.uuid();
-      writeFileSync(
-        join(org, `local_${sid}.json`),
-        JSON.stringify({ sessionId: `local_${sid}`, cliSessionId: rng.uuid(), title: rng.sentence(6), titleSource: i % 2 ? "user" : "ai", isArchived: false, lastActivityAt: 1_750_000_000_000 + i * 1000, cwd: `/work/${rng.alnum(5)}` }),
-      );
+      const p = join(org, `local_${sid}.json`);
+      writeFileSync(p, JSON.stringify({ sessionId: `local_${sid}`, cliSessionId: rng.uuid(), title: rng.sentence(6), titleSource: i % 2 ? "user" : "ai", isArchived: false, lastActivityAt: 1_750_000_000_000 + i * 1000, cwd: `/work/${rng.alnum(5)}` }));
+      // Fixed stamps, as the fixture's own Claude Desktop files have: with
+      // the clock's, each binary's saved index printed its own 10,000
+      // fractional mtimes, and the two files differed in size by chance.
+      utimesSync(p, ccdMtimeSec(1_000 + i), ccdMtimeSec(1_000 + i));
     }
+    utimesSync(org, CCD_DIR_MTIME_SEC, CCD_DIR_MTIME_SEC);
     const first = await runOnce([binary, "watch", "--once"], h.env, 600_000);
-    const second = await runOnce([binary, "watch", "--once"], h.env, 600_000);
+    const second = await medianPass([binary, "watch", "--once"], h.env, 600_000);
     const indexPath = join(h.home, ".let", "hx", "ccd-index.json");
+    const saved = existsSync(indexPath) ? readFileSync(indexPath, "utf8") : "";
+    savedCcdIndex[who] = saved;
     return {
       ccdFiles: N,
       firstPassElapsedMs: first.elapsedMs,
@@ -844,7 +924,7 @@ async function measureCcdIndex(binary: string): Promise<Measurement> {
       secondPassCpuMs: second.cpuMs,
       secondPassMaxRss: second.maxRssBytes,
       secondPassReads: bytesIn(second),
-      savedIndexBytes: existsSync(indexPath) ? Buffer.byteLength(readFileSync(indexPath, "utf8")) : 0,
+      savedIndexBytes: Buffer.byteLength(saved),
     };
   } finally {
     h.gateway.stop();
@@ -860,8 +940,9 @@ async function measureFounder(binary: string, who: Who): Promise<Measurement> {
   const h = await prepareHome(binary, "founder", "founder");
   try {
     const first = await runOnce([binary, "watch", "--once"], h.env, 1_800_000);
-    const second = await runOnce([binary, "watch", "--once"], h.env, 1_800_000);
-    const memory = memorySampler(`founder-${who}`);
+    const second = await medianPass([binary, "watch", "--once"], h.env, 1_800_000);
+    // The zones at the end of the warm-up and near the end of the idle window.
+    const memory = memorySampler(`founder-${who}`, [20_000, 140_000]);
     const daemon = await runDaemon([binary, "watch"], h.env, FOUNDER_WARMUP_MS + FOUNDER_IDLE_MS, undefined, memory.sampler);
     const commits = h.gateway.stats().parentCommits;
     const summary = memory.finish();
@@ -946,7 +1027,7 @@ if (only.has("idle") && (process.platform === "linux" || process.platform === "d
 }
 if (only.has("idle-hot")) await both("idle-hot", (b, who) => measureIdle(b, who, "hot-claude-like", "idle-hot"));
 if (only.has("backoff")) await both("backoff", (b, who) => measureBackoff(b, who));
-if (only.has("ccd-index") && process.platform === "darwin") await both("ccd-index", (b) => measureCcdIndex(b));
+if (only.has("ccd-index") && process.platform === "darwin") await both("ccd-index", (b, who) => measureCcdIndex(b, who));
 if (only.has("founder")) await both("founder", (b, who) => measureFounder(b, who));
 if (process.platform === "linux" && only.has("idle")) {
   log("\n=== rusage-check (last)");
@@ -978,6 +1059,13 @@ function idleRows(name: string, label: string): void {
     row(`${name}-syscalls`, "read", "calls/s", I.reference.readPerSec!, I.candidate.readPerSec!, vOf("readPerSec"));
     row(`${name}-syscalls`, "memory (mmap, munmap, mremap, madvise, mprotect, brk)", "calls/s", I.reference.memoryCallsPerSec!, I.candidate.memoryCallsPerSec!, vOf("memoryCallsPerSec"));
     row(`${name}-syscalls`, "all system calls", "calls/s", I.reference.syscallsPerSec!, I.candidate.syscallsPerSec!, vOf("syscallsPerSec"));
+  }
+  if (I.reference.idleStatPerSec !== undefined && I.candidate.idleStatPerSec !== undefined) {
+    const after = `after the first ${PATH_TRACE_STARTUP_MS / 1000} s of a ${PATH_TRACE_MS / 1000} s traced daemon (by path: ${name}-<who>-stat-paths.txt)`;
+    row(`${name}-syscalls`, `stat family, ${after}`, "calls/s", I.reference.idleStatPerSec!, I.candidate.idleStatPerSec!);
+    row(`${name}-syscalls`, `readlink, ${after}`, "calls/s", I.reference.idleReadlinkPerSec!, I.candidate.idleReadlinkPerSec!);
+    row(`${name}-syscalls`, `openat (files and directories opened), ${after}`, "calls/s", I.reference.idleOpenPerSec!, I.candidate.idleOpenPerSec!);
+    row(`${name}-syscalls`, `stat family in those first ${PATH_TRACE_STARTUP_MS / 1000} s (the start-up pass)`, "calls", I.reference.startupStatCalls!, I.candidate.startupStatCalls!);
   }
   row(`${name}-cpu`, `CPU of a 60 s idle daemon (${label})`, "% of one core", I.reference.idleCpuPercent!, I.candidate.idleCpuPercent!, vOf("idleCpuPercent"));
   row(`${name}-cpu`, "CPU over the last 40 s of that daemon (sampled)", "% of one core", I.reference.sampledIdleCpuPercent!, I.candidate.sampledIdleCpuPercent!, vOf("sampledIdleCpuPercent"));
@@ -1038,11 +1126,28 @@ if (B) {
 }
 const C = results["ccd-index"];
 if (C) {
-  row("ccd-index", `second one-shot pass with ${C.reference.ccdFiles} Claude Desktop files: block reads`, inUnit, C.reference.secondPassReads!, C.candidate.secondPassReads!);
-  row("ccd-index", "second pass CPU time", "ms", C.reference.secondPassCpuMs!, C.candidate.secondPassCpuMs!);
-  row("ccd-index", "second pass maximum RSS", "bytes", C.reference.secondPassMaxRss!, C.candidate.secondPassMaxRss!);
-  row("ccd-index", "second pass wall time", "ms", C.reference.secondPassElapsedMs!, C.candidate.secondPassElapsedMs!);
+  const ofRuns = `median of ${SECOND_PASSES} runs`;
+  row("ccd-index", `second one-shot pass with ${C.reference.ccdFiles} Claude Desktop files: block reads (${ofRuns})`, inUnit, C.reference.secondPassReads!, C.candidate.secondPassReads!);
+  row("ccd-index", `second pass CPU time (${ofRuns})`, "ms", C.reference.secondPassCpuMs!, C.candidate.secondPassCpuMs!);
+  row("ccd-index", `second pass maximum RSS (${ofRuns})`, "bytes", C.reference.secondPassMaxRss!, C.candidate.secondPassMaxRss!);
+  row("ccd-index", `second pass wall time (${ofRuns})`, "ms", C.reference.secondPassElapsedMs!, C.candidate.secondPassElapsedMs!);
   row("ccd-index", "saved index", "bytes", C.reference.savedIndexBytes!, C.candidate.savedIndexBytes!);
+  // The same check the differential runs on every scenario's saved index:
+  // each file is exactly what JSON.stringify writes for its own content, and
+  // every entry is byte-identical to the reference's for the same path (the
+  // order of the entries is the reference's read race, savedAtMs its clock).
+  const refSaved = savedCcdIndex.reference ?? "";
+  const candSaved = savedCcdIndex.candidate ?? "";
+  if (refSaved && candSaved) {
+    const entries = (text: string): number => {
+      const v = JSON.parse(text) as { dirs?: object; files?: object };
+      return Object.keys(v.dirs ?? {}).length + Object.keys(v.files ?? {}).length;
+    };
+    const diffs = ccdIndexByteDiffs(refSaved, candSaved, (k) => k.split(workDir).join("<WORK>"));
+    row("ccd-index", "saved index: entries (dirs and files)", "entries", entries(refSaved), entries(candSaved));
+    row("ccd-index", "saved index: differences from the reference, byte for byte per entry (first 40 listed in the log)", "differences", 0, diffs.length);
+    for (const d of diffs) log(`    ccd-index bytes: ${d}`);
+  }
 }
 const F = results["founder"];
 if (F) {
@@ -1051,9 +1156,9 @@ if (F) {
   row("founder", "first one-shot pass: wall time", "ms", F.reference.firstPassElapsedMs!, F.candidate.firstPassElapsedMs!);
   row("founder", "first one-shot pass: CPU time", "ms", F.reference.firstPassCpuMs!, F.candidate.firstPassCpuMs!);
   row("founder", `first one-shot pass: maximum RSS (${maxRssHow})`, "bytes", F.reference.firstPassMaxRss!, F.candidate.firstPassMaxRss!);
-  row("founder", "second one-shot pass: wall time", "ms", F.reference.secondPassElapsedMs!, F.candidate.secondPassElapsedMs!);
-  row("founder", "second one-shot pass: CPU time", "ms", F.reference.secondPassCpuMs!, F.candidate.secondPassCpuMs!);
-  row("founder", `second one-shot pass: maximum RSS (${maxRssHow})`, "bytes", F.reference.secondPassMaxRss!, F.candidate.secondPassMaxRss!);
+  row("founder", `second one-shot pass: wall time (median of ${SECOND_PASSES} runs)`, "ms", F.reference.secondPassElapsedMs!, F.candidate.secondPassElapsedMs!);
+  row("founder", `second one-shot pass: CPU time (median of ${SECOND_PASSES} runs)`, "ms", F.reference.secondPassCpuMs!, F.candidate.secondPassCpuMs!);
+  row("founder", `second one-shot pass: maximum RSS (${maxRssHow}; median of ${SECOND_PASSES} runs)`, "bytes", F.reference.secondPassMaxRss!, F.candidate.secondPassMaxRss!);
   row("founder-idle", `daemon: idle CPU over ${F.reference.idleWindowSecs} s after a ${F.reference.warmupSecs} s warm-up (sampled)`, "% of one core", F.reference.idleCpuPercent!, F.candidate.idleCpuPercent!);
   row("founder-idle", `daemon: resident size while idle, median (${sampledAs}, sampled)`, "kB", F.reference.idleRssMedianKb!, F.candidate.idleRssMedianKb!);
   row("founder-idle", "daemon: resident size while idle, maximum (sampled)", "kB", F.reference.idleRssMaxKb!, F.candidate.idleRssMaxKb!);

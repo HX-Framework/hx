@@ -86,7 +86,7 @@ fault first is not a race.
 | Requests | Per step, per session: the sequence of method, path, query, headers and body (the signed PUT by size and sha256). Requests that belong to no session per endpoint. Batch endpoints (`verify`, `reattribute`, `retitle`) as sorted multisets of their items. `sync-status`: the last snapshot of a step. `heartbeat`: present or not. In a long-running daemon step (`watch-for`), a REFUSED workflow upload (5xx) leaves the sequence and is compared as presence per run: since 77.12 the client retries it on a backoff, so how many attempts a run has time for is timing; the first refusal is the fact |
 | `state.json`, `activity.jsonl`, `config.json`, `settings.json`, `org-names.json` | Normalized deep equality; `activity.jsonl` as a multiset |
 | `state.journal.jsonl` | Empty or absent at the end of every run (candidate and reference alike): the offsets journal (77.12) is folded into `state.json` at every exit that is not a kill, so the compared `state.json` is current and no reader that ignores the journal is stale |
-| `ccd-index.json` | The saved Claude Desktop index (77.12), normalized, when the reference writes one; a reference that predates it says nothing about the candidate, a candidate that drops it while the reference writes it fails |
+| `ccd-index.json` | The saved Claude Desktop index (77.12), when the reference writes one; a reference that predates it says nothing about the candidate, a candidate that drops it while the reference writes it fails. Compared twice: normalized, and byte for byte per entry (`ccd-index.json bytes`): each file is exactly what `JSON.stringify` writes for its own content, the top-level keys come in the same order, and every `dirs` and `files` entry is byte-identical to the reference's for the same path. Not compared: `savedAtMs` (the save's clock) and the order of the `files` entries, which the reference writes in the order its 32 parallel stat-and-read workers complete, so two reference runs on one tree differ there. The fixture gives the Claude Desktop store fixed mtimes with sub-millisecond fractions (`ccdMtimeSec` in `fixtures/gen-home.ts`), so both runs stat the same stamps |
 | CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes; for a long-running daemon step the SET of distinct lines, with the per-tick `uploaded=`/`failed=` counters summed over the run and the pass-level backoff's length masked — which tick a session's retry lands in follows the clock, and the backoff doubles once per failing tick in a row) |
 | `hx ui` | Every probe's status and normalized JSON |
 | Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); Codex titles come from `state_5.sqlite`; every discovered session reached the store |
@@ -125,7 +125,7 @@ surface identical: stored bytes, request sequences, `state.json`,
 | Workflow upload backoff | Fewer refused `/sessions/workflow` attempts during an outage; a 404/401/403 now pauses the lane like the child lanes | refused workflow uploads compared as presence per run in `watch-for` steps |
 | Stuck-line dedupe key | One `[stuck]` line per hold instead of one per countdown minute | daemon stdout as distinct lines; the stuck line's numbers masked |
 | (not a fix) the daemon's clock | The held sessions' retries land in two ticks whose split varies run to run, so the per-tick counters and the pass-level backoff length vary with them — found by the candidate-vs-itself jobs of the first run | per-tick counters summed, backoff length masked, in daemon steps |
-| Saved Claude Desktop index (`ccd-index.json`) | A new cache file in `~/.let/hx` | compared when the reference writes it |
+| Saved Claude Desktop index (`ccd-index.json`) | A new cache file in `~/.let/hx` | compared when the reference writes it, normalized and byte for byte per entry |
 | File events as hints | Nothing, unless watching fails: one `[hx] file events unavailable (…)` line | none (a failure to arm shows up as a diff, which is the point) |
 
 ### The hot-path surface (hx2, M3)
@@ -206,8 +206,8 @@ jobs run `--scenarios main`, the same list as the TypeScript jobs, so the
 golden compare identical, and coverage requires all 24 protocol calls. The
 `daemon` selections stay for a candidate that predates M5.
 
-The service definitions never run in the harness, so the build job checks
-them apart: `harness/run/service-defs.ts` renders the TypeScript client's
+The service definitions never run in the harness, so the unit-test job
+(`hx2-test`) checks them apart: `harness/run/service-defs.ts` renders the TypeScript client's
 plist, systemd unit, container bootstrap and Task Scheduler XML for a fixed
 binary path, and hx2's unit tests compare their own renderings with those
 files byte for byte (and with the client's snapshot file). One service slot
@@ -278,8 +278,22 @@ transcripts, file checks per second of an idle daemon under `strace -c`
 (Linux, the per-syscall summaries attached as `idle-<run>-strace.txt`), its
 CPU and RSS, refused workflow uploads and `[stuck]` lines in the
 `daemon-backoff` run, and (macOS) the second pass over 10,000 Claude Desktop
-files. Every number is the operating system's view of the process (rusage,
-strace, /proc, ps); nothing is instrumented inside the binary.
+files, with the two saved indexes compared byte for byte per entry. A second
+pass (here and on the founder tree) runs five times and each of its figures is
+the median of the five, because one run's wall time on a shared macOS runner
+moved by a factor of two between runs of the same binaries. Every
+number is the operating system's view of the process (rusage, strace, /proc,
+ps); nothing is instrumented inside the binary.
+
+The `strace -c` window holds the daemon's start-up pass as well as its idle
+time, and it counts calls without their paths. So on Linux a second daemon is
+traced for 45 s with every stat-family, `readlink` and `openat` call's path
+(`harness/lib/stat-trace.ts`; an open says which file a stat of a descriptor
+was for, and a directory's open is counted apart as a directory read): the
+calls are counted by syscall and path
+pattern, the first 15 s apart from the rest, into
+`<run>-<who>-stat-paths.txt`, and the table gets the idle rates after the
+start-up pass.
 
 The idle daemon's resident memory is also sampled once a second from outside
 the process (`idle-memory` rows; `/proc/<pid>/status` and `smaps_rollup` on
