@@ -7,15 +7,17 @@
 //! reader. The scan is copied as it is, stale groups and all: nothing the
 //! servers see may change.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::ccd::{ccd_leveldb_dir, read_ccd_recents_cached, refresh_ccd_index};
+use crate::ccd::{ccd_id_key, ccd_leveldb_dir, read_ccd_recents_cached, refresh_ccd_index, CcdSessionMeta, IdKey};
 use crate::ccd_leveldb::LeveldbScan;
 use crate::fsutil::stat_safe;
 use crate::js::{is_space, js, lossy, num_to_string, trim, JsStr};
 use crate::json::{obj, Json};
+use crate::wtf8;
 
 fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || from > hay.len() || hay.len() - from < needle.len() {
@@ -252,20 +254,20 @@ pub fn build_group_mirror(now_ms: f64) -> Json {
         }
     }
     // Claude Desktop names its sessions by an internal id; the workbench keys
-    // them by the cli/jsonl id, resolved from the per-session metadata.
-    let mut cli_by_ccd: Vec<(JsStr, JsStr)> = Vec::new();
-    for r in read_ccd_recents_cached(now_ms).iter() {
-        if let Some(cli) = &r.cli_session_id {
-            let key = js(&r.ccd_session_id);
-            match cli_by_ccd.iter_mut().find(|(k, _)| *k == key) {
-                Some(slot) => slot.1 = js(cli),
-                None => cli_by_ccd.push((key, js(cli))),
-            }
+    // them by the cli/jsonl id, resolved from the per-session metadata. The
+    // client's Map: the last record with an id wins, and an empty cli id
+    // (falsy) maps nothing.
+    let records = read_ccd_recents_cached(now_ms);
+    let mut cli_by_ccd: HashMap<IdKey<'_>, &Arc<CcdSessionMeta>> = HashMap::with_capacity(records.len());
+    for r in records.iter() {
+        if r.has_cli_id() {
+            cli_by_ccd.insert(r.ccd_key(), r);
         }
     }
     let to_cli = |local_id: &JsStr| -> JsStr {
-        match cli_by_ccd.iter().find(|(k, _)| k == local_id) {
-            Some((_, cli)) => cli.clone(),
+        let id = wtf8::from_units(local_id);
+        match cli_by_ccd.get(&ccd_id_key(&id)).and_then(|r| r.cli_session_id_units()) {
+            Some(cli) => cli,
             None => local_id.clone(),
         }
     };

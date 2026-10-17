@@ -2,9 +2,9 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
-use crate::fsutil::{exists, join, SEP};
+use crate::fsutil::{exists, join, now_ms, SEP};
 use crate::home::homedir;
 use crate::json::{obj, Json};
 use crate::pathnorm::normalize_data_dir;
@@ -81,14 +81,52 @@ fn resolve_family(default_root: &str, from_settings: &[String], from_env: Option
     out
 }
 
+/// The sub-tick memo of roots.ts. The daemon resolves the roots several
+/// times a tick (the tick and `publish_roots` each resolve, and the mirror
+/// and audit timers add calls of their own), and every resolution stats and
+/// realpaths each candidate. A resolution for the same settings and
+/// environment within ROOTS_MEMO_TTL_MS of the last one reuses it, and the
+/// daemon's pass drops the memo at its start, so a tick's first resolution
+/// observes the filesystem fresh and later ones in the same tick collapse.
+const ROOTS_MEMO_TTL_MS: f64 = 1_200.0;
+
+type RootsKey = (Vec<String>, Vec<String>, Option<String>, Option<String>);
+
+struct RootsMemo {
+    key: RootsKey,
+    at_ms: f64,
+    value: ResolvedRoots,
+}
+
+fn roots_memo() -> MutexGuard<'static, Option<RootsMemo>> {
+    static MEMO: OnceLock<Mutex<Option<RootsMemo>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `invalidateRootsMemo`: the next resolution re-observes the filesystem.
+pub fn invalidate_roots_memo() {
+    *roots_memo() = None;
+}
+
 /// Resolve the full watch-root set for this process (settings + own env).
 pub fn resolve_data_roots(s: &HxSettings) -> ResolvedRoots {
-    let claude_env = std::env::var("CLAUDE_CONFIG_DIR").ok().filter(|v| !v.is_empty());
-    let codex_env = std::env::var("CODEX_HOME").ok().filter(|v| !v.is_empty());
-    ResolvedRoots {
+    let claude_env_raw = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    let codex_env_raw = std::env::var("CODEX_HOME").ok();
+    let key: RootsKey = (s.data_dirs.claude.clone(), s.data_dirs.codex.clone(), claude_env_raw.clone(), codex_env_raw.clone());
+    let now = now_ms();
+    if let Some(m) = roots_memo().as_ref() {
+        if m.key == key && now - m.at_ms < ROOTS_MEMO_TTL_MS {
+            return m.value.clone();
+        }
+    }
+    let claude_env = claude_env_raw.filter(|v| !v.is_empty());
+    let codex_env = codex_env_raw.filter(|v| !v.is_empty());
+    let value = ResolvedRoots {
         claude: resolve_family(&DEFAULT_CLAUDE_ROOT, &s.data_dirs.claude, claude_env.as_deref()),
         codex: resolve_family(&DEFAULT_CODEX_ROOT, &s.data_dirs.codex, codex_env.as_deref()),
-    }
+    };
+    *roots_memo() = Some(RootsMemo { key, at_ms: now, value: value.clone() });
+    value
 }
 
 /// Identity of a resolved set — drives the daemon's stamp-on-change.

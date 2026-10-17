@@ -132,7 +132,80 @@ pub fn collapse_spaces(s: &[u16]) -> JsStr {
     out
 }
 
-/// `Number.prototype.toString` / `JSON.stringify` for a finite number.
+/// The digits and exponent `Number.prototype.toString` writes for a finite,
+/// positive double: the fewest digits that read back as the double (what
+/// `{:e}` gives) and, when the double lies exactly halfway between two such
+/// digit strings, the even one (the specification's tie rule). Rust's
+/// formatter takes the one above there: 1767704100369.28125 is
+/// `1767704100369.2812` in JavaScript and `…369.2813` in `Display`. About one
+/// fractional millisecond mtime in 256 is such a double.
+fn js_digits(a: f64) -> (String, i32) {
+    let sci = format!("{:e}", a);
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    // a = m × 2^e2, m odd.
+    let bits = a.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7FF) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (mut m, mut e2) = if raw_exp == 0 { (frac, -1074) } else { (frac | (1u64 << 52), raw_exp - 1075) };
+    if m == 0 {
+        return (digits, exp);
+    }
+    let tz = m.trailing_zeros();
+    m >>= tz;
+    e2 += tz as i32;
+    // The digits are a × 10^p rounded, p = k - 1 - exp. A tie is 2 × a × 10^p
+    // being an odd integer: m × 2^(e2 + 1 + p) × 5^p, or over 5^-p when p is
+    // negative, with m odd.
+    let k = digits.len() as i32;
+    let p = k - 1 - exp;
+    let tie = e2 + 1 + p == 0 && (p >= 0 || 5u64.checked_pow((-p) as u32).map_or(false, |f| m % f == 0));
+    if !tie {
+        return (digits, exp);
+    }
+    // a is then exactly k + 1 digits ending in 5, "T5": the two candidates
+    // are T and T + 1, and the even one is JavaScript's.
+    let exact = format!("{:.*e}", k as usize, a);
+    let (em, ee) = exact.split_once('e').unwrap_or((exact.as_str(), "0"));
+    let mut t_exp: i32 = ee.parse().unwrap_or(exp);
+    let mut t: Vec<u8> = em.bytes().filter(|c| *c != b'.').collect();
+    t.truncate(k as usize);
+    if t.last().map_or(false, |d| (d - b'0') % 2 == 1) {
+        let mut i = t.len();
+        loop {
+            if i == 0 {
+                t.insert(0, b'1');
+                t_exp += 1;
+                break;
+            }
+            i -= 1;
+            if t[i] == b'9' {
+                t[i] = b'0';
+            } else {
+                t[i] += 1;
+                break;
+            }
+        }
+    }
+    while t.len() > 1 && t[t.len() - 1] == b'0' {
+        t.pop();
+    }
+    let cand = String::from_utf8(t).unwrap_or_default();
+    // Both candidates of a tie read back as the double; keep the
+    // formatter's digits if this one, for any reason, does not.
+    let text = if cand.len() > 1 { format!("{}.{}e{}", &cand[..1], &cand[1..], t_exp) } else { format!("{}e{}", cand, t_exp) };
+    if text.parse::<f64>().ok() == Some(a) {
+        (cand, t_exp)
+    } else {
+        (digits, exp)
+    }
+}
+
+/// `Number.prototype.toString` / `JSON.stringify` for a finite number: the
+/// digits of `js_digits`, laid out the way the specification lays them out —
+/// plainly from 1e-6 up to 1e21, in exponent form outside (`1e+21`,
+/// `1.5e-7`), where Rust's `Display` would write every zero.
 pub fn num_to_string(v: f64) -> String {
     if v.is_nan() || v.is_infinite() {
         return "null".to_string();
@@ -140,10 +213,33 @@ pub fn num_to_string(v: f64) -> String {
     if v == 0.0 {
         return "0".to_string();
     }
-    if v.fract() == 0.0 && v.abs() < 1e21 {
-        return format!("{}", v as i128);
+    let a = v.abs();
+    // Below 2^53 an integral double is its own shortest digits.
+    if v.fract() == 0.0 && a < 9_007_199_254_740_992.0 {
+        return format!("{}", v as i64);
     }
-    format!("{}", v)
+    let (digits, exp) = js_digits(a);
+    let k = digits.len() as i32;
+    let n = exp + 1;
+    let body = if k <= n && n <= 21 {
+        format!("{}{}", digits, "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{}", "0".repeat((-n) as usize), digits)
+    } else {
+        let sign = if n - 1 < 0 { '-' } else { '+' };
+        if k == 1 {
+            format!("{}e{}{}", digits, sign, (n - 1).abs())
+        } else {
+            format!("{}.{}e{}{}", &digits[..1], &digits[1..], sign, (n - 1).abs())
+        }
+    };
+    if v < 0.0 {
+        format!("-{}", body)
+    } else {
+        body
+    }
 }
 
 /// `Math.round`: halves round toward positive infinity.
@@ -285,4 +381,57 @@ pub fn to_locale_time_string_en_us(ms: f64) -> String {
     };
     let (pm, h12) = d.hour12();
     format!("{}:{:02}:{:02} {}", h12, d.minute(), d.second(), if pm { "PM" } else { "AM" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers_print_as_javascript_prints_them() {
+        // Every expected string is what JavaScript printed for the double.
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.0, "1"),
+            (-1.5, "-1.5"),
+            (123.456, "123.456"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1.7676037801284883e+12, "1767603780128.4883"),
+            (1.767603600104731e+12, "1767603600104.731"),
+            (9.95, "9.95"),
+            (1e-6, "0.000001"),
+            (1.5e-6, "0.0000015"),
+            (2.5e-7, "2.5e-7"),
+            (1.5e-7, "1.5e-7"),
+            (1e-7, "1e-7"),
+            (5e-324, "5e-324"),
+            (1e20, "100000000000000000000"),
+            (1e21, "1e+21"),
+            (1.000000000000001e+21, "1.000000000000001e+21"),
+            (1.5e21, "1.5e+21"),
+            (-2.5e300, "-2.5e+300"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (9_007_199_254_740_993.0, "9007199254740992"),
+            // Ties: the double is exactly halfway between two shortest
+            // digit strings, and JavaScript writes the even one.
+            (1767704100369.28125, "1767704100369.2812"),
+            (1.7677041005290312e+12, "1767704100529.0312"),
+            (1.7677041008490938e+12, "1767704100849.0938"),
+            (1.7921806746540312e+12, "1792180674654.0312"),
+            (1.7921806749740938e+12, "1792180674974.0938"),
+            (1.2345725024414062e+5, "123457.25024414062"),
+            (1.2345975073242188e+5, "123459.75073242188"),
+            (6.553754711914062e+4, "65537.54711914062"),
+            (6.554004760742188e+4, "65540.04760742188"),
+            (1.0000000000000018e+15, "1000000000000001.8"),
+            (1.0000000000000042e+15, "1000000000000004.2"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(num_to_string(*v), *want, "{:e}", v);
+            let mut out = String::new();
+            crate::json::write_num(&mut out, *v);
+            assert_eq!(out, *want, "write_num {:e}", v);
+        }
+    }
 }

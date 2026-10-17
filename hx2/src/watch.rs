@@ -25,7 +25,7 @@ use crate::children::{
 };
 use crate::codex_titles::{read_codex_title, CodexTitle};
 use crate::config::HxConfig;
-use crate::fsutil::{basename, node_error, now_ms, relative, stat_safe};
+use crate::fsutil::{basename, node_error, now_ms, relative, release_freed_memory, stat_safe};
 use crate::home::homedir;
 use crate::js::{math_round, num_to_string, to_locale_time_string_en_us, JsStr};
 use crate::json::{obj, Json, OMap};
@@ -37,7 +37,7 @@ use crate::parse::{summarise_chunk, ChunkSummary};
 use crate::pathnorm::collapse_home;
 use crate::reattribute::run_reattribute_sweep;
 use crate::report::{elect_uploaders, filter_watched, owed_summary, should_skip_entry, snapshot_from, SyncSnapshot};
-use crate::roots::{resolve_data_roots, roots_signature, DataRoot, ResolvedRoots};
+use crate::roots::{invalidate_roots_memo, resolve_data_roots, roots_signature, DataRoot, ResolvedRoots};
 use crate::route::{resolve_route_shared, RouteCache, RouteMode};
 use crate::settings::{is_paused, read_settings, tuning_int, tuning_value, HxSettings};
 use crate::sidecars::sync_artifacts;
@@ -518,14 +518,14 @@ struct TitleMeta {
 /// `deriveTitleMeta`: Claude Desktop's title, else the chunk's, else Codex's,
 /// else the rollout head's; a synthesized label on a from-zero upload.
 fn derive_title_meta(summary: &ChunkSummary, head: &HeadMeta, step_offset: u64, ccd: Option<&CcdSessionMeta>, codex: Option<&CodexTitle>) -> TitleMeta {
-    let ccd_title: Option<JsStr> = ccd.and_then(|m| m.title.clone()).filter(|t| !t.is_empty());
+    let ccd_title: Option<JsStr> = ccd.and_then(|m| m.title_units()).filter(|t| !t.is_empty());
     let mut title: Option<JsStr> = ccd_title
         .clone()
         .or_else(|| summary.title.clone())
         .or_else(|| codex.map(|c| c.title.clone()))
         .or_else(|| head.title.clone());
     let mut source: Option<&'static str> = if ccd_title.is_some() {
-        ccd.and_then(|m| m.title_source)
+        ccd.and_then(|m| m.title_source())
     } else if summary.title.is_some() {
         summary.title_source
     } else if codex.is_some() {
@@ -588,7 +588,7 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
     }
 
     // Claude Desktop's title and group id, and Codex's own title: byte-independent, resolved once.
-    let ccd_meta: Option<CcdSessionMeta> = get_ccd_recents_by_cli_id(now_ms()).get(&session_id).cloned();
+    let ccd_meta: Option<Arc<CcdSessionMeta>> = get_ccd_recents_by_cli_id(now_ms()).get(&session_id).cloned();
     let codex_title: Option<CodexTitle> = if file.source == "codex" { read_codex_title(&file.root_dir, &session_id) } else { None };
 
     let mut any_progress = false;
@@ -694,13 +694,13 @@ fn ingest_one(ctx: &Ctx, file: &DiscoveredFile, opts: &WatchOptions) -> Result<b
                             }
                         }
                     }
-                    let tm = derive_title_meta(&summary, &head, step_offset, ccd_meta.as_ref(), codex_title.as_ref());
+                    let tm = derive_title_meta(&summary, &head, step_offset, ccd_meta.as_deref(), codex_title.as_ref());
                     let cwd_meta: Json = if ctx.cfg.evidence_upload == Some(false) { Json::Null } else { opt_js(&head.cwd) };
                     let meta = obj(vec![
                         ("sourcePath", Json::str(&file.path)),
                         ("title", opt_js(&tm.title)),
                         ("titleSource", Json::opt_str(tm.title_source)),
-                        ("ccdSessionId", ccd_meta.as_ref().map(|m| Json::str(&m.ccd_session_id)).unwrap_or(Json::Null)),
+                        ("ccdSessionId", ccd_meta.as_ref().map(|m| Json::Str(m.ccd_session_id_units())).unwrap_or(Json::Null)),
                         ("cwd", cwd_meta),
                         ("gitBranch", opt_js(&head.git_branch)),
                         ("repoSlug", Json::opt_str(repo_slug.as_deref())),
@@ -1632,6 +1632,9 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
             return;
         }
         *pass_started.lock().unwrap_or_else(|e| e.into_inner()) = now_ms();
+        // Every tick observes the root set fresh: a mirror or audit timer
+        // must not leave the sub-tick memo warm across a tick boundary.
+        invalidate_roots_memo();
         let pass_start = now_ms();
         let settings = read_settings();
         *watchdog_limit_ms = resolve_watchdog_ms(&settings);
@@ -1843,25 +1846,4 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
     save_ccd_index_if_changed(now_ms(), true);
     ctx.store.disarm_coalesced();
     ctx.store.drain();
-}
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    /// malloc/malloc.h: hand freed pages back to the system (every zone when NULL).
-    fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-}
-
-/// Hand the allocator's freed pages back to the system after a pass that
-/// allocated: the catch-up's read buffers and the snapshot text must not sit
-/// in the daemon's resident size for the rest of the day. The allocator
-/// keeps them otherwise; nothing the servers see changes.
-fn release_freed_memory() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
-    #[cfg(target_os = "macos")]
-    unsafe {
-        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-    }
 }

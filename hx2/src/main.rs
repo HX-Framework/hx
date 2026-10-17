@@ -25,6 +25,7 @@ mod fsevents;
 mod fsutil;
 mod home;
 mod js;
+mod jscan;
 mod json;
 mod ledger;
 mod logger;
@@ -47,6 +48,7 @@ mod title_sync;
 mod watch;
 mod watchdog;
 mod winpath;
+mod wtf8;
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};

@@ -37,7 +37,8 @@ name: Differential harness
 #
 # On the hx-2.0 branch four more jobs run the Rust port (hx2/, the daemon)
 # against the same reference:
-#   hx2-build         cargo build --release on both runners;
+#   hx2-build         cargo build --release on both runners (hx2-test runs
+#                     the crate's unit tests beside it);
 #   hx2-differential  the reference compared with hx2 on the daemon surface:
 #                     every scenario with the steps of the next card (the hx
 #                     ui API, update, connect, disconnect) removed
@@ -626,6 +627,25 @@ jobs:
           name: hx2-${{ matrix.os }}
           path: bin/hx2
           if-no-files-found: error
+
+  hx2-test:
+    name: hx2 unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: hx2
+
+      - name: Test
+        run: cargo test --manifest-path hx2/Cargo.toml
 
   hx2-differential:
     name: Reference vs hx2, daemon surface (${{ matrix.os }})

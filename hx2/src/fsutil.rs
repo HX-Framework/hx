@@ -330,3 +330,25 @@ pub fn write_atomic_0600_node(p: &Path, bytes: &[u8]) -> Result<(), String> {
     write_file_0600(&tmp, bytes).map_err(|e| node_error(&e, "open", &tmp))?;
     fs::rename(&tmp, p).map_err(|e| node_rename_error(&e, &tmp, p))
 }
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    /// malloc/malloc.h: hand freed pages back to the system (every zone when NULL).
+    fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+}
+
+/// Hand the allocator's freed pages back to the system after work that
+/// allocated: the catch-up's read buffers, the snapshot text and the saved
+/// Claude Desktop index's load must not sit in the daemon's resident size
+/// for the rest of the day. The allocator keeps them otherwise; nothing the
+/// servers see changes.
+pub fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+}

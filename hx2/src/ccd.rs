@@ -10,23 +10,37 @@
 //!
 //! The index is process-wide, as the client's module state is: both tee
 //! lanes read the same store.
+//!
+//! A long-lived machine has 35,000 or more session files, so the index is
+//! kept compact: a record is its three strings in one WTF-8 buffer (wtf8.rs)
+//! and its flags, each id that is a canonical UUID packed to its 16 bytes; a
+//! path is its directory, interned, and its file name (`local_<uuid>.json`
+//! packed the same way), shared between the index and the directory's
+//! listing; a record is shared between the index, the record list and the
+//! cli-id lookup. The session files and the saved index are read by
+//! scanning (jscan.rs), not into a JSON tree, the saved index from the file
+//! mapped into memory, and it is written straight into its text. Every byte
+//! of that text is what the client writes for the same index: the harness
+//! compares the two files entry by entry.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use indexmap::{IndexMap, IndexSet};
 
-use crate::fsutil::{join, readdir_safe, stat_safe, write_atomic_0600};
+use crate::fsutil::{join, readdir_safe, release_freed_memory, stat_safe, write_atomic_0600};
 use crate::home::{homedir, hx_dir};
-use crate::js::{js, trim, JsStr};
-use crate::json::{obj, Json, OMap};
+use crate::js::JsStr;
+use crate::jscan::{Scanner, Val};
+use crate::json::write_num;
+use crate::wtf8;
 
 pub const CCD_REFRESH_TTL_MS: f64 = 20_000.0;
 pub const CCD_FULL_STAT_INTERVAL_MS: f64 = 60_000.0;
 pub const CCD_INDEX_SAVE_INTERVAL_MS: f64 = 10.0 * 60_000.0;
-const CCD_INDEX_FORMAT: f64 = 1.0;
 
 /// Claude Desktop's per-user data directory, where it ships: under
 /// `~/Library/Application Support` on macOS and %APPDATA% (Roaming) on
@@ -61,103 +75,611 @@ pub fn ccd_leveldb_dir() -> Option<String> {
     ccd_app_dir().map(|r| join(&join(&r, "Local Storage"), "leveldb"))
 }
 
-#[derive(Clone, Debug)]
+// ── Ids ─────────────────────────────────────────────────────────────────────
+
+/// A canonical UUID — 8-4-4-4-12 lowercase hex digits, the way Claude Desktop
+/// and Claude Code write every session id — as its 16 bytes. Only that one
+/// spelling is packed, so unpacking gives the same text back, two packed ids
+/// are equal exactly when their texts are, and they order as their texts do
+/// (a lowercase hex digit sorts as its value).
+type Uuid = [u8; 16];
+
+const SESSION_PREFIX: &[u8] = b"local_";
+const SESSION_SUFFIX: &[u8] = b".json";
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn parse_uuid(b: &[u8]) -> Option<Uuid> {
+    if b.len() != 36 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    let (mut i, mut j) = (0, 0);
+    while i < 36 {
+        if i == 8 || i == 13 || i == 18 || i == 23 {
+            if b[i] != b'-' {
+                return None;
+            }
+            i += 1;
+            continue;
+        }
+        out[j] = (hex_digit(b[i])? << 4) | hex_digit(b[i + 1])?;
+        i += 2;
+        j += 1;
+    }
+    Some(out)
+}
+
+fn push_uuid(out: &mut Vec<u8>, u: &Uuid) {
+    for (k, byte) in u.iter().enumerate() {
+        if k == 4 || k == 6 || k == 8 || k == 10 {
+            out.push(b'-');
+        }
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 0xF) as usize]);
+    }
+}
+
+fn uuid_text(u: &Uuid) -> [u8; 36] {
+    let mut v = Vec::with_capacity(36);
+    push_uuid(&mut v, u);
+    let mut out = [0u8; 36];
+    out.copy_from_slice(&v);
+    out
+}
+
+/// An id as the index compares it: packed when it is a canonical UUID (with
+/// the `local_` prefix for a Claude Desktop id), else its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IdKey<'a> {
+    Uuid(Uuid),
+    Text(&'a [u8]),
+}
+
+/// The key of a `ccdSessionId` text.
+pub fn ccd_id_key(b: &[u8]) -> IdKey<'_> {
+    if b.len() == SESSION_PREFIX.len() + 36 && b.starts_with(SESSION_PREFIX) {
+        if let Some(u) = parse_uuid(&b[SESSION_PREFIX.len()..]) {
+            return IdKey::Uuid(u);
+        }
+    }
+    IdKey::Text(b)
+}
+
+/// The key of a `cliSessionId` text.
+fn cli_id_key(b: &[u8]) -> IdKey<'_> {
+    match parse_uuid(b) {
+        Some(u) => IdKey::Uuid(u),
+        None => IdKey::Text(b),
+    }
+}
+
+/// Two cli-id keys in the order of their texts.
+fn cmp_cli(a: &IdKey<'_>, b: &IdKey<'_>) -> std::cmp::Ordering {
+    match (a, b) {
+        (IdKey::Uuid(x), IdKey::Uuid(y)) => x.cmp(y),
+        (IdKey::Text(x), IdKey::Text(y)) => x.cmp(y),
+        (IdKey::Uuid(x), IdKey::Text(y)) => uuid_text(x)[..].cmp(*y),
+        (IdKey::Text(x), IdKey::Uuid(y)) => (*x).cmp(&uuid_text(y)[..]),
+    }
+}
+
+// ── Records ─────────────────────────────────────────────────────────────────
+
+const HAS_CLI: u8 = 1;
+const HAS_TITLE: u8 = 2;
+const ARCHIVED: u8 = 4;
+const SOURCE_USER: u8 = 8;
+const SOURCE_AI: u8 = 16;
+/// `ccdSessionId` is `local_` and a canonical UUID, held as its 16 bytes.
+const CCD_PACKED: u8 = 32;
+/// `cliSessionId` is a canonical UUID, held as its 16 bytes.
+const CLI_PACKED: u8 = 64;
+
+/// One session's metadata (`CcdSessionMeta` in ccd.ts): `ccdSessionId`,
+/// `cliSessionId` and `title` one after another in one WTF-8 buffer, each
+/// id packed to 16 bytes when it is a canonical UUID, so a record costs one
+/// small allocation for its text.
+#[derive(Debug)]
 pub struct CcdSessionMeta {
-    pub ccd_session_id: String,
-    pub cli_session_id: Option<String>,
-    pub title: Option<JsStr>,
-    /// "user" | "ai"
-    pub title_source: Option<&'static str>,
-    pub is_archived: bool,
-    pub last_activity_at: f64,
+    text: Box<[u8]>,
+    cli_at: u32,
+    title_at: u32,
+    flags: u8,
+    last_activity_at: f64,
 }
 
 impl CcdSessionMeta {
-    fn to_json(&self) -> Json {
-        obj(vec![
-            ("ccdSessionId", Json::str(&self.ccd_session_id)),
-            ("cliSessionId", Json::opt_str(self.cli_session_id.as_deref())),
-            ("title", match &self.title {
-                Some(t) => Json::Str(t.clone()),
-                None => Json::Null,
-            }),
-            ("titleSource", Json::opt_str(self.title_source)),
-            ("isArchived", Json::Bool(self.is_archived)),
-            ("lastActivityAt", Json::num(self.last_activity_at)),
-        ])
+    fn new(ccd: &[u8], cli: Option<&[u8]>, title: Option<&[u8]>, title_source: Option<&'static str>, is_archived: bool, last_activity_at: f64) -> Self {
+        let mut flags = 0u8;
+        let ccd_key = ccd_id_key(ccd);
+        let cli_key = cli.map(cli_id_key);
+        let len_of = |k: &IdKey<'_>| match k {
+            IdKey::Uuid(_) => 16,
+            IdKey::Text(t) => t.len(),
+        };
+        let mut text = Vec::with_capacity(len_of(&ccd_key) + cli_key.as_ref().map_or(0, len_of) + title.map_or(0, |t| t.len()));
+        match ccd_key {
+            IdKey::Uuid(u) => {
+                text.extend_from_slice(&u);
+                flags |= CCD_PACKED;
+            }
+            IdKey::Text(t) => text.extend_from_slice(t),
+        }
+        let cli_at = text.len() as u32;
+        if let Some(k) = cli_key {
+            flags |= HAS_CLI;
+            match k {
+                IdKey::Uuid(u) => {
+                    text.extend_from_slice(&u);
+                    flags |= CLI_PACKED;
+                }
+                IdKey::Text(t) => text.extend_from_slice(t),
+            }
+        }
+        let title_at = text.len() as u32;
+        if let Some(t) = title {
+            text.extend_from_slice(t);
+            flags |= HAS_TITLE;
+        }
+        if is_archived {
+            flags |= ARCHIVED;
+        }
+        match title_source {
+            Some("user") => flags |= SOURCE_USER,
+            Some("ai") => flags |= SOURCE_AI,
+            _ => {}
+        }
+        CcdSessionMeta { text: text.into_boxed_slice(), cli_at, title_at, flags, last_activity_at }
     }
 
-    /// A saved record: `ccdSessionId` a string and `cliSessionId` null or a string.
-    fn from_saved(v: &Json) -> Option<CcdSessionMeta> {
-        if v.as_obj().is_none() {
+    fn packed(b: &[u8]) -> Uuid {
+        let mut u = [0u8; 16];
+        u.copy_from_slice(b);
+        u
+    }
+
+    /// The key of `ccdSessionId`, without unpacking it.
+    pub fn ccd_key(&self) -> IdKey<'_> {
+        let raw = &self.text[..self.cli_at as usize];
+        if self.flags & CCD_PACKED != 0 {
+            IdKey::Uuid(Self::packed(raw))
+        } else {
+            IdKey::Text(raw)
+        }
+    }
+
+    /// The key of `cliSessionId`, without unpacking it; None for null.
+    fn cli_key(&self) -> Option<IdKey<'_>> {
+        if self.flags & HAS_CLI == 0 {
             return None;
         }
-        let ccd_session_id = v.get_string("ccdSessionId")?;
-        let cli_session_id = match v.get("cliSessionId") {
-            Some(Json::Null) => None,
-            Some(Json::Str(s)) => Some(crate::js::lossy(s)),
-            _ => return None,
-        };
-        Some(CcdSessionMeta {
-            ccd_session_id,
-            cli_session_id,
-            title: match v.get("title") {
-                Some(Json::Str(s)) => Some(s.clone()),
-                _ => None,
-            },
-            title_source: match v.get_string("titleSource").as_deref() {
-                Some("user") => Some("user"),
-                Some("ai") => Some("ai"),
-                _ => None,
-            },
-            is_archived: matches!(v.get("isArchived"), Some(Json::Bool(true))),
-            last_activity_at: v.get_f64("lastActivityAt").unwrap_or(0.0),
+        let raw = &self.text[self.cli_at as usize..self.title_at as usize];
+        Some(if self.flags & CLI_PACKED != 0 { IdKey::Uuid(Self::packed(raw)) } else { IdKey::Text(raw) })
+    }
+
+    /// `if (r.cliSessionId)`: a cli id that is there and not empty.
+    pub fn has_cli_id(&self) -> bool {
+        match self.cli_key() {
+            Some(IdKey::Uuid(_)) => true,
+            Some(IdKey::Text(t)) => !t.is_empty(),
+            None => false,
+        }
+    }
+
+    /// `ccdSessionId`, WTF-8.
+    pub fn ccd_session_id(&self) -> Cow<'_, [u8]> {
+        match self.ccd_key() {
+            IdKey::Uuid(u) => {
+                let mut v = Vec::with_capacity(SESSION_PREFIX.len() + 36);
+                v.extend_from_slice(SESSION_PREFIX);
+                push_uuid(&mut v, &u);
+                Cow::Owned(v)
+            }
+            IdKey::Text(t) => Cow::Borrowed(t),
+        }
+    }
+
+    /// `cliSessionId`, WTF-8; None for null.
+    pub fn cli_session_id(&self) -> Option<Cow<'_, [u8]>> {
+        Some(match self.cli_key()? {
+            IdKey::Uuid(u) => Cow::Owned(uuid_text(&u).to_vec()),
+            IdKey::Text(t) => Cow::Borrowed(t),
         })
     }
+
+    /// `title`, WTF-8; None for null.
+    pub fn title(&self) -> Option<&[u8]> {
+        if self.flags & HAS_TITLE != 0 {
+            Some(&self.text[self.title_at as usize..])
+        } else {
+            None
+        }
+    }
+
+    /// "user" | "ai"
+    pub fn title_source(&self) -> Option<&'static str> {
+        if self.flags & SOURCE_USER != 0 {
+            Some("user")
+        } else if self.flags & SOURCE_AI != 0 {
+            Some("ai")
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_archived(&self) -> bool {
+        self.flags & ARCHIVED != 0
+    }
+
+    #[allow(dead_code)]
+    pub fn last_activity_at(&self) -> f64 {
+        self.last_activity_at
+    }
+
+    /// The title as the client holds it, in UTF-16 code units.
+    pub fn title_units(&self) -> Option<JsStr> {
+        self.title().map(wtf8::to_units)
+    }
+
+    /// `ccdSessionId` as the client holds it, in UTF-16 code units.
+    pub fn ccd_session_id_units(&self) -> JsStr {
+        wtf8::to_units(&self.ccd_session_id())
+    }
+
+    /// `cliSessionId` as the client holds it, in UTF-16 code units.
+    pub fn cli_session_id_units(&self) -> Option<JsStr> {
+        self.cli_session_id().map(|c| wtf8::to_units(&c))
+    }
+
+    /// The record as `JSON.stringify` writes the client's object.
+    fn write_json(&self, out: &mut String) {
+        out.push_str("{\"ccdSessionId\":");
+        wtf8::write_json(out, &self.ccd_session_id());
+        out.push_str(",\"cliSessionId\":");
+        match self.cli_session_id() {
+            Some(c) => wtf8::write_json(out, &c),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"title\":");
+        match self.title() {
+            Some(t) => wtf8::write_json(out, t),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"titleSource\":");
+        match self.title_source() {
+            Some(s) => {
+                out.push('"');
+                out.push_str(s);
+                out.push('"');
+            }
+            None => out.push_str("null"),
+        }
+        out.push_str(if self.is_archived() { ",\"isArchived\":true" } else { ",\"isArchived\":false" });
+        out.push_str(",\"lastActivityAt\":");
+        write_num(out, self.last_activity_at);
+        out.push('}');
+    }
 }
+
+fn title_source_of(b: &[u8]) -> Option<&'static str> {
+    match b {
+        b"user" => Some("user"),
+        b"ai" => Some("ai"),
+        _ => None,
+    }
+}
+
+/// `readSessionFile`: the record of one session file, or None where the
+/// client's is null (unreadable, not JSON, not an object, no string
+/// `sessionId`). For a key that appears twice the last value counts, as in
+/// `JSON.parse`.
+fn read_session_file(file_path: &str) -> Option<CcdSessionMeta> {
+    let raw = fs::read(file_path).ok()?;
+    session_record(&raw)
+}
+
+fn session_record(raw: &[u8]) -> Option<CcdSessionMeta> {
+    let mut s = Scanner::new(raw);
+    // Anything but an object (a parse error included) is a null record.
+    if s.peek() != Some(b'{') {
+        return None;
+    }
+    let mut fields: [Option<Val>; 6] = Default::default();
+    s.object(|s, key| {
+        let slot = match key {
+            b"sessionId" => 0,
+            b"cliSessionId" => 1,
+            b"title" => 2,
+            b"titleSource" => 3,
+            b"isArchived" => 4,
+            b"lastActivityAt" => 5,
+            _ => return s.skip_value(),
+        };
+        fields[slot] = Some(s.val()?);
+        Ok(())
+    })
+    .ok()?;
+    if !s.at_end() {
+        return None;
+    }
+    let [sid, cli, title, source, archived, last] = fields;
+    let ccd = match sid {
+        Some(Val::Str(b)) => b,
+        _ => return None,
+    };
+    let cli = match cli {
+        Some(Val::Str(b)) => Some(b),
+        _ => None,
+    };
+    // `typeof d.title === "string" && d.title.trim() ? d.title : null`
+    let title = match title {
+        Some(Val::Str(b)) if wtf8::has_non_space(&b) => Some(b),
+        _ => None,
+    };
+    let source = match source {
+        Some(Val::Str(b)) => title_source_of(&b),
+        _ => None,
+    };
+    let last = match last {
+        Some(Val::Num(n)) => n,
+        _ => 0.0,
+    };
+    Some(CcdSessionMeta::new(&ccd, cli.as_deref(), title.as_deref(), source, matches!(archived, Some(Val::Bool(true))), last))
+}
+
+// ── Paths ───────────────────────────────────────────────────────────────────
+
+/// The directory part of a path with no separator in it.
+const NO_DIR: u32 = u32::MAX;
+
+/// The separator `path.join` puts between a directory and a name: the
+/// client builds every path in the index with it, so the saved index holds
+/// `\` on Windows.
+const SEP: u8 = if cfg!(windows) { b'\\' } else { b'/' };
+
+/// A file name in the index: `local_<uuid>.json` with a canonical UUID
+/// packed to its 16 bytes, any other name as its WTF-8 text, shared between
+/// the index and its directory's listing (a saved index can name any string).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Name {
+    Session(Uuid),
+    Other(Arc<[u8]>),
+}
+
+impl Name {
+    fn of(b: &[u8]) -> Name {
+        let n = SESSION_PREFIX.len();
+        if b.len() == n + 36 + SESSION_SUFFIX.len() && b.starts_with(SESSION_PREFIX) && b.ends_with(SESSION_SUFFIX) {
+            if let Some(u) = parse_uuid(&b[n..n + 36]) {
+                return Name::Session(u);
+            }
+        }
+        Name::Other(Arc::from(b))
+    }
+
+    fn push_to(&self, out: &mut Vec<u8>) {
+        match self {
+            Name::Session(u) => {
+                out.extend_from_slice(SESSION_PREFIX);
+                push_uuid(out, u);
+                out.extend_from_slice(SESSION_SUFFIX);
+            }
+            Name::Other(b) => out.extend_from_slice(b),
+        }
+    }
+}
+
+/// A path in the index: its directory, interned (a store has a handful),
+/// and its file name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PathKey {
+    dir: u32,
+    name: Name,
+}
+
+/// Every directory a path in the index has named, by number.
+#[derive(Default)]
+struct DirTable {
+    dirs: IndexSet<Box<[u8]>>,
+}
+
+impl DirTable {
+    fn intern(&mut self, d: &[u8]) -> u32 {
+        if let Some(i) = self.dirs.get_index_of(d) {
+            return i as u32;
+        }
+        self.dirs.insert_full(Box::from(d)).0 as u32
+    }
+
+    fn get(&self, id: u32) -> &[u8] {
+        &self.dirs[id as usize]
+    }
+
+    /// A whole path, split at its last separator.
+    fn split(&mut self, full: &[u8]) -> PathKey {
+        match full.iter().rposition(|&c| c == SEP) {
+            Some(at) => PathKey { dir: self.intern(&full[..at]), name: Name::of(&full[at + 1..]) },
+            None => PathKey { dir: NO_DIR, name: Name::of(full) },
+        }
+    }
+
+    /// The whole path, WTF-8.
+    fn path_bytes(&self, k: &PathKey, out: &mut Vec<u8>) {
+        out.clear();
+        if k.dir != NO_DIR {
+            out.extend_from_slice(self.get(k.dir));
+            out.push(SEP);
+        }
+        k.name.push_to(out);
+    }
+
+    /// The path as the operating system is handed it.
+    fn path_string(&self, k: &PathKey) -> String {
+        let mut b = Vec::new();
+        self.path_bytes(k, &mut b);
+        wtf8::lossy(&b).into_owned()
+    }
+
+    /// The path as `JSON.stringify` writes it; `scratch` is a buffer to reuse.
+    fn write_json(&self, out: &mut String, k: &PathKey, scratch: &mut Vec<u8>) {
+        self.path_bytes(k, scratch);
+        wtf8::write_json(out, scratch);
+    }
+}
+
+// ── The saved file's bytes ──────────────────────────────────────────────────
+
+/// The saved index's bytes for one parse. Where the platform can, they are
+/// the file mapped read-only: its tens of megabytes on a long-lived machine
+/// are then the file's own clean pages, gone the moment the map is, never a
+/// heap buffer the allocator may keep after the load. hx and hx2 replace the
+/// file by writing a temporary one and renaming it, never in place, so the
+/// mapped file cannot shrink under the parse.
+enum SavedBytes {
+    #[cfg(unix)]
+    Mapped { ptr: *mut libc::c_void, len: usize },
+    Read(Vec<u8>),
+}
+
+impl SavedBytes {
+    fn open(path: &Path) -> Option<SavedBytes> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Ok(f) = fs::File::open(path) {
+                if let Ok(m) = f.metadata() {
+                    let len = m.len() as usize;
+                    if m.is_file() && len > 0 {
+                        // SAFETY: a fresh read-only private mapping of an open
+                        // file; unmapped once, in drop.
+                        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+                        if ptr != libc::MAP_FAILED {
+                            return Some(SavedBytes::Mapped { ptr, len });
+                        }
+                    }
+                }
+            }
+        }
+        fs::read(path).ok().map(SavedBytes::Read)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            #[cfg(unix)]
+            // SAFETY: the mapping is `len` readable bytes until drop.
+            SavedBytes::Mapped { ptr, len } => unsafe { std::slice::from_raw_parts(*ptr as *const u8, *len) },
+            SavedBytes::Read(v) => v.as_slice(),
+        }
+    }
+}
+
+impl Drop for SavedBytes {
+    fn drop(&mut self) {
+        match self {
+            #[cfg(unix)]
+            // SAFETY: the mapping made in open, unmapped once.
+            SavedBytes::Mapped { ptr, len } => unsafe {
+                libc::munmap(*ptr, *len);
+            },
+            SavedBytes::Read(_) => {}
+        }
+    }
+}
+
+// ── The index ───────────────────────────────────────────────────────────────
 
 struct IndexedFile {
     size: f64,
     mtime_ms: f64,
-    record: Option<CcdSessionMeta>,
+    record: Option<Arc<CcdSessionMeta>>,
 }
 
 struct OrgDirListing {
     mtime_ms: f64,
-    files: Vec<String>,
+    /// The `local_*.json` files present at `mtime_ms`.
+    files: Vec<PathKey>,
+}
+
+/// `cliSessionId` → record, as the client's Map from `getCcdRecentsByCliId`
+/// holds it: a record without a cli id, or with an empty one, is not in it,
+/// and the last record with an id wins. Sorted by the id (a stable sort, so
+/// that last record stays last among its equals).
+pub struct CcdByCli {
+    sorted: Vec<Arc<CcdSessionMeta>>,
+}
+
+impl CcdByCli {
+    fn build(records: &[Arc<CcdSessionMeta>]) -> CcdByCli {
+        let mut sorted: Vec<Arc<CcdSessionMeta>> = records.iter().filter(|r| r.has_cli_id()).cloned().collect();
+        sorted.sort_by(|a, b| match (a.cli_key(), b.cli_key()) {
+            (Some(x), Some(y)) => cmp_cli(&x, &y),
+            _ => std::cmp::Ordering::Equal,
+        });
+        CcdByCli { sorted }
+    }
+
+    /// The record for a CLI session id.
+    pub fn get(&self, cli: &str) -> Option<&Arc<CcdSessionMeta>> {
+        let q = cli_id_key(cli.as_bytes());
+        let end = self.sorted.partition_point(|r| r.cli_key().map_or(true, |k| cmp_cli(&k, &q) != std::cmp::Ordering::Greater));
+        let r = self.sorted.get(end.checked_sub(1)?)?;
+        if r.cli_key().map_or(false, |k| cmp_cli(&k, &q) == std::cmp::Ordering::Equal) {
+            Some(r)
+        } else {
+            None
+        }
+    }
 }
 
 struct CcdIndex {
     dir: Option<String>,
-    index: IndexMap<String, IndexedFile>,
-    org_dirs: IndexMap<String, OrgDirListing>,
-    records: Arc<Vec<CcdSessionMeta>>,
+    paths: DirTable,
+    index: IndexMap<PathKey, IndexedFile>,
+    /// Keyed by the org directory's number in `paths`.
+    org_dirs: IndexMap<u32, OrgDirListing>,
+    records: Arc<Vec<Arc<CcdSessionMeta>>>,
     version: u64,
     last_refresh_ms: f64,
     last_full_stat_ms: f64,
-    by_cli: Option<(u64, Arc<HashMap<String, CcdSessionMeta>>)>,
+    by_cli: Option<(u64, Arc<CcdByCli>)>,
     load_done: bool,
     saved_version: u64,
     last_save_ms: f64,
+    /// The saved file's size, to size the next save's buffer.
+    last_save_len: usize,
 }
 
-fn index() -> &'static Mutex<CcdIndex> {
+fn global() -> MutexGuard<'static, CcdIndex> {
     static INDEX: OnceLock<Mutex<CcdIndex>> = OnceLock::new();
-    INDEX.get_or_init(|| {
-        Mutex::new(CcdIndex {
-            dir: ccd_sessions_dir(),
-            index: IndexMap::new(),
-            org_dirs: IndexMap::new(),
-            records: Arc::new(Vec::new()),
-            version: 0,
-            last_refresh_ms: f64::NEG_INFINITY,
-            last_full_stat_ms: f64::NEG_INFINITY,
-            by_cli: None,
-            load_done: false,
-            saved_version: 0,
-            last_save_ms: f64::NEG_INFINITY,
+    INDEX
+        .get_or_init(|| {
+            Mutex::new(CcdIndex {
+                dir: ccd_sessions_dir(),
+                paths: DirTable::default(),
+                index: IndexMap::new(),
+                org_dirs: IndexMap::new(),
+                records: Arc::new(Vec::new()),
+                version: 0,
+                last_refresh_ms: f64::NEG_INFINITY,
+                last_full_stat_ms: f64::NEG_INFINITY,
+                by_cli: None,
+                load_done: false,
+                saved_version: 0,
+                last_save_ms: f64::NEG_INFINITY,
+                last_save_len: 0,
+            })
         })
-    })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn is_session_file(name: &str) -> bool {
@@ -186,31 +708,6 @@ fn list_org_dirs(dir: &str) -> Vec<String> {
     out
 }
 
-fn read_session_file(file_path: &str) -> Option<CcdSessionMeta> {
-    let raw = fs::read(file_path).ok()?;
-    let d = Json::parse(&String::from_utf8_lossy(&raw)).ok()?;
-    if d.as_obj().is_none() {
-        return None;
-    }
-    let ccd_session_id = d.get_string("sessionId")?;
-    let title = match d.get("title") {
-        Some(Json::Str(s)) if !trim(s).is_empty() => Some(s.clone()),
-        _ => None,
-    };
-    Some(CcdSessionMeta {
-        ccd_session_id,
-        cli_session_id: d.get_string("cliSessionId"),
-        title,
-        title_source: match d.get_string("titleSource").as_deref() {
-            Some("user") => Some("user"),
-            Some("ai") => Some("ai"),
-            _ => None,
-        },
-        is_archived: matches!(d.get("isArchived"), Some(Json::Bool(true))),
-        last_activity_at: d.get_f64("lastActivityAt").unwrap_or(0.0),
-    })
-}
-
 impl CcdIndex {
     fn reset(&mut self) {
         self.index.clear();
@@ -220,7 +717,7 @@ impl CcdIndex {
     }
 
     fn rebuild_records(&mut self) {
-        let next: Vec<CcdSessionMeta> = self.index.values().filter_map(|e| e.record.clone()).collect();
+        let next: Vec<Arc<CcdSessionMeta>> = self.index.values().filter_map(|e| e.record.clone()).collect();
         self.records = Arc::new(next);
     }
 
@@ -238,52 +735,38 @@ impl CcdIndex {
             (Some(f), Some(d)) => (f, d),
             _ => return,
         };
-        let raw = match fs::read(&file) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        let saved = match Json::parse(&String::from_utf8_lossy(&raw)) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        if saved.get_f64("v") != Some(CCD_INDEX_FORMAT) {
-            return;
-        }
-        let dirs = match saved.get("dirs").and_then(|d| d.as_obj()) {
-            Some(d) => d.clone(),
+        let bytes = match SavedBytes::open(&file) {
+            Some(b) => b,
             None => return,
         };
-        let files = match saved.get("files").and_then(|f| f.as_obj()) {
-            Some(f) => f.clone(),
-            None => return,
-        };
-        let under = format!("{}{}", dir, crate::fsutil::SEP);
-        for (d, listing) in dirs.iter() {
-            if !d.starts_with(&under) {
-                continue;
-            }
-            let mtime = match listing.get_f64("mtimeMs") {
-                Some(m) => m,
-                None => continue,
-            };
-            let list = match listing.get("files").and_then(|f| f.as_arr()) {
-                Some(l) => l,
-                None => continue,
-            };
-            let names: Vec<String> = list.iter().filter_map(|f| f.as_string()).collect();
-            self.org_dirs.insert(d.clone(), OrgDirListing { mtime_ms: mtime, files: names });
+        let under = format!("{}{}", dir, SEP as char);
+        let saved = parse_saved_index(bytes.bytes(), under.as_bytes(), &mut self.paths);
+        let len = bytes.bytes().len();
+        drop(bytes);
+        if let Some(saved) = saved {
+            self.adopt_saved(saved, len);
         }
-        for (p, f) in files.iter() {
-            if !p.starts_with(&under) {
-                continue;
+        // The load's scratch — the parse's maps, the strings it decoded —
+        // goes back to the system now, not whenever the allocator gets to it.
+        release_freed_memory();
+    }
+
+    /// The parsed saved index as this process's index. The maps are empty
+    /// here: the load comes before the first refresh.
+    fn adopt_saved(&mut self, saved: SavedIndex, len: usize) {
+        for (id, listing) in saved.dirs {
+            if let Some(l) = listing {
+                self.org_dirs.insert(id, l);
             }
-            let (size, mtime) = match (f.get_f64("size"), f.get_f64("mtimeMs")) {
-                (Some(s), Some(m)) => (s, m),
-                _ => continue,
-            };
-            let record = f.get("record").and_then(CcdSessionMeta::from_saved);
-            self.index.insert(p.clone(), IndexedFile { size, mtime_ms: mtime, record });
         }
+        let n = saved.files.values().filter(|f| f.is_some()).count();
+        let mut index: IndexMap<PathKey, IndexedFile> = IndexMap::with_capacity(n);
+        for (p, f) in saved.files {
+            if let Some(f) = f {
+                index.insert(p, f);
+            }
+        }
+        self.index = index;
         if self.index.is_empty() && self.org_dirs.is_empty() {
             return;
         }
@@ -291,6 +774,7 @@ impl CcdIndex {
         self.version = 1;
         self.saved_version = 1;
         self.last_full_stat_ms = f64::NEG_INFINITY;
+        self.last_save_len = len;
     }
 
     fn refresh_now(&mut self, now_ms: f64, full_stat: bool) {
@@ -307,77 +791,89 @@ impl CcdIndex {
         };
         let mut changed = false;
         let dirs = list_org_dirs(&dir);
-        let seen: IndexSet<String> = dirs.iter().cloned().collect();
-        let mut to_stat: IndexSet<String> = IndexSet::new();
+        let mut seen: HashSet<u32> = HashSet::with_capacity(dirs.len());
+        let mut to_stat: IndexSet<PathKey> = IndexSet::new();
+        // Paths the directory pass drops, taken out of the index in one sweep
+        // before the file pass (the client deletes them as it goes; nothing
+        // between the two passes reads the index).
+        let mut gone: HashSet<PathKey> = HashSet::new();
         for d in &dirs {
-            let st = stat_safe(Path::new(d));
-            let known_mtime = self.org_dirs.get(d).map(|k| k.mtime_ms);
-            match st {
+            let id = self.paths.intern(d.as_bytes());
+            seen.insert(id);
+            match stat_safe(Path::new(d)) {
                 Some(s) if s.is_dir => {
-                    if let Some(km) = known_mtime {
-                        if km == s.mtime_ms {
+                    if let Some(k) = self.org_dirs.get(&id) {
+                        if k.mtime_ms == s.mtime_ms {
                             if full_stat {
-                                if let Some(k) = self.org_dirs.get(d) {
-                                    for p in &k.files {
-                                        to_stat.insert(p.clone());
-                                    }
+                                for p in &k.files {
+                                    to_stat.insert(p.clone());
                                 }
                             }
                             continue;
                         }
                     }
-                    let present: Vec<String> = readdir_safe(Path::new(d)).into_iter().filter(|f| is_session_file(f)).map(|f| join(d, &f)).collect();
-                    if let Some(k) = self.org_dirs.get(d) {
-                        let gone: Vec<String> = k.files.iter().filter(|p| !present.contains(p)).cloned().collect();
-                        for p in gone {
-                            if self.index.shift_remove(&p).is_some() {
-                                changed = true;
+                    let mut present: Vec<PathKey> = readdir_safe(Path::new(d)).into_iter().filter(|f| is_session_file(f)).map(|f| PathKey { dir: id, name: Name::of(f.as_bytes()) }).collect();
+                    present.shrink_to_fit();
+                    if let Some(k) = self.org_dirs.get(&id) {
+                        let present_set: HashSet<&PathKey> = present.iter().collect();
+                        for p in &k.files {
+                            if !present_set.contains(p) {
+                                gone.insert(p.clone());
                             }
                         }
                     }
-                    self.org_dirs.insert(d.clone(), OrgDirListing { mtime_ms: s.mtime_ms, files: present.clone() });
-                    for p in present {
-                        to_stat.insert(p);
+                    for p in &present {
+                        to_stat.insert(p.clone());
                     }
+                    self.org_dirs.insert(id, OrgDirListing { mtime_ms: s.mtime_ms, files: present });
                 }
                 _ => {
-                    if let Some(k) = self.org_dirs.shift_remove(d) {
-                        for p in &k.files {
-                            if self.index.shift_remove(p).is_some() {
-                                changed = true;
-                            }
-                        }
+                    if let Some(k) = self.org_dirs.shift_remove(&id) {
+                        gone.extend(k.files);
                     }
                 }
             }
         }
-        let vanished: Vec<String> = self.org_dirs.keys().filter(|d| !seen.contains(*d)).cloned().collect();
+        // An account or org dir that vanished takes its files with it.
+        let vanished: Vec<u32> = self.org_dirs.keys().copied().filter(|d| !seen.contains(d)).collect();
         for d in vanished {
             if let Some(k) = self.org_dirs.shift_remove(&d) {
-                for p in &k.files {
-                    if self.index.shift_remove(p).is_some() {
-                        changed = true;
-                    }
-                }
+                gone.extend(k.files);
             }
         }
+        if !gone.is_empty() {
+            let before = self.index.len();
+            self.index.retain(|k, _| !gone.contains(k));
+            if self.index.len() != before {
+                changed = true;
+            }
+        }
+        let mut missing: HashSet<PathKey> = HashSet::new();
         for p in to_stat {
-            match stat_safe(Path::new(&p)) {
+            let full = self.paths.path_string(&p);
+            match stat_safe(Path::new(&full)) {
                 Some(s) if !s.is_dir => {
-                    let same = self.index.get(&p).map(|k| k.size == s.size as f64 && k.mtime_ms == s.mtime_ms).unwrap_or(false);
-                    if same {
-                        continue;
+                    let size = s.size as f64;
+                    if let Some(k) = self.index.get(&p) {
+                        if k.size == size && k.mtime_ms == s.mtime_ms {
+                            continue;
+                        }
                     }
-                    let record = read_session_file(&p);
-                    self.index.insert(p.clone(), IndexedFile { size: s.size as f64, mtime_ms: s.mtime_ms, record });
+                    let record = read_session_file(&full).map(Arc::new);
+                    // An existing path keeps its place, as in a JavaScript Map.
+                    self.index.insert(p, IndexedFile { size, mtime_ms: s.mtime_ms, record });
                     changed = true;
                 }
                 _ => {
-                    if self.index.shift_remove(&p).is_some() {
+                    if self.index.contains_key(&p) {
+                        missing.insert(p);
                         changed = true;
                     }
                 }
             }
+        }
+        if !missing.is_empty() {
+            self.index.retain(|k, _| !missing.contains(k));
         }
         if full_stat {
             self.last_full_stat_ms = now_ms;
@@ -399,57 +895,281 @@ impl CcdIndex {
         self.version
     }
 
-    fn saved_json(&self, now_ms: f64) -> Json {
-        let mut dirs = OMap::with_capacity(self.org_dirs.len());
-        for (d, listing) in &self.org_dirs {
-            dirs.set(d, obj(vec![("mtimeMs", Json::num(listing.mtime_ms)), ("files", Json::Arr(listing.files.iter().map(|f| Json::str(f)).collect()))]));
+    /// The saved index's text: `JSON.stringify({ v, savedAtMs, dirs, files })`
+    /// of the client's maps, written in one pass.
+    fn saved_text(&self, now_ms: f64) -> String {
+        let mut out = String::with_capacity(self.last_save_len + self.last_save_len / 16 + 4096);
+        let mut scratch: Vec<u8> = Vec::new();
+        out.push_str("{\"v\":1,\"savedAtMs\":");
+        write_num(&mut out, now_ms);
+        out.push_str(",\"dirs\":{");
+        for (i, (id, listing)) in self.org_dirs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            wtf8::write_json(&mut out, self.paths.get(*id));
+            out.push_str(":{\"mtimeMs\":");
+            write_num(&mut out, listing.mtime_ms);
+            out.push_str(",\"files\":[");
+            for (j, p) in listing.files.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                self.paths.write_json(&mut out, p, &mut scratch);
+            }
+            out.push_str("]}");
         }
-        let mut files = OMap::with_capacity(self.index.len());
-        for (p, f) in &self.index {
-            files.set(
-                p,
-                obj(vec![
-                    ("size", Json::num(f.size)),
-                    ("mtimeMs", Json::num(f.mtime_ms)),
-                    ("record", match &f.record {
-                        Some(r) => r.to_json(),
-                        None => Json::Null,
-                    }),
-                ]),
-            );
+        out.push_str("},\"files\":{");
+        for (i, (p, f)) in self.index.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            self.paths.write_json(&mut out, p, &mut scratch);
+            out.push_str(":{\"size\":");
+            write_num(&mut out, f.size);
+            out.push_str(",\"mtimeMs\":");
+            write_num(&mut out, f.mtime_ms);
+            out.push_str(",\"record\":");
+            match &f.record {
+                Some(r) => r.write_json(&mut out),
+                None => out.push_str("null"),
+            }
+            out.push('}');
         }
-        obj(vec![("v", Json::num(CCD_INDEX_FORMAT)), ("savedAtMs", Json::num(now_ms)), ("dirs", Json::Obj(dirs)), ("files", Json::Obj(files))])
+        out.push_str("}}");
+        out
     }
 }
 
+// ── The saved index, read ───────────────────────────────────────────────────
+
+/// What `loadSavedIndex` takes from a saved file: every entry under the
+/// store in the file's order, first place and last value for a path that
+/// appears twice (as an object `JSON.parse` builds), None where the client
+/// skips the entry.
+struct SavedIndex {
+    dirs: IndexMap<u32, Option<OrgDirListing>>,
+    files: IndexMap<PathKey, Option<IndexedFile>>,
+}
+
+/// None where the client takes nothing from the file: not JSON, `v` not 1,
+/// or `dirs` or `files` not objects (an array passes `typeof`, and gives no
+/// entry under the store).
+fn parse_saved_index(raw: &[u8], under: &[u8], paths: &mut DirTable) -> Option<SavedIndex> {
+    let mut s = Scanner::new(raw);
+    if s.peek() != Some(b'{') {
+        return None;
+    }
+    let mut v_is_one = false;
+    let mut dirs: Option<IndexMap<u32, Option<OrgDirListing>>> = None;
+    let mut files: Option<IndexMap<PathKey, Option<IndexedFile>>> = None;
+    s.object(|s, key| match key {
+        b"v" => {
+            v_is_one = matches!(s.val()?, Val::Num(n) if n == 1.0);
+            Ok(())
+        }
+        b"dirs" => {
+            dirs = saved_dirs(s, under, paths)?;
+            Ok(())
+        }
+        b"files" => {
+            // A saved entry is a few hundred bytes: size the map once.
+            files = saved_files(s, under, paths, raw.len() / 512)?;
+            Ok(())
+        }
+        _ => s.skip_value(),
+    })
+    .ok()?;
+    if !s.at_end() || !v_is_one {
+        return None;
+    }
+    Some(SavedIndex { dirs: dirs?, files: files? })
+}
+
+/// An object's or an array's entries under the store; None for any other value.
+fn saved_dirs(s: &mut Scanner<'_>, under: &[u8], paths: &mut DirTable) -> Result<Option<IndexMap<u32, Option<OrgDirListing>>>, ()> {
+    match s.peek() {
+        Some(b'{') => {}
+        Some(b'[') => return s.skip_value().map(|_| Some(IndexMap::new())),
+        _ => return s.skip_value().map(|_| None),
+    }
+    let mut out: IndexMap<u32, Option<OrgDirListing>> = IndexMap::new();
+    s.object(|s, key| {
+        if !key.starts_with(under) {
+            return s.skip_value();
+        }
+        let listing = saved_listing(s, paths)?;
+        out.insert(paths.intern(key), listing);
+        Ok(())
+    })?;
+    Ok(Some(out))
+}
+
+/// `{ mtimeMs: number, files: array }`, the array's strings kept.
+fn saved_listing(s: &mut Scanner<'_>, paths: &mut DirTable) -> Result<Option<OrgDirListing>, ()> {
+    if s.peek() != Some(b'{') {
+        return s.skip_value().map(|_| None);
+    }
+    let mut mtime: Option<f64> = None;
+    let mut files: Option<Vec<PathKey>> = None;
+    s.object(|s, key| match key {
+        b"mtimeMs" => {
+            mtime = match s.val()? {
+                Val::Num(n) => Some(n),
+                _ => None,
+            };
+            Ok(())
+        }
+        b"files" => {
+            if s.peek() != Some(b'[') {
+                files = None;
+                return s.skip_value();
+            }
+            let mut list: Vec<PathKey> = Vec::new();
+            let mut buf: Vec<u8> = Vec::new();
+            s.array(|s| {
+                if s.peek() != Some(b'"') {
+                    return s.skip_value();
+                }
+                buf.clear();
+                s.string_into(&mut buf)?;
+                list.push(paths.split(&buf));
+                Ok(())
+            })?;
+            list.shrink_to_fit();
+            files = Some(list);
+            Ok(())
+        }
+        _ => s.skip_value(),
+    })?;
+    Ok(match (mtime, files) {
+        (Some(mtime_ms), Some(files)) => Some(OrgDirListing { mtime_ms, files }),
+        _ => None,
+    })
+}
+
+fn saved_files(s: &mut Scanner<'_>, under: &[u8], paths: &mut DirTable, capacity: usize) -> Result<Option<IndexMap<PathKey, Option<IndexedFile>>>, ()> {
+    match s.peek() {
+        Some(b'{') => {}
+        Some(b'[') => return s.skip_value().map(|_| Some(IndexMap::new())),
+        _ => return s.skip_value().map(|_| None),
+    }
+    let mut out: IndexMap<PathKey, Option<IndexedFile>> = IndexMap::with_capacity(capacity);
+    s.object(|s, key| {
+        if !key.starts_with(under) {
+            return s.skip_value();
+        }
+        let entry = saved_file(s)?;
+        out.insert(paths.split(key), entry);
+        Ok(())
+    })?;
+    Ok(Some(out))
+}
+
+/// `{ size: number, mtimeMs: number, record }`.
+fn saved_file(s: &mut Scanner<'_>) -> Result<Option<IndexedFile>, ()> {
+    if s.peek() != Some(b'{') {
+        return s.skip_value().map(|_| None);
+    }
+    let mut size: Option<f64> = None;
+    let mut mtime: Option<f64> = None;
+    let mut record: Option<CcdSessionMeta> = None;
+    s.object(|s, key| match key {
+        b"size" => {
+            size = match s.val()? {
+                Val::Num(n) => Some(n),
+                _ => None,
+            };
+            Ok(())
+        }
+        b"mtimeMs" => {
+            mtime = match s.val()? {
+                Val::Num(n) => Some(n),
+                _ => None,
+            };
+            Ok(())
+        }
+        b"record" => {
+            record = saved_record(s)?;
+            Ok(())
+        }
+        _ => s.skip_value(),
+    })?;
+    Ok(match (size, mtime) {
+        (Some(size), Some(mtime_ms)) => Some(IndexedFile { size, mtime_ms, record: record.map(Arc::new) }),
+        _ => None,
+    })
+}
+
+/// `isSavedRecord`: an object whose `ccdSessionId` is a string and whose
+/// `cliSessionId` is null or a string, read the way the client writes one.
+fn saved_record(s: &mut Scanner<'_>) -> Result<Option<CcdSessionMeta>, ()> {
+    if s.peek() != Some(b'{') {
+        return s.skip_value().map(|_| None);
+    }
+    let mut fields: [Option<Val>; 6] = Default::default();
+    s.object(|s, key| {
+        let slot = match key {
+            b"ccdSessionId" => 0,
+            b"cliSessionId" => 1,
+            b"title" => 2,
+            b"titleSource" => 3,
+            b"isArchived" => 4,
+            b"lastActivityAt" => 5,
+            _ => return s.skip_value(),
+        };
+        fields[slot] = Some(s.val()?);
+        Ok(())
+    })?;
+    let [ccd, cli, title, source, archived, last] = fields;
+    let ccd = match ccd {
+        Some(Val::Str(b)) => b,
+        _ => return Ok(None),
+    };
+    let cli = match cli {
+        Some(Val::Str(b)) => Some(b),
+        Some(Val::Null) => None,
+        _ => return Ok(None),
+    };
+    let title = match title {
+        Some(Val::Str(b)) => Some(b),
+        _ => None,
+    };
+    let source = match source {
+        Some(Val::Str(b)) => title_source_of(&b),
+        _ => None,
+    };
+    let last = match last {
+        Some(Val::Num(n)) => n,
+        _ => 0.0,
+    };
+    Ok(Some(CcdSessionMeta::new(&ccd, cli.as_deref(), title.as_deref(), source, matches!(archived, Some(Val::Bool(true))), last)))
+}
+
+// ── The API ─────────────────────────────────────────────────────────────────
+
 /// Bring the index up to date if it is older than the TTL (or `force`); returns its version.
 pub fn refresh_ccd_index(now_ms: f64, force: bool) -> u64 {
-    index().lock().unwrap_or_else(|e| e.into_inner()).refresh(now_ms, force)
+    global().refresh(now_ms, force)
 }
 
 /// Every record (archived included), at most CCD_REFRESH_TTL_MS stale.
-pub fn read_ccd_recents_cached(now_ms: f64) -> Arc<Vec<CcdSessionMeta>> {
-    let mut g = index().lock().unwrap_or_else(|e| e.into_inner());
+pub fn read_ccd_recents_cached(now_ms: f64) -> Arc<Vec<Arc<CcdSessionMeta>>> {
+    let mut g = global();
     g.refresh(now_ms, false);
     g.records.clone()
 }
 
 /// cliSessionId → Claude Desktop metadata, rebuilt only when the records changed.
-pub fn get_ccd_recents_by_cli_id(now_ms: f64) -> Arc<HashMap<String, CcdSessionMeta>> {
-    let mut g = index().lock().unwrap_or_else(|e| e.into_inner());
+pub fn get_ccd_recents_by_cli_id(now_ms: f64) -> Arc<CcdByCli> {
+    let mut g = global();
     let version = g.refresh(now_ms, false);
     if let Some((v, map)) = &g.by_cli {
         if *v == version {
             return map.clone();
         }
     }
-    let mut by_cli: HashMap<String, CcdSessionMeta> = HashMap::new();
-    for r in g.records.iter() {
-        if let Some(cli) = &r.cli_session_id {
-            by_cli.insert(cli.clone(), r.clone());
-        }
-    }
-    let map = Arc::new(by_cli);
+    let map = Arc::new(CcdByCli::build(&g.records));
     g.by_cli = Some((version, map.clone()));
     map
 }
@@ -457,7 +1177,7 @@ pub fn get_ccd_recents_by_cli_id(now_ms: f64) -> Arc<HashMap<String, CcdSessionM
 /// Write the index if it changed since the last save; `force` skips the
 /// interval (the daemon's parting flush, the end of a one-shot pass).
 pub fn save_ccd_index_if_changed(now_ms: f64, force: bool) -> bool {
-    let mut g = index().lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = global();
     let file = match (g.index_path(), g.dir.clone()) {
         (Some(f), Some(_)) => f,
         _ => return false,
@@ -471,7 +1191,7 @@ pub fn save_ccd_index_if_changed(now_ms: f64, force: bool) -> bool {
     if g.index.is_empty() && g.org_dirs.is_empty() {
         return false;
     }
-    let text = g.saved_json(now_ms).stringify();
+    let text = g.saved_text(now_ms);
     if let Some(parent) = file.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -480,23 +1200,186 @@ pub fn save_ccd_index_if_changed(now_ms: f64, force: bool) -> bool {
     }
     g.saved_version = g.version;
     g.last_save_ms = now_ms;
+    g.last_save_len = text.len();
     true
-}
-
-/// The title string a Claude Desktop record carries, as text (for logs).
-#[allow(dead_code)]
-pub fn title_text(meta: &CcdSessionMeta) -> Option<String> {
-    meta.title.as_ref().map(|t| crate::js::lossy(t))
-}
-
-#[allow(dead_code)]
-pub fn js_title(s: &str) -> JsStr {
-    js(s)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ccd_app_dir_win32;
+    use super::*;
+
+    /// A test path with the platform's separator, as `path.join` writes it.
+    fn os_path(s: &str) -> String {
+        s.replace('/', &(SEP as char).to_string())
+    }
+
+    /// `os_path` inside JSON text, where a backslash is written escaped.
+    fn os_path_json(s: &str) -> String {
+        if SEP == b'/' {
+            s.to_string()
+        } else {
+            s.replace('/', "\\\\")
+        }
+    }
+
+    fn index_from(text: &str, under: &str) -> CcdIndex {
+        let mut idx = CcdIndex {
+            dir: Some(under.trim_end_matches(SEP as char).to_string()),
+            paths: DirTable::default(),
+            index: IndexMap::new(),
+            org_dirs: IndexMap::new(),
+            records: Arc::new(Vec::new()),
+            version: 0,
+            last_refresh_ms: f64::NEG_INFINITY,
+            last_full_stat_ms: f64::NEG_INFINITY,
+            by_cli: None,
+            load_done: true,
+            saved_version: 0,
+            last_save_ms: f64::NEG_INFINITY,
+            last_save_len: 0,
+        };
+        let saved = parse_saved_index(text.as_bytes(), under.as_bytes(), &mut idx.paths).expect("loads");
+        for (id, l) in saved.dirs {
+            if let Some(l) = l {
+                idx.org_dirs.insert(id, l);
+            }
+        }
+        for (p, f) in saved.files {
+            if let Some(f) = f {
+                idx.index.insert(p, f);
+            }
+        }
+        idx.rebuild_records();
+        idx
+    }
+
+    /// What JSON.stringify writes for the record readSessionFile builds.
+    fn record_json(raw: &str) -> Option<String> {
+        session_record(raw.as_bytes()).map(|r| {
+            let mut s = String::new();
+            r.write_json(&mut s);
+            s
+        })
+    }
+
+    const SAVED: &str = concat!(
+        "{\"v\":1,\"savedAtMs\":1792180673041,\"dirs\":{\"/s/acct/org\":{\"mtimeMs\":1767603780128.4883,\"files\":[\"/s/acct/org/local_b.json\",\"/s/acct/org/local_a.json\"]}},",
+        "\"files\":{\"/s/acct/org/local_a.json\":{\"size\":273,\"mtimeMs\":1767603600104.731,\"record\":{\"ccdSessionId\":\"local_a\",\"cliSessionId\":\"57be05c1\",\"title\":\"Pipeline \\\"review\\\" \\ud83d\\ude00 \\ud800\",\"titleSource\":\"user\",\"isArchived\":false,\"lastActivityAt\":1767607200000}},",
+        "\"/s/acct/org/local_b.json\":{\"size\":280,\"mtimeMs\":1767603660112.65,\"record\":{\"ccdSessionId\":\"local_b\",\"cliSessionId\":null,\"title\":null,\"titleSource\":null,\"isArchived\":true,\"lastActivityAt\":0.5}},",
+        "\"/s/acct/org/local_c.json\":{\"size\":2,\"mtimeMs\":1767603720120.569,\"record\":null}}}"
+    );
+
+    #[test]
+    fn a_saved_index_is_written_back_byte_for_byte() {
+        let saved = os_path_json(SAVED);
+        let idx = index_from(&saved, &os_path("/s/"));
+        // The JSON.stringify of the same object, with this save's clock.
+        let want = saved.replace("\"savedAtMs\":1792180673041", "\"savedAtMs\":1792180679999").replace("\\ud83d\\ude00", "😀");
+        assert_eq!(idx.saved_text(1_792_180_679_999.0), want);
+        assert_eq!(idx.records.len(), 2);
+    }
+
+    #[test]
+    fn loading_follows_the_client_on_odd_files() {
+        let under = os_path("/s/");
+        let mut paths = DirTable::default();
+        for bad in ["", "[]", "null", "{\"v\":2,\"dirs\":{},\"files\":{}}", "{\"v\":1,\"dirs\":{}}", "{\"v\":1,\"dirs\":0,\"files\":{}}", "{\"v\":1,\"dirs\":\"x\",\"files\":{}}", "{\"v\":1,\"dirs\":{},\"files\":{} ", "{\"v\":1,\"dirs\":{},\"files\":{}} x"] {
+            assert!(!parse_saved_index(bad.as_bytes(), under.as_bytes(), &mut paths).map(|s| !s.dirs.is_empty() || !s.files.is_empty()).unwrap_or(false), "{:?}", bad);
+        }
+        assert!(parse_saved_index(b"{\"v\":1,\"dirs\":{},\"files\":{} ", under.as_bytes(), &mut paths).is_none());
+        // Arrays pass `typeof` and give no entries; paths outside the store
+        // and entries of the wrong shape are skipped; the last of a
+        // duplicated path counts, in the first one's place.
+        let text = os_path_json("{\"files\":{\"/s/a/local_1.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/elsewhere/local_2.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/s/a/local_3.json\":{\"size\":\"1\",\"mtimeMs\":2},\"/s/a/local_4.json\":{\"size\":4,\"mtimeMs\":4,\"record\":{\"ccdSessionId\":\"x\"}},\"/s/a/local_1.json\":{\"size\":9,\"mtimeMs\":9,\"record\":{\"ccdSessionId\":\"y\",\"cliSessionId\":null}}},\"dirs\":[],\"v\":1.0}");
+        let saved = parse_saved_index(text.as_bytes(), under.as_bytes(), &mut paths).expect("loads");
+        assert!(saved.dirs.is_empty());
+        let kept: Vec<(String, f64, bool)> = saved.files.iter().filter_map(|(k, v)| v.as_ref().map(|f| (paths.path_string(k), f.size, f.record.is_some()))).collect();
+        assert_eq!(kept, vec![(os_path("/s/a/local_1.json"), 9.0, true), (os_path("/s/a/local_4.json"), 4.0, false)]);
+    }
+
+    #[test]
+    fn a_session_file_reads_as_read_session_file_reads_it() {
+        assert_eq!(
+            record_json("{\"sessionId\":\"local_x\",\"cliSessionId\":\"c\",\"title\":\"T\",\"titleSource\":\"ai\",\"isArchived\":true,\"lastActivityAt\":5,\"cwd\":\"/w\",\"messages\":[{\"a\":[1,2,{}]}]}").as_deref(),
+            Some("{\"ccdSessionId\":\"local_x\",\"cliSessionId\":\"c\",\"title\":\"T\",\"titleSource\":\"ai\",\"isArchived\":true,\"lastActivityAt\":5}")
+        );
+        // Wrong types fall back the way the client's typeof checks do; a
+        // blank title is null; the last of a duplicated key counts.
+        assert_eq!(
+            record_json("{\"sessionId\":\"a\",\"sessionId\":\"local_y\",\"cliSessionId\":5,\"title\":\" \\u3000 \",\"titleSource\":\"robot\",\"isArchived\":\"true\",\"lastActivityAt\":\"9\"}").as_deref(),
+            Some("{\"ccdSessionId\":\"local_y\",\"cliSessionId\":null,\"title\":null,\"titleSource\":null,\"isArchived\":false,\"lastActivityAt\":0}")
+        );
+        assert_eq!(record_json("{\"cliSessionId\":\"c\"}"), None);
+        assert_eq!(record_json("[{\"sessionId\":\"x\"}]"), None);
+        assert_eq!(record_json("{\"sessionId\":\"x\"} trailing"), None);
+        assert_eq!(record_json("{\"sessionId\":\"x\",}"), None);
+    }
+
+    #[test]
+    fn the_saved_file_is_read_whole() {
+        let dir = std::env::temp_dir().join(format!("hx2-ccd-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ccd-index.json");
+        fs::write(&p, SAVED).unwrap();
+        assert_eq!(SavedBytes::open(&p).map(|b| b.bytes().to_vec()), Some(SAVED.as_bytes().to_vec()));
+        fs::write(&p, "").unwrap();
+        assert_eq!(SavedBytes::open(&p).map(|b| b.bytes().len()), Some(0));
+        assert!(SavedBytes::open(&dir.join("absent.json")).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn packed_ids_and_names_give_their_text_back() {
+        let canon = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b";
+        // Canonical: packed. Anything else — upper case, braces, no dashes,
+        // a wrong length, a lone surrogate — stays as its text.
+        let others = ["0F1E2D3C-4B5A-6978-8A9B-0C1D2E3F4A5B", "{0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b}", "0f1e2d3c4b5a69788a9b0c1d2e3f4a5b", "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5", "0f1e2d3c-4b5a-6978-8a9b_0c1d2e3f4a5b", ""];
+        let ccd = format!("local_{}", canon);
+        let r = CcdSessionMeta::new(ccd.as_bytes(), Some(canon.as_bytes()), Some(b"T"), Some("ai"), false, 1.0);
+        assert!(matches!(r.ccd_key(), IdKey::Uuid(_)) && matches!(r.cli_key(), Some(IdKey::Uuid(_))));
+        assert_eq!(&*r.ccd_session_id(), ccd.as_bytes());
+        assert_eq!(r.cli_session_id().as_deref(), Some(canon.as_bytes()));
+        assert_eq!(r.text.len(), 16 + 16 + 1);
+        for o in others {
+            let ccd_o = format!("local_{}", o);
+            let r = CcdSessionMeta::new(ccd_o.as_bytes(), Some(o.as_bytes()), None, None, false, 0.0);
+            assert!(matches!(r.ccd_key(), IdKey::Text(_)) && matches!(r.cli_key(), Some(IdKey::Text(_))), "{}", o);
+            assert_eq!(&*r.ccd_session_id(), ccd_o.as_bytes());
+            assert_eq!(r.cli_session_id().as_deref(), Some(o.as_bytes()));
+        }
+        let lone = crate::wtf8::from_units(&[0x6C, 0xD800]);
+        let r = CcdSessionMeta::new(&lone, None, None, None, false, 0.0);
+        assert_eq!(&*r.ccd_session_id(), lone.as_slice());
+        // File names.
+        let mut paths = DirTable::default();
+        for name in [format!("local_{}.json", canon), format!("local_{}.json", others[0]), "local_x.json".to_string(), "notes.txt".to_string()] {
+            let full = os_path(&format!("/s/a/o/{}", name));
+            let k = paths.split(full.as_bytes());
+            assert_eq!(matches!(k.name, Name::Session(_)), name.contains(canon), "{}", name);
+            assert_eq!(paths.path_string(&k), full);
+        }
+    }
+
+    #[test]
+    fn packed_ids_order_as_their_text() {
+        let ids = ["00000000-0000-0000-0000-000000000000", "0000000a-0000-0000-0000-000000000000", "00000009-ffff-ffff-ffff-ffffffffffff", "a0000000-0000-0000-0000-000000000000", "9fffffff-ffff-ffff-ffff-ffffffffffff", "0000000A-0000-0000-0000-000000000000", "0000", "zz", "-"];
+        for a in ids {
+            for b in ids {
+                assert_eq!(cmp_cli(&cli_id_key(a.as_bytes()), &cli_id_key(b.as_bytes())), a.as_bytes().cmp(b.as_bytes()), "{} {}", a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn by_cli_keeps_the_last_record_per_id() {
+        let r = |ccd: &str, cli: Option<&str>| Arc::new(CcdSessionMeta::new(ccd.as_bytes(), cli.map(|c| c.as_bytes()), None, None, false, 0.0));
+        let records = vec![r("local_1", Some("b")), r("local_2", Some("a")), r("local_3", Some("b")), r("local_4", Some("")), r("local_5", None)];
+        let m = CcdByCli::build(&records);
+        assert_eq!(m.get("b").map(|x| x.ccd_session_id().to_vec()), Some(b"local_3".to_vec()));
+        assert_eq!(m.get("a").map(|x| x.ccd_session_id().to_vec()), Some(b"local_2".to_vec()));
+        assert!(m.get("").is_none());
+        assert!(m.get("c").is_none());
+    }
 
     // src/ccd.test.ts: ccdAppDir on win32.
 
