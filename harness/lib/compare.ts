@@ -47,6 +47,15 @@ function readJsonl<T>(p: string): T[] {
 
 function contextFor(run: RunDir, candidateName: BinaryName, versions: string[], toleranceMs: number, mode: "diff" | "golden"): NormalizeContext {
   void toleranceMs;
+  // Both runs of a scenario generate their homes from one fixture clock
+  // (run-harness.ts), so the fixture's mtimes are the same instants in both
+  // runs, all of them before that clock. Measured from each run's own start
+  // they would differ by the time between the two starts (a whole reference
+  // run: 277 s for synthetic-10k), so a diff starts the run-relative window
+  // at the fixture clock: a timestamp before it is compared exactly, and a
+  // timestamp from the run's own clock relative to the run's start, within
+  // the scenario's tolerance.
+  const fixtureNowMs = run.meta.fixtureNowMs;
   return {
     candidateName,
     versions,
@@ -55,7 +64,7 @@ function contextFor(run: RunDir, candidateName: BinaryName, versions: string[], 
     gatewayUrl: run.meta.gatewayUrl,
     fortressUrl: run.meta.fortressUrl,
     anchorMs: run.meta.startedAtMs,
-    windowBeforeMs: DEFAULT_WINDOW_BEFORE_MS,
+    windowBeforeMs: mode === "diff" && fixtureNowMs !== undefined ? run.meta.startedAtMs - fixtureNowMs : DEFAULT_WINDOW_BEFORE_MS,
     windowAfterMs: DEFAULT_WINDOW_AFTER_MS,
     mode,
   };

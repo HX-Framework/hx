@@ -114,6 +114,10 @@ export interface RunMeta {
   gatewayUrl: string;
   fortressUrl: string | null;
   startedAtMs: number;
+  /** The moment the fixture home's mtimes are relative to: one for both runs
+   *  of a scenario (DriverOptions.fixtureNowMs). Absent in run directories
+   *  written before it was recorded. */
+  fixtureNowMs?: number;
   endedAtMs: number;
   steps: StepRecord[];
   /** Steps whose expectExit was not met, or that errored. */

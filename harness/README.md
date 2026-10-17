@@ -48,9 +48,16 @@ stored bytes must match byte for byte).
 | `claude-like` | The core plus 600 sessions over 150 project dirs, 60 lanes, 30 workflow runs, 120 task sets, 300 Claude Desktop files: the shape of a real `~/.claude`. |
 | `synthetic-10k` | The core plus 10,000 sessions over 200 project dirs with 500 lanes, 30 KB each. |
 
-Timestamps inside files are fixed; only mtimes follow the clock (set relative
-to the moment of generation), so discovery windows and tiers classify the
-files the same way whenever a run happens. Every session in a folder carries
+Timestamps inside files are fixed; only mtimes follow the clock. They are set
+relative to one moment per scenario, taken before the reference starts and
+shared by both runs, so the two binaries find the same mtimes and the same
+dates even when a scenario runs across midnight UTC, and discovery windows
+and tiers classify the files the same way whenever a run happens. The
+candidate starts a whole reference run after that moment (up to about five
+minutes, for synthetic-10k), so it finds every file that much older than the
+reference did: an mtime placed closer than that to an age the client tests
+(5 and 15 minutes, 48 hours, a whole number of days, 30 days) can classify
+differently in the two runs. Every session in a folder carries
 one branch: `hx ui` shows a folder under the branch of whichever session its
 stat pool returned first, an order no port can be held to.
 
@@ -92,7 +99,8 @@ fault first is not a race.
 Normalization (`lib/normalize.ts`) hides exactly: the candidate's name (`hx2`
 → `hx`, the one allowed difference, in output, User-Agent and asset names),
 each binary's version string, run-relative timestamps (compared with a
-per-scenario tolerance; the fixed content timestamps are compared exactly),
+per-scenario tolerance; the fixed content timestamps and the fixture's
+mtimes, the same instants in both runs, are compared exactly),
 the connection probe's latency/throughput/grade, the fixture home and work
 paths, local ports, pids and launch tokens, and the two numbers in the stuck
 line (`waiting out a retry backoff for another <n> min (<n> consecutive
