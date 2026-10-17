@@ -63,10 +63,14 @@ for (const scenario of scenarios) {
   const refDir = join(out, scenario.name, "reference");
   const candDir = join(out, scenario.name, "candidate");
   log(`\n=== ${scenario.name}: ${scenario.description}`);
+  // One fixture clock per scenario, taken before either run: both homes are
+  // generated from it, so both binaries find the same mtimes, and the same
+  // dates, even when the scenario runs across midnight UTC.
+  const fixtureNowMs = Date.now();
   const t0 = Date.now();
-  refMeta = await runScenario({ binary: reference, name: referenceName, scenario, outDir: refDir, home, workDir, log: verbose ? log : () => {} });
+  refMeta = await runScenario({ binary: reference, name: referenceName, scenario, outDir: refDir, home, workDir, fixtureNowMs, log: verbose ? log : () => {} });
   const t1 = Date.now();
-  candMeta = await runScenario({ binary: candidate, name: candidateName, scenario, outDir: candDir, home, workDir, log: verbose ? log : () => {} });
+  candMeta = await runScenario({ binary: candidate, name: candidateName, scenario, outDir: candDir, home, workDir, fixtureNowMs, log: verbose ? log : () => {} });
   const t2 = Date.now();
   referenceDirs.push(refDir);
 
