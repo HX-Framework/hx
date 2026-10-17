@@ -51,16 +51,17 @@ stored bytes must match byte for byte).
 | `hot-small`, `hot-claude-like`, `hot-10k` | The hot-path shapes: the same Claude Code parent transcripts and git repositories, nothing else (see The hot-path surface below). |
 | `founder` | The measurement tree: the hot core plus 4,800 transcripts over 700 project dirs and 36,000 Claude Desktop session files. |
 
-Timestamps inside files are fixed; only mtimes follow the clock. They are set
-relative to one moment per scenario, taken before the reference starts and
-shared by both runs, so the two binaries find the same mtimes and the same
-dates even when a scenario runs across midnight UTC, and discovery windows
-and tiers classify the files the same way whenever a run happens. The
-candidate starts a whole reference run after that moment (up to about five
-minutes, for synthetic-10k), so it finds every file that much older than the
-reference did: an mtime placed closer than that to an age the client tests
-(5 and 15 minutes, 48 hours, a whole number of days, 30 days) can classify
-differently in the two runs. Every session in a folder carries
+Timestamps inside files are fixed; only mtimes follow the clock, apart from
+the Claude Desktop store's, which are fixed too (`ccd-index.json` below). The
+others are set relative to one moment per scenario, taken before the
+reference starts and shared by both runs, so the two binaries find the same
+mtimes and the same dates even when a scenario runs across midnight UTC, and
+discovery windows and tiers classify the files the same way whenever a run
+happens. The candidate starts a whole reference run after that moment (up to
+about five minutes, for synthetic-10k), so it finds every file that much
+older than the reference did: an mtime placed closer than that to an age the
+client tests (5 and 15 minutes, 48 hours, a whole number of days, 30 days)
+can classify differently in the two runs. Every session in a folder carries
 one branch: `hx ui` shows a folder under the branch of whichever session its
 stat pool returned first, an order no port can be held to.
 
