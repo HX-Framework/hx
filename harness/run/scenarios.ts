@@ -387,14 +387,16 @@ export const HOT_PATH_SCENARIOS = ["hot-baseline", "hot-claude-like", "hot-10k",
 export const MAIN_SCENARIOS = SCENARIOS.filter((s) => !HOT_PATH_SCENARIOS.includes(s.name)).map((s) => s.name);
 
 // ── The daemon surface (hx2, M4) ──────────────────────────────────────────
-// After M4 the Rust port answers every step of every scenario except the
-// ones the next card owns: the hx ui API, `hx update`, `hx connect` and
+// After M4 the Rust port answered every step of every scenario except the
+// ones M5 owned: the hx ui API, `hx update`, `hx connect` and
 // `hx disconnect`. `--scenarios daemon` runs the full catalog with those
 // steps removed (and the goldens of the removed steps dropped), on both
 // binaries alike, so a baseline run compares the daemon, the status and
 // doctor reports, tick, backfill, reattribute and retry on every shape. The
 // four protocol calls only those steps make (pairing, disconnect, the update
-// channel) are excluded from the coverage check for this selection.
+// channel) are excluded from the coverage check for this selection. Since
+// M5 the hx2 jobs run `main` like the TypeScript jobs; the daemon selections
+// remain for a candidate that predates it.
 const M5_COMMANDS = new Set(["update", "connect", "disconnect"]);
 
 /** The protocol calls only the M5 steps make. */
