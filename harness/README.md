@@ -221,7 +221,8 @@ uploads the `small` fixture; `hx2 connect` (the saved login, no pairing)
 moves the device to hx2; hx takes it back (`hx restart` up to 77.12,
 `hx start` from 77.13.0 on); `hx2 start` takes it again; hx takes it back
 again; a transcript grows after every switch. It checks that every fixture
-session is in the store; that after each switch every object got exactly
+session is stored whole (before the first switch too, so no upload is in
+flight when the slot moves); that after each switch every object got exactly
 the bytes it was missing (the bytes PUT equal how much the store grew, and
 no commit replaced an object the store already held); that each grown
 transcript is stored byte for byte and went up through the client that held

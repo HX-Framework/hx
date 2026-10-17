@@ -23,7 +23,7 @@
 //      device to hx2.
 //
 // The checks, from the gateway's recording and store:
-//   • every fixture session is in the store;
+//   • every fixture session is stored whole;
 //   • after every switch, every object got exactly the bytes it was missing:
 //     the bytes PUT equal how much the store grew, and no commit replaced an
 //     object the store already held (a client that lost the other's offsets
@@ -46,10 +46,11 @@
 // on CI runners only: harness/run/service-home.ts.
 
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { FakeGateway, type RecordedRequest } from "../gateway/gateway.js";
+import type { ManifestSession } from "../fixtures/gen-home.js";
 import { appendTranscriptLines, CLOUD_PORT } from "./run-scenario.js";
 import { type Client, killWatchProcesses, type Manager, MANAGER_NAME, MANAGERS, prepareServiceHome, run, type Spawned, versionOf, watchProcesses } from "./service-home.js";
 
@@ -113,12 +114,29 @@ function storedKey(index: number): string {
   return `${s.family}:${s.sessionId}:letai`;
 }
 
-function missingSessions(): string[] {
-  const keys = Object.keys(cloud.manifest());
-  return manifest.sessions.filter((s) => !keys.some((k) => k.startsWith(`${s.family}:${s.sessionId}:`))).map((s) => `${s.family}:${s.sessionId}`);
+/** Fixture sessions the store does not hold whole yet: the stored object
+ *  shorter than the file. A session listed twice (the twin, moved to a new
+ *  cwd) is held as its newest copy. Mere presence is not enough: the 70 MB
+ *  transcript goes up in two passes, 64 MiB at a time, and a switch between
+ *  them would interrupt an upload in flight. */
+function unsyncedSessions(): string[] {
+  const store = cloud.manifest();
+  const newest = new Map<string, ManifestSession>();
+  for (const s of manifest.sessions) {
+    const key = `${s.family}:${s.sessionId}`;
+    const prev = newest.get(key);
+    if (!prev || s.mtimeOffsetMs > prev.mtimeOffsetMs) newest.set(key, s);
+  }
+  const out: string[] = [];
+  for (const [key, s] of newest) {
+    const want = statSync(s.path).size;
+    const got = store[`${key}:letai`]?.bytes ?? 0;
+    if (got !== want) out.push(`${key} (${got} of ${want} bytes)`);
+  }
+  return out;
 }
 
-/** Every fixture session stored, and no commit for `quietMs`. */
+/** Every fixture session stored whole, and no commit for `quietMs`. */
 async function waitSynced(timeoutMs = 300_000, quietMs = 8_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastCommits = -1;
@@ -129,10 +147,10 @@ async function waitSynced(timeoutMs = 300_000, quietMs = 8_000): Promise<void> {
       lastCommits = commits;
       quietSince = Date.now();
     }
-    if (missingSessions().length === 0 && Date.now() - quietSince >= quietMs) return;
+    if (unsyncedSessions().length === 0 && Date.now() - quietSince >= quietMs) return;
     await sleep(500);
   }
-  throw new Error(`the fixture home was not in the store after ${timeoutMs / 1000} s: missing ${missingSessions().join(", ")}`);
+  throw new Error(`the fixture home was not stored whole after ${timeoutMs / 1000} s: ${unsyncedSessions().join(", ")}`);
 }
 
 /** The grown transcript stored at its full size on disk. */
@@ -300,7 +318,7 @@ const check = (name: string, problems: string[], okDetails: string): void => {
 const objectKey = (r: RecordedRequest): string => (r.lane ? `${r.sessionKey}:${r.lane}:letai` : `${r.sessionKey}:letai`);
 const isCommit = (r: RecordedRequest): boolean => r.path === "/sessions/commit" || r.path === "/sessions/agent-commit";
 
-check("every fixture session is in the store", missingSessions(), `${manifest.sessions.length} sessions`);
+check("every fixture session is stored whole", unsyncedSessions(), `${manifest.sessions.length} sessions`);
 
 for (const p of phases) {
   const window = requests.filter((r) => r.seq >= p.seqFrom && r.seq < p.seqTo);
