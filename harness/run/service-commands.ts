@@ -19,7 +19,7 @@ import { join, resolve } from "node:path";
 import { FakeGateway } from "../gateway/gateway.js";
 import { DEFAULT_WINDOW_AFTER_MS, DEFAULT_WINDOW_BEFORE_MS, normalizeText } from "../lib/normalize.js";
 import { CLOUD_PORT } from "./run-scenario.js";
-import { type Client, killWatchProcesses, type Manager, MANAGERS, prepareServiceHome, run, versionOf, watchProcesses } from "./service-home.js";
+import { type Client, killWatchProcesses, type Manager, MANAGERS, markdownCell, prepareServiceHome, run, versionOf, watchProcesses } from "./service-home.js";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -147,7 +147,7 @@ STEPS.forEach((step, i) => {
   const same = !!a && !!b && a.exit === b.exit && a.stdout === b.stdout && a.stderr === b.stderr && a.own === b.own && a.other === b.other;
   if (!same) differing += 1;
   const cell = (r: StepResult | undefined): string =>
-    r ? `exit ${r.exit} · ${r.own} watch<br>${[r.stdout, r.stderr].filter(Boolean).join("\n").replace(/\|/g, "\\|").replace(/\n/g, "<br>")}` : "(not run)";
+    r ? `exit ${r.exit} · ${r.own} watch<br>${markdownCell([r.stdout, r.stderr].filter(Boolean).join("\n"))}` : "(not run)";
   rows.push(`| \`${step.args.join(" ")}\` (${step.name}) | ${same ? "identical" : "**DIFFERENT**"} | ${cell(a)} | ${same ? "" : cell(b)} |`);
 });
 const ok = differing === 0;

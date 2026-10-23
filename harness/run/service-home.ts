@@ -147,6 +147,12 @@ export function prepareServiceHome(o: { manager: Manager; work: string; name: st
   };
 }
 
+/** Text as one cell of a Markdown table: backslashes first, so an escape
+ *  already in the text cannot undo the pipe's, then pipes, then line breaks. */
+export function markdownCell(text: string): string {
+  return text.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n/g, "<br>");
+}
+
 /** "hx version: X" → X. */
 export async function versionOf(bin: string, env: Record<string, string>): Promise<string> {
   const r = await run([bin, "--version"], env);

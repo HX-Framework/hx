@@ -52,7 +52,7 @@ import { join, resolve } from "node:path";
 import { FakeGateway, type RecordedRequest } from "../gateway/gateway.js";
 import type { ManifestSession } from "../fixtures/gen-home.js";
 import { appendTranscriptLines, CLOUD_PORT } from "./run-scenario.js";
-import { type Client, killWatchProcesses, type Manager, MANAGER_NAME, MANAGERS, prepareServiceHome, run, type Spawned, versionOf, watchProcesses } from "./service-home.js";
+import { type Client, killWatchProcesses, type Manager, MANAGER_NAME, MANAGERS, markdownCell, prepareServiceHome, run, type Spawned, versionOf, watchProcesses } from "./service-home.js";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -487,7 +487,7 @@ lines.push(`${process.platform}-${process.arch} · hx ${versions.hx} · hx2 ${ve
 lines.push("");
 lines.push("| Check | Result | Details |");
 lines.push("| --- | --- | --- |");
-for (const c of checks) lines.push(`| ${c.name} | ${c.ok ? "ok" : "**FAILED**"} | ${c.details.replace(/\n/g, "<br>").replace(/\|/g, "\\|")} |`);
+for (const c of checks) lines.push(`| ${c.name} | ${c.ok ? "ok" : "**FAILED**"} | ${markdownCell(c.details)} |`);
 lines.push("");
 for (const p of phases) {
   lines.push(`#### ${p.name}: \`${p.client} ${p.command.join(" ")}\``);
