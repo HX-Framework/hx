@@ -156,6 +156,12 @@ export interface DaemonOps {
    */
   restart(opts: InstallOpts): Promise<void>;
   state(): Promise<DaemonState>;
+  /**
+   * The binary the installed service definition runs, as the definition spells
+   * it, or null when none is installed. This is how hx tells that the shared
+   * service slot runs hx2 (see "The shared service slot" below).
+   */
+  slotBinary?(): string | null;
   /** Pretty-printed name for messages, e.g. "launchd" or "systemd (user)". */
   managerName: string;
   /**
@@ -428,6 +434,10 @@ function macOps(): DaemonOps {
     async state() {
       return macState();
     },
+    slotBinary() {
+      const content = readTextOrNull(LAUNCHD_PLIST);
+      return content === null ? null : definitionBinPath("launchd", content);
+    },
   };
 }
 
@@ -574,6 +584,10 @@ function systemdOps(): DaemonOps {
     },
     async state() {
       return linuxState();
+    },
+    slotBinary() {
+      const content = readTextOrNull(SYSTEMD_UNIT_PATH);
+      return content === null ? null : definitionBinPath("systemd", content);
     },
   };
 }
@@ -839,6 +853,10 @@ function shellHookOps(): DaemonOps {
     async state() {
       return shellHookState();
     },
+    slotBinary() {
+      const content = readTextOrNull(BOOTSTRAP_PATH);
+      return content === null ? null : bootstrapBinPath(content);
+    },
   };
 }
 
@@ -889,7 +907,11 @@ export function windowsServiceBinary(
   // handles Windows paths, and the ambient module is POSIX-flavored when the
   // process runs on Linux — which would silently reduce `C:\Users\me\bin\hx.exe`
   // to a bare filename. Being explicit also lets CI cover it from Linux.
-  const candidate = winPath.join(winPath.dirname(binPath), WIN_SERVICE_EXE);
+  //
+  // An hx2 binary maps to hx2's own service build (hx2-svc.exe): `hx retry`
+  // re-registers a slot that runs hx2 with hx2, never with hx-svc.exe.
+  const exe = clientOfBinary(binPath) === "hx2" ? "hx2-svc.exe" : WIN_SERVICE_EXE;
+  const candidate = winPath.join(winPath.dirname(binPath), exe);
   return exists(candidate) ? candidate : binPath;
 }
 
@@ -1016,6 +1038,24 @@ export function parseWinState(stdout: string): DaemonState {
     loaded: state !== "Disabled",
     pid: Number.isInteger(pid) && pid > 0 ? pid : null,
   };
+}
+
+/** The program the task's first action runs, from the scheduler's COM service. */
+const WIN_TASK_BINARY_PS = [
+  `$ErrorActionPreference='SilentlyContinue';`,
+  `$svc = New-Object -ComObject Schedule.Service;`,
+  `$svc.Connect();`,
+  `$t = $svc.GetFolder('\\').GetTask('${WIN_TASK_NAME}');`,
+  `if ($t) { ($t.Definition.Actions | Select-Object -First 1).Path }`,
+].join(" ");
+
+function winTaskBinary(): string | null {
+  const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", WIN_TASK_BINARY_PS], {
+    stdio: "pipe",
+  });
+  if (r.error || r.status !== 0) return null;
+  const out = r.stdout.toString().trim();
+  return out || null;
 }
 
 function winState(): DaemonState {
@@ -1150,6 +1190,9 @@ function windowsOps(): DaemonOps {
     async state() {
       return winState();
     },
+    slotBinary() {
+      return winTaskBinary();
+    },
   };
 }
 
@@ -1177,6 +1220,9 @@ function unsupportedOps(
     },
     async state() {
       return { loaded: false, pid: null };
+    },
+    slotBinary() {
+      return null;
     },
   };
 }
@@ -1328,6 +1374,55 @@ StandardError=append:${logs.stderr}
 [Install]
 WantedBy=default.target
 `;
+}
+
+// ───────────────────── The shared service slot (hx2) ─────────────────────
+//
+// hx2, the Rust port of this client (the HX2 program), installs the same
+// definitions under the same label, ai.let.hx-vision, and reads and writes the
+// same files in ~/.let/hx. So a device has one service slot, and it runs hx or
+// hx2, never both. `hx2 start` (or `hx2 connect`) moves a device to hx2, and
+// `hx start` moves it back. Nothing else in hx takes the slot from hx2: while
+// the installed definition runs hx2, `hx connect`, `hx restart` and `hx update`
+// leave the service as it is and say so, `hx retry` restarts it with hx2,
+// `hx uninstall` keeps it unless --purge removes the state it runs on, and the
+// HX Client UI's restart button changes nothing.
+
+/** Read a text file, or null when it cannot be read. */
+function readTextOrNull(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** The binary a container bootstrap.sh launches: its `[ -x '<bin>' ] || return` line. */
+export function bootstrapBinPath(content: string): string | null {
+  const m = content.match(/^\s*\[ -x ('(?:[^']|'\\'')*') \] \|\| return$/m);
+  if (!m) return null;
+  return m[1].slice(1, -1).replace(/'\\''/g, "'");
+}
+
+/** The client a binary belongs to, by its file name: hx (hx, hx.exe, hx-svc.exe),
+ *  hx2 (hx2, hx2.exe, hx2-svc.exe), or null for any other name. */
+export function clientOfBinary(path: string): "hx" | "hx2" | null {
+  const name = (path.split(/[\\/]/).pop() ?? "").toLowerCase();
+  const stem = name.replace(/\.exe$/, "").replace(/-svc$/, "");
+  if (stem === "hx2") return "hx2";
+  if (stem === "hx") return "hx";
+  return null;
+}
+
+/** The hx2 binary the installed definition runs, or null when the slot is
+ *  empty, runs hx, or runs anything else. */
+export function slotRunsHx2(ops: DaemonOps): string | null {
+  try {
+    const bin = ops.slotBinary?.() ?? null;
+    return bin !== null && clientOfBinary(bin) === "hx2" ? bin : null;
+  } catch {
+    return null;
+  }
 }
 
 // ─────────────── Keeping the installed definition current ───────────────

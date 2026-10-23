@@ -7,7 +7,7 @@
 // resolves it interactively; the UI server always passes "denied" — a browser
 // click must not edit dotfiles. On launchd/systemd the value is irrelevant.
 
-import { getDaemonOps, type DaemonState } from "./daemon.js";
+import { getDaemonOps, slotRunsHx2, type DaemonState } from "./daemon.js";
 import { clearAllFailures, clearBlockedFailures, resetStateCache } from "./state.js";
 import { tickOnce } from "./watch.js";
 import { assertSecureFetchUrl } from "./net.js";
@@ -35,7 +35,8 @@ export async function daemonAction(
   if (action === "stop") {
     await ops.stop();
   } else if (action === "restart") {
-    await ops.restart({ binPath, dotfileConsent });
+    // A slot that runs hx2 stays with it; "start" is what moves it back.
+    if (!slotRunsHx2(ops)) await ops.restart({ binPath, dotfileConsent });
   } else {
     await ops.install({ binPath, dotfileConsent });
   }
@@ -63,12 +64,15 @@ export async function retryBlocked(
 ): Promise<RetryBlockedResult> {
   const ops = getDaemonOps();
   const before = await ops.state().catch(() => ({ loaded: false, pid: null }));
+  // The shared slot runs hx2: bring the service back with hx2, as installed.
+  // The definitions hx and hx2 write differ in the binary's path alone.
+  const binPath = slotRunsHx2(ops) ?? process.execPath;
   if (before.loaded) await ops.stop();
   resetStateCache();
   const cleared =
     opts.scope === "all" ? await clearAllFailures() : await clearBlockedFailures();
   if (before.loaded) {
-    await ops.install({ binPath: process.execPath, dotfileConsent: opts.dotfileConsent });
+    await ops.install({ binPath, dotfileConsent: opts.dotfileConsent });
     return { ...cleared, restarted: true };
   }
   if (opts.foregroundPass === false) return { ...cleared, restarted: false };

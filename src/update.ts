@@ -38,7 +38,7 @@ import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { dirname } from "node:path";
-import { getDaemonOps, type DaemonOps, type DaemonState } from "./daemon.js";
+import { getDaemonOps, slotRunsHx2, type DaemonOps, type DaemonState } from "./daemon.js";
 import { HX_VERSION, parseStableSemver, compareStableSemver } from "./version.js";
 import { assertSecureFetchUrl } from "./net.js";
 
@@ -88,6 +88,12 @@ export interface UpdateResult {
   installedPath: string;
   /** Whether the daemon was restarted because it was loaded. */
   daemonRestarted: boolean;
+  /**
+   * True when the loaded service runs hx2 (the shared slot): hx's binary was
+   * updated and the service was left alone, since only `hx start` moves a
+   * device back to hx.
+   */
+  serviceRunsHx2: boolean;
   /**
    * True when the running binary was already current (remote version not newer,
    * or byte-identical) — no download, swap, or daemon restart was performed.
@@ -199,7 +205,10 @@ export async function runUpdate(opts: UpdateOpts): Promise<UpdateResult> {
   const ops = opts.daemonOps ?? getDaemonOps();
   const before = await ops.state();
   let daemonRestarted = false;
-  if (before.loaded) {
+  // The shared slot runs hx2: hx's own binary is current now, and the service
+  // stays with hx2 until `hx start` moves the device back.
+  const serviceRunsHx2 = before.loaded && slotRunsHx2(ops) !== null;
+  if (before.loaded && !serviceRunsHx2) {
     log(`restarting daemon (was ${before.pid ? `pid ${before.pid}` : "loaded but idle"})`);
     try {
       await ops.restart({ binPath });
@@ -225,6 +234,7 @@ export async function runUpdate(opts: UpdateOpts): Promise<UpdateResult> {
     sha256: actual,
     installedPath: binPath,
     daemonRestarted,
+    serviceRunsHx2,
     alreadyLatest: false,
     localVersion,
     remoteVersion,
@@ -243,6 +253,7 @@ function alreadyLatest(
     sha256: null,
     installedPath: binPath,
     daemonRestarted: false,
+    serviceRunsHx2: false,
     alreadyLatest: true,
     localVersion,
     remoteVersion,
