@@ -235,8 +235,15 @@ pub fn compute_sync_report(store: &Store, roots_override: Option<&ResolvedRoots>
     let now = now_ms();
     let mut all = discover_claude_files(&roots.claude, None, now);
     all.extend(discover_codex_files(&roots.codex, true, None, now));
+    Ok(store.read(|state| compute_sync_report_from(state, roots, all, &settings)))
+}
+
+/// `computeSyncReport(roots, injected)`: the report over files a caller has
+/// already discovered (the `hx ui` server's cached sweep) and a given state.
+pub fn compute_sync_report_from(state: &Json, roots: &ResolvedRoots, all: Vec<DiscoveredFile>, settings: &HxSettings) -> SyncReport {
     let org_names = read_org_names();
-    let report = store.read(|state| {
+    let settings = settings.clone();
+    let report = (|state: &Json| {
         let discovered: HashSet<String> = all.iter().map(|f| f.path.clone()).collect();
         let mut live_sessions: HashSet<String> = HashSet::new();
         for f in &all {
@@ -342,8 +349,8 @@ pub fn compute_sync_report(store: &Store, roots_override: Option<&ResolvedRoots>
             child_lanes: child,
             unwatched: unwatched as u64,
         }
-    });
-    Ok(report)
+    })(state);
+    report
 }
 
 /// The offsets of a file entry as the stuck line prints them: `key at off/size`.

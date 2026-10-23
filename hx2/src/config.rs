@@ -63,8 +63,17 @@ pub fn read_local_config() -> Option<HxConfig> {
 /// pretty-printed) renamed over the target; `stateScope` is never persisted.
 /// Errors carry the runtime's text (`EACCES: permission denied, open '…'`).
 pub fn write_config_json(cfg: &Json) -> Result<(), String> {
+    write_to(&config_path(), cfg)
+}
+
+/// `writeLocalConfig(cfg)`: the `--local` tee's connection, config.local.json.
+pub fn write_local_config_json(cfg: &Json) -> Result<(), String> {
+    write_to(&local_config_path(), cfg)
+}
+
+fn write_to(target: &std::path::Path, cfg: &Json) -> Result<(), String> {
     fs::create_dir_all(hx_dir()).map_err(|e| node_error(&e, "mkdir", hx_dir()))?;
     let mut persisted = cfg.clone();
     persisted.remove("stateScope");
-    write_atomic_0600_node(&config_path(), persisted.stringify_pretty().as_bytes())
+    write_atomic_0600_node(target, persisted.stringify_pretty().as_bytes())
 }

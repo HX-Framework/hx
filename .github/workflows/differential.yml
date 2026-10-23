@@ -35,23 +35,31 @@ name: Differential harness
 # on a manual run — from another ref, or downloaded from a URL (an hx2
 # release asset, say) with `candidate_name: hx2`.
 #
-# On the hx-2.0 branch four more jobs run the Rust port (hx2/, the daemon)
-# against the same reference:
-#   hx2-build         cargo build --release on both runners (hx2-test runs
-#                     the crate's unit tests beside it);
-#   hx2-differential  the reference compared with hx2 on the daemon surface:
-#                     every scenario with the steps of the next card (the hx
-#                     ui API, update, connect, disconnect) removed
-#                     (harness/run/scenarios.ts, daemonScenarios), passed as
-#                     `candidate_name: hx2`, with the goldens; the hot-path
-#                     shapes in hx2-differential-hot, as for the TypeScript
-#                     jobs, both sampling the runner's memory;
+# On the hx-2.0 branch six more jobs run the Rust port (hx2/, the whole
+# client since M5) against the same reference:
+#   hx2-build         the web UI (bun), then cargo build --release on both
+#                     runners;
+#   hx2-test          the crate's unit tests beside the build, among them the
+#                     service definitions against the TypeScript client's
+#                     renderings for the same binary path;
+#   hx2-differential  the reference compared with hx2 on every scenario but
+#                     the hot-path shapes (`--scenarios main`: the daemon, the
+#                     CLI, the hx ui API, update, connect and disconnect),
+#                     passed as `candidate_name: hx2`, with the goldens; the
+#                     hot-path shapes in hx2-differential-hot, as for the
+#                     TypeScript jobs, both sampling the runner's memory;
 #   hx2-self          hx2 compared with itself on the same scenarios
 #                     (hx2-self-hot for the hot-path shapes);
 #   hx2-measure       harness/run/measure.ts with hx2 as the candidate:
 #                     the founder-sized tree (4,800 transcripts, 36,000
 #                     Claude Desktop files) for memory and idle CPU, the idle
-#                     shapes under strace, and the Claude Desktop index.
+#                     shapes under strace, and the Claude Desktop index;
+#   hx2-switch        a device moves its one service slot from hx to hx2 and
+#                     back through launchd, systemd and the container shell
+#                     hook, and loses nothing and uploads nothing twice
+#                     (harness/run/switch.ts); then both clients run the
+#                     service commands through the same manager, compared
+#                     after normalization (harness/run/service-commands.ts).
 
 on:
   pull_request:
@@ -358,6 +366,9 @@ jobs:
           # a shutdown signal"). Sample the machine every 10 s into the step
           # log (live, so it survives a shutdown) and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -430,6 +441,9 @@ jobs:
           # a shutdown signal"). Sample the machine every 10 s into the step
           # log (live, so it survives a shutdown) and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -612,6 +626,21 @@ jobs:
         with:
           workspaces: hx2
 
+      # `hx ui` serves the React app as built: the same ui/ sources, lockfile
+      # and Bun as the TypeScript build (harness/ci/build.sh), embedded into
+      # the binary by hx2/build.rs.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Build the web UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ui
+          bun install --frozen-lockfile
+          bun run build
+
       - name: Build
         shell: bash
         run: |
@@ -644,11 +673,25 @@ jobs:
         with:
           workspaces: hx2
 
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # Among the unit tests, the service definitions against the TypeScript
+      # client's own renderings for the same binary and HOME (one service
+      # slot: the files may differ in the binary's path alone).
       - name: Test
-        run: cargo test --manifest-path hx2/Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          # Both renderings take their log and state paths from the same HOME.
+          defs="$RUNNER_TEMP/service-defs"
+          bun harness/run/service-defs.ts --out "$defs"
+          HX2_TS_SERVICE_DEFS="$defs" cargo test --manifest-path hx2/Cargo.toml
 
   hx2-differential:
-    name: Reference vs hx2, daemon surface (${{ matrix.os }})
+    name: Reference vs hx2 (${{ matrix.os }})
     needs: [reference, hx2-build]
     strategy:
       fail-fast: false
@@ -678,7 +721,7 @@ jobs:
       # goldens hold the file sizes of that path's length, and the candidate's
       # name is normalized in its output before the home path is masked, so a
       # home path spelling "hx2" would come out of the first step unmaskable.
-      - name: Run the harness on the daemon surface, sampling memory
+      - name: Run the harness, sampling memory
         shell: bash
         env:
           RUNNER_OS_NAME: ${{ runner.os }}
@@ -693,6 +736,9 @@ jobs:
           # every 10 s into the step log (live, so it survives a shutdown)
           # and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -712,7 +758,7 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/reference/hx \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx-harness" \
+            --scenarios main --out harness-out --work "$RUNNER_TEMP/hx-harness" \
             --goldens "harness/golden/$RUNNER_OS_NAME" --write-goldens "harness-out/goldens/$RUNNER_OS_NAME"
 
       - name: Report
@@ -729,7 +775,7 @@ jobs:
           if-no-files-found: warn
 
   hx2-self:
-    name: hx2 vs itself, daemon surface (${{ matrix.os }})
+    name: hx2 vs itself (${{ matrix.os }})
     needs: hx2-build
     strategy:
       fail-fast: false
@@ -749,7 +795,7 @@ jobs:
           name: hx2-${{ matrix.os }}
           path: bin/hx2
 
-      - name: Run the harness on the daemon surface, sampling memory
+      - name: Run the harness, sampling memory
         shell: bash
         run: |
           set -euo pipefail
@@ -762,6 +808,9 @@ jobs:
           # every 10 s into the step log (live, so it survives a shutdown)
           # and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -781,7 +830,7 @@ jobs:
           bun harness/run/run-harness.ts \
             --reference bin/hx2/hx2 --reference-name hx2 \
             --candidate bin/hx2/hx2 --candidate-name hx2 \
-            --scenarios daemon-main --out harness-out --work "$RUNNER_TEMP/hx-harness"
+            --scenarios main --out harness-out --work "$RUNNER_TEMP/hx-harness"
 
       - name: Report
         if: always()
@@ -835,6 +884,9 @@ jobs:
           # every 10 s into the step log (live, so it survives a shutdown)
           # and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -903,6 +955,9 @@ jobs:
           # every 10 s into the step log (live, so it survives a shutdown)
           # and into memory.log.
           sample() {
+            # Not under the step's `set -e`: macOS ps writes more than head
+            # reads, the pipe breaks, and the loop would end after one sample.
+            set +e
             while true; do
               echo "--- memory $(date -u +%FT%TZ)"
               if [ "$RUNNER_OS" = Linux ]; then
@@ -988,4 +1043,88 @@ jobs:
         with:
           name: harness-measure-hx2-${{ matrix.os }}
           path: measure-out
+          if-no-files-found: warn
+
+  # The background service through a real service manager, which the
+  # harness's scenarios never install. First the exit check of the program's
+  # "Build hx2" step: hx and hx2 share one service slot, and a device that
+  # moves it from hx to hx2 and back loses nothing and uploads nothing twice
+  # (harness/run/switch.ts). Then the service commands of both clients side
+  # by side (harness/run/service-commands.ts). launchd and systemd run the
+  # service with the runner's own HOME, so the fixture is linked into it
+  # there; the container shell hook runs with the fixture as HOME.
+  hx2-switch:
+    name: The service, hx and hx2 (${{ matrix.manager }})
+    needs: [reference, hx2-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, manager: shell-hook }
+          - { os: ubuntu-latest, manager: systemd }
+          - { os: macos-latest, manager: launchd }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx-reference-${{ matrix.os }}
+          path: bin/reference
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hx2-${{ matrix.os }}
+          path: bin/hx2
+
+      # A hosted runner has no login session, so no user manager runs for the
+      # runner user (ci.yml's systemd-user job does the same).
+      - name: Start a systemd user manager
+        if: matrix.manager == 'systemd'
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          runtime="/run/user/$(id -u)"
+          for _ in $(seq 1 50); do
+            [ -S "$runtime/systemd/private" ] && break
+            sleep 0.2
+          done
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          XDG_RUNTIME_DIR="$runtime" systemctl --user show-environment > /dev/null
+
+      - name: Move the service
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x bin/reference/hx bin/hx2/hx2
+          bun harness/run/switch.ts --hx bin/reference/hx --hx2 bin/hx2/hx2 \
+            --manager ${{ matrix.manager }} --out service-out/switch --work "$RUNNER_TEMP/hx-switch"
+
+      # start, status, restart, stop, logs and uninstall, run by each client
+      # in turn through the same manager and compared after normalization.
+      - name: Compare the service commands
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun harness/run/service-commands.ts --hx bin/reference/hx --hx2 bin/hx2/hx2 \
+            --manager ${{ matrix.manager }} --out service-out/commands --work "$RUNNER_TEMP/hx-service-commands"
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          for f in service-out/switch/report.md service-out/commands/report.md; do
+            if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: harness-hx2-service-${{ matrix.manager }}
+          path: service-out
           if-no-files-found: warn

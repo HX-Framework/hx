@@ -4,8 +4,9 @@ version = "78.0.0"
 edition = "2021"
 rust-version = "1.80"
 publish = false
-description = "hx2: the hx client's daemon, ported to Rust as an exact copy of the TypeScript client (HX2 program, M3 and M4)"
+description = "hx2: the hx client, ported to Rust as an exact copy of the TypeScript client (HX2 program, M3 to M5)"
 license = "MIT"
+build = "build.rs"
 
 [[bin]]
 name = "hx2"
@@ -29,6 +30,19 @@ indexmap = "2"
 # Codex keeps its session titles in ~/.codex/state_<N>.sqlite (codex-titles.ts
 # reads it with bun:sqlite); the bundled SQLite keeps the build self-contained.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# HTTPS to the hosted gateway, a fortress and the download proxy. Bun's fetch
+# trusts the Mozilla root store it bundles (plus NODE_EXTRA_CA_CERTS); the
+# same Mozilla roots are compiled in here. ring is also the source of the
+# sha256, the HMAC and the random tokens of `hx ui` and `hx update`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
+ring = "0.17"
+# Bun's fetch advertises `accept-encoding: gzip, deflate, br, zstd` and decodes
+# whatever the server picks; the Cloudflare edge in front of let.ai compresses.
+# flate2 also unpacks the gzipped release asset of `hx update`.
+flate2 = "1"
+brotli-decompressor = "4"
+zstd = "0.13"
 
 [profile.release]
 opt-level = 3
