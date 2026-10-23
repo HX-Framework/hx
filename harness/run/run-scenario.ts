@@ -33,6 +33,11 @@ export interface DriverOptions {
   home: string;
   /** The harness work directory, for path normalization. */
   workDir: string;
+  /** Epoch ms the fixture home's mtimes are relative to (gen-home's `now`).
+   *  The harness passes one value to both runs of a scenario, so the two
+   *  homes hold the same mtimes whenever each run starts. Defaults to the
+   *  run's own start. */
+  fixtureNowMs?: number;
   log?: (line: string) => void;
 }
 
@@ -134,9 +139,10 @@ export async function runScenario(o: DriverOptions): Promise<RunMeta> {
   rmSync(o.outDir, { recursive: true, force: true });
   mkdirSync(join(o.outDir, "steps"), { recursive: true });
   const startedAtMs = Date.now();
+  const fixtureNowMs = o.fixtureNowMs ?? startedAtMs;
 
   // Fixture home.
-  const manifest = generateHome({ out: o.home, shape: scenario.shape, seed: scenario.seed, now: startedAtMs });
+  const manifest = generateHome({ out: o.home, shape: scenario.shape, seed: scenario.seed, now: fixtureNowMs });
   cpSync(`${o.home}.manifest.json`, join(o.outDir, "fixture.manifest.json"));
   // A second, empty home for the "not connected" step.
   const emptyHome = `${o.home}-empty`;
@@ -231,6 +237,7 @@ export async function runScenario(o: DriverOptions): Promise<RunMeta> {
     gatewayUrl,
     fortressUrl,
     startedAtMs,
+    fixtureNowMs,
     endedAtMs: Date.now(),
     steps,
     failures,
