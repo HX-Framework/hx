@@ -45,7 +45,7 @@ stored bytes must match byte for byte).
 
 | Shape | What it holds |
 | --- | --- |
-| `small` | The curated core: 13 Claude Code transcripts covering every parsing quirk (a user and an AI title, a plan attachment, a cwd-change twin, a 70 MB file past the 64 MB per-pass budget, a 5 MiB single line, emoji/CJK/a lone surrogate, a message past the 4,000-unit cap, a file and a directory older than the 30-day window, an empty file), two subagent lanes with meta sidecars, a workflow run (journal + script + lane), tasks for two sessions, a team config, git repositories the cwds point at (a clone, a linked worktree, a non-GitHub remote) and an encoded `@owner@name@xxxxxx` scratch cwd; four Codex rollouts (CLI, desktop originator, archived) and a `state_5.sqlite` with a user name, an AI title and a missing row; five Claude Desktop session files and a Local Storage leveldb with a stale `.log` and an authoritative Snappy-compressed `.ldb` (two groups, assignments, unread ids, a vestigial `dframe-store`). |
+| `small` | The curated core: 13 Claude Code transcripts covering every parsing quirk (a user and an AI title, a plan attachment, a cwd-change twin, a 70 MB file past the 64 MB per-pass budget, a 5 MiB single line, emoji/CJK/a lone surrogate, a message past the 4,000-unit cap, a file and a directory older than the 30-day window, an empty file), two subagent lanes with meta sidecars, a workflow run (journal + script + lane), tasks for two sessions, a team config, git repositories the cwds point at (a clone, a linked worktree, a non-GitHub remote) and an encoded `@owner@name@xxxxxx` scratch cwd; four Codex rollouts (CLI, desktop originator, archived), a `state_5.sqlite` with a user name, an AI title and a missing row, and Codex Desktop's sidebar (a `.codex-global-state.json` with two accounts' sections; the database's sections, a pinned thread and threads the sidebar does not list; a project placed in a section; a later change to the sections); five Claude Desktop session files and a Local Storage leveldb with a stale `.log` and an authoritative Snappy-compressed `.ldb` (two groups, assignments, unread ids, a vestigial `dframe-store`). |
 | `claude-like` | The core plus 600 sessions over 150 project dirs, 60 lanes, 30 workflow runs, 120 task sets, 300 Claude Desktop files: the shape of a real `~/.claude`. |
 | `synthetic-10k` | The core plus 10,000 sessions over 200 project dirs with 500 lanes, 30 KB each. |
 | `hot-small`, `hot-claude-like`, `hot-10k` | The hot-path shapes: the same Claude Code parent transcripts and git repositories, nothing else (see The hot-path surface below). |
@@ -93,6 +93,7 @@ stat pool returned first, an order no port can be held to.
 | `fortress-direct` | a fortress-direct route | Session bytes go to the second gateway with the capability token; sidecars and child lanes stay on the cloud gateway |
 | `daemon-backoff` | a held vault, every workflow upload 503, a transcript grows 12 s in | The long-running daemon for 50 s then SIGTERM: held sessions retry on their 20 s backoff, the workflow sidecar retries on its own backoff (77.12) instead of every tick, the stuck line is logged once per hold, the grown transcript uploads within the run (file events or polling, never a fresh process's first sweep), and `hx status` reads a current snapshot after the stop |
 | `ccd-accounts` | the per-account Claude Desktop store; an account switch 6 s into a 15 s daemon run | The mirror is the live account's drawn groups, from the newest write wherever it sits; after the switch the second account's mirror is uploaded within 3 s (the leveldb watch: the 20 s mirror timer never fires in the run) |
+| `codex-sections` | Codex Desktop's sidebar; a change to it 5 s into a 12 s daemon run, written the way Codex writes it (a temp file renamed over the old one) | The group mirror carries Codex's sections as `codex`; after the change the changed sections are uploaded within 3 s (the watch on the Codex home: the 20 s mirror timer never fires in the run) |
 | `paused`, `excluded` | settings | Pause/resume; the personal gate and an exclude rule |
 
 Fault scenarios run with `tuning.uploadConcurrency: 1`, so which file hits a
@@ -109,7 +110,7 @@ fault first is not a race.
 | `ccd-index.json` | The saved Claude Desktop index (77.12), when the reference writes one; a reference that predates it says nothing about the candidate, a candidate that drops it while the reference writes it fails. Compared twice: normalized, and byte for byte per entry (`ccd-index.json bytes`): each file is exactly what `JSON.stringify` writes for its own content, the top-level keys come in the same order, and every `dirs` and `files` entry is byte-identical to the reference's for the same path. Not compared: `savedAtMs` (the save's clock) and the order of the `files` entries, which the reference writes in the order its 32 parallel stat-and-read workers complete, so two reference runs on one tree differ there. The fixture gives the Claude Desktop store fixed mtimes with sub-millisecond fractions (`ccdMtimeSec` in `fixtures/gen-home.ts`), so both runs stat the same stamps |
 | CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes; for a long-running daemon step the SET of distinct lines, with the per-tick `uploaded=`/`failed=` counters summed over the run and the pass-level backoff's length masked — which tick a session's retry lands in follows the clock, and the backoff doubles once per failing tick in a row) |
 | `hx ui` | Every probe's status and normalized JSON |
-| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); with the per-account store, the second account's mirror is uploaded within 3 s of the switch (the check names the measured time); Codex titles come from `state_5.sqlite`; every discovered session reached the store |
+| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); with the per-account store, the second account's mirror is uploaded within 3 s of the switch (the check names the measured time); Codex titles come from `state_5.sqlite`; the mirror's `codex` equals the signed-in account's saved sidebar on every platform, and after a change the changed sections are uploaded within 3 s (hx from 77.15.0, hx2 from 78.0.2); every discovered session reached the store |
 | Coverage | All 24 calls of the protocol appear in the reference recording |
 
 Normalization (`lib/normalize.ts`) hides exactly: the candidate's name (`hx2`
@@ -279,6 +280,18 @@ and uploads its stale group), so:
 | What a server, a person or the UI can see | Rule |
 | --- | --- |
 | The mirror is the live account's drawn groups, and follows a write within about a second | a run whose version predates the reader (hx before 77.14.0, hx2 before 78.0.1) is not held to the per-account fixture; when the reference predates it, its `/sessions/group-mirror` requests, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison, and the candidate is held to the fixture instead. A reference that has the reader is compared as before |
+
+### Contract taught for Codex sections in the mirror (77.15.0, hx2 78.0.2)
+
+The group mirror carries Codex Desktop's sidebar sections as `codex`
+(`src/codex-sections.ts`): left out when the Codex read fails, null when the
+home holds no Codex state. A client that predates it sends no `codex`, makes
+no upload when only Codex changed, logs a `[groups]` line without the Codex
+count and keeps another mirror hash, so:
+
+| What a server, a person or the UI can see | Rule |
+| --- | --- |
+| The mirror carries Codex's sections, and follows a change to them within about a second | a run whose version predates them (hx before 77.15.0, hx2 before 78.0.2) is not held to the Codex fixture; when the reference predates them, its `/sessions/group-mirror` requests, the stored mirror, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison (the same rule as the per-account reader's), and the candidate is held to the fixture instead. A reference that sends `codex` is compared in full |
 
 ### Goldens
 

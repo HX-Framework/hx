@@ -12,8 +12,8 @@
 // Ports are fixed so the gateway URL the binary prints and persists is the
 // same in both runs: 48621 (cloud), 48622 (fortress), 48700 (hx ui).
 
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync, appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync, appendFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 import { FakeGateway, type GatewayConfig } from "../gateway/gateway.js";
 import { generateHome, type Manifest } from "../fixtures/gen-home.js";
@@ -311,6 +311,7 @@ async function runStep(step: Step, c: StepCtx): Promise<void> {
       const started = Date.now();
       let grown = false;
       let switched = false;
+      let codexChanged = false;
       while (Date.now() - started < step.durationMs && proc.exitCode === null && proc.signalCode === null) {
         if (step.grow && !grown && Date.now() - started >= step.grow.atMs) {
           growSession(c, step.grow.sessionIndex, step.grow.bytes, `grow:${c.scenario.name}:${step.name}`);
@@ -322,6 +323,17 @@ async function runStep(step: Step, c: StepCtx): Promise<void> {
           appendFileSync(join(c.home, sw.file), Buffer.from(sw.appendBase64, "base64"));
           c.rec.ccdSwitchTMs = c.cloud.clockMs();
           switched = true;
+        }
+        if (step.codexChange && !codexChanged && Date.now() - started >= step.codexChange.atMs) {
+          // As Codex writes it: a temp file beside it, renamed over it.
+          const ch = c.manifest.codexChange;
+          if (!ch.contentBase64) throw new Error("codexChange: the fixture has no Codex sidebar");
+          const target = join(c.home, ch.file);
+          const temp = join(dirname(target), `.${basename(target)}.tmp-${Date.now()}-harness`);
+          writeFileSync(temp, Buffer.from(ch.contentBase64, "base64"));
+          renameSync(temp, target);
+          c.rec.codexChangeTMs = c.cloud.clockMs();
+          codexChanged = true;
         }
         await new Promise((r) => setTimeout(r, 50));
       }
