@@ -229,3 +229,133 @@ export function buildLog(batches: KeyValue[][], firstSequence = 1): Buffer {
   }
   return Buffer.concat(records);
 }
+
+/** One internal entry for buildLdbEntries: a value, or a deletion (null). */
+export interface LeveldbEntry {
+  key: Buffer;
+  seq: number;
+  value: Buffer | null;
+}
+
+function internalKeyOf(userKey: Buffer, sequence: number, type: number): Buffer {
+  const tail = Buffer.alloc(8);
+  tail.writeUInt32LE((((sequence % 2 ** 24) * 256) | type) >>> 0, 0);
+  tail.writeUInt32LE(Math.floor(sequence / 2 ** 24), 4);
+  return Buffer.concat([userKey, tail]);
+}
+
+/**
+ * A table holding exactly the entries given, each with its own sequence
+ * number, deletions included: several versions of one key, as a table that
+ * no compaction has cleaned yet holds them. Sorted as leveldb sorts internal
+ * keys: user key ascending, then the newest first.
+ */
+export function buildLdbEntries(entries: LeveldbEntry[], opts: LdbOptions = {}): Buffer {
+  const sorted = [...entries].sort((a, b) => Buffer.compare(a.key, b.key) || b.seq - a.seq);
+  return buildLdbInternal(
+    sorted.map((e) => ({ key: internalKeyOf(e.key, e.seq, e.value === null ? 0 : TYPE_VALUE), value: e.value ?? Buffer.alloc(0) })),
+    opts,
+  );
+}
+
+function buildLdbInternal(entries: KeyValue[], opts: LdbOptions): Buffer {
+  const blockSize = opts.blockSize ?? 4096;
+  const restartInterval = opts.restartInterval ?? 16;
+  const compress = opts.compress ?? true;
+  const file: Buffer[] = [];
+  let offset = 0;
+  const indexEntries: KeyValue[] = [];
+  const writeBlock = (raw: Buffer, type: 0 | 1): Handle => {
+    const data = type === 1 ? snappyCompress(raw) : raw;
+    const typed = Buffer.concat([data, Buffer.from([type])]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32LE(maskCrc(crc32c(typed)), 0);
+    file.push(typed, crc);
+    const handle = { offset, size: data.length };
+    offset += typed.length + 4;
+    return handle;
+  };
+  let pending: KeyValue[] = [];
+  let pendingBytes = 0;
+  const flush = (): void => {
+    if (pending.length === 0) return;
+    const handle = writeBlock(encodeBlock(pending, restartInterval), compress ? 1 : 0);
+    indexEntries.push({ key: pending[pending.length - 1]!.key, value: encodeHandle(handle) });
+    pending = [];
+    pendingBytes = 0;
+  };
+  for (const e of entries) {
+    pending.push(e);
+    pendingBytes += e.key.length + e.value.length + 8;
+    if (pendingBytes >= blockSize) flush();
+  }
+  flush();
+  const metaHandle = writeBlock(encodeBlock([], restartInterval), 0);
+  const indexHandle = writeBlock(encodeBlock(indexEntries, 1), 0);
+  const footer = Buffer.alloc(48);
+  Buffer.concat([encodeHandle(metaHandle), encodeHandle(indexHandle)]).copy(footer, 0);
+  MAGIC.copy(footer, 40);
+  file.push(footer);
+  return Buffer.concat(file);
+}
+
+/** One write batch for buildLogBatches: entries at seq, seq + 1, … (a null
+ *  value is a deletion). */
+export interface LogBatch {
+  seq: number;
+  entries: Array<{ key: Buffer; value: Buffer | null }>;
+}
+
+const LOG_BLOCK_SIZE = 32_768;
+const LOG_HEADER_SIZE = 7;
+
+/**
+ * A write-ahead log framed exactly as leveldb's log writer frames it: a batch
+ * longer than what is left of a 32 KiB block is split into first, middle and
+ * last fragments, and a block's tail shorter than a header is zero-filled.
+ * With `startOffset`, the bytes to append to a log that long.
+ */
+export function buildLogBatches(batches: LogBatch[], opts: { startOffset?: number } = {}): Buffer {
+  const out: Buffer[] = [];
+  // Appending to a log of `startOffset` bytes continues its current block.
+  let blockOffset = (opts.startOffset ?? 0) % LOG_BLOCK_SIZE;
+  for (const batch of batches) {
+    const head = Buffer.alloc(12);
+    head.writeUInt32LE(batch.seq % 2 ** 32, 0);
+    head.writeUInt32LE(Math.floor(batch.seq / 2 ** 32), 4);
+    head.writeUInt32LE(batch.entries.length, 8);
+    const body = Buffer.concat([
+      head,
+      ...batch.entries.map((e) =>
+        e.value === null
+          ? Buffer.concat([Buffer.from([0]), varint(e.key.length), e.key])
+          : Buffer.concat([Buffer.from([TYPE_VALUE]), varint(e.key.length), e.key, varint(e.value.length), e.value]),
+      ),
+    ]);
+    let left = body.length;
+    let ptr = 0;
+    let begin = true;
+    do {
+      const leftover = LOG_BLOCK_SIZE - blockOffset;
+      if (leftover < LOG_HEADER_SIZE) {
+        if (leftover > 0) out.push(Buffer.alloc(leftover));
+        blockOffset = 0;
+      }
+      const avail = LOG_BLOCK_SIZE - blockOffset - LOG_HEADER_SIZE;
+      const len = Math.min(left, avail);
+      const end = left === len;
+      const type = begin && end ? 1 : begin ? 2 : end ? 4 : 3;
+      const data = body.subarray(ptr, ptr + len);
+      const header = Buffer.alloc(LOG_HEADER_SIZE);
+      header.writeUInt32LE(maskCrc(crc32c(Buffer.concat([Buffer.from([type]), data]))), 0);
+      header.writeUInt16LE(len, 4);
+      header[6] = type;
+      out.push(header, data);
+      blockOffset += LOG_HEADER_SIZE + len;
+      ptr += len;
+      left -= len;
+      begin = false;
+    } while (left > 0);
+  }
+  return Buffer.concat(out);
+}
