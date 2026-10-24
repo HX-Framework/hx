@@ -223,6 +223,55 @@ fn upload_semaphore() -> &'static ByteSemaphore {
     SEMAPHORE.get_or_init(|| ByteSemaphore::new(UPLOAD_BYTES_CAP))
 }
 
+// ── Progress reports (watch.ts reportSync) ──────────────────────────────────
+
+/// One progress report: its answer counts as contact with the gateway, its
+/// failure is logged (`sendSyncStatus(...).then(...).catch(...)`).
+fn send_sync_report(ctx: &Ctx, last_contact: &Mutex<f64>, snap: SyncSnapshot) {
+    match ctx.gw.send_sync_status(snap.total, snap.done, snap.total_bytes) {
+        Ok(()) => *last_contact.lock().unwrap_or_else(|e| e.into_inner()) = now_ms(),
+        Err(e) => ctx.log(&format!("[hx] sync-status error: {}", e.message())),
+    }
+}
+
+/// The progress reports still waiting for their answer. Each one runs on a
+/// thread of its own, as the TypeScript client's `void sendSyncStatus(...)`
+/// leaves its fetch running while the pass carries on.
+#[derive(Default)]
+struct ReportsInFlight {
+    count: Mutex<usize>,
+    settled: Condvar,
+}
+
+/// A report on its way; dropping it settles the report.
+struct ReportInFlight(Arc<ReportsInFlight>);
+
+impl ReportsInFlight {
+    fn start(self: &Arc<Self>) -> ReportInFlight {
+        *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        ReportInFlight(self.clone())
+    }
+
+    /// Until every report sent so far has its answer or its error. Each one
+    /// is bounded by its own deadline.
+    fn wait(&self) {
+        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        while *count > 0 {
+            count = self.settled.wait(count).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+impl Drop for ReportInFlight {
+    fn drop(&mut self) {
+        let mut count = self.0.count.lock().unwrap_or_else(|e| e.into_inner());
+        *count -= 1;
+        if *count == 0 {
+            self.0.settled.notify_all();
+        }
+    }
+}
+
 /// `runPool`: workers dequeue from the same ordered list; a stop flag ends
 /// dequeueing for every lane. A worker that returns false ends ITS lane
 /// only — the TypeScript lane whose worker threw rejects and stops while
@@ -1594,9 +1643,11 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
         }
     };
 
-    let last_contact = Mutex::new(0.0f64);
+    // Shared with the report threads, which record a report's answer as contact.
+    let last_contact = Arc::new(Mutex::new(0.0f64));
     let last_sync_sig = Mutex::new(String::new());
     let last_sync_sent = Mutex::new(0.0f64);
+    let reports = Arc::new(ReportsInFlight::default());
     let report_sync = |snap: SyncSnapshot| {
         let sig = format!("{}/{}/{}", snap.done, snap.total, snap.total_bytes);
         {
@@ -1613,9 +1664,16 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
             *last = sig;
             *sent = now;
         }
-        match ctx.gw.send_sync_status(snap.total, snap.done, snap.total_bytes) {
-            Ok(()) => *last_contact.lock().unwrap_or_else(|e| e.into_inner()) = now_ms(),
-            Err(e) => ctx.log(&format!("[hx] sync-status error: {}", e.message())),
+        // Sent without waiting for the answer: the pass goes on to its uploads.
+        let in_flight = reports.start();
+        let (report_ctx, report_contact) = (ctx.clone(), last_contact.clone());
+        let spawned = std::thread::Builder::new().name("hx-sync-status".to_string()).spawn(move || {
+            send_sync_report(&report_ctx, &report_contact, snap);
+            drop(in_flight);
+        });
+        if spawned.is_err() {
+            // No thread to be had: send the report on this thread and wait for it.
+            send_sync_report(&ctx, &last_contact, snap);
         }
     };
 
@@ -1716,6 +1774,15 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
 
     audit();
     run(&mut watchdog_limit_ms, &mut upload_backoff_ms, &mut pause_uploads_until, &mut was_paused, &mut perf);
+    // If nothing but the first pass's progress reports can have reached the
+    // gateway, their answers decide whether the first beat goes out, so the
+    // beat waits for them. The TypeScript client gets the same outcome without
+    // waiting: its first beat runs after the pass's file work, and by then the
+    // report sent at the pass's start has its answer. (The harness's
+    // readonly-state pass uploads nothing, and neither client beats after it.)
+    if now_ms() - *last_contact.lock().unwrap_or_else(|e| e.into_inner()) >= HEARTBEAT_MS {
+        reports.wait();
+    }
     beat_gateway();
     sync_group_mirror(&ctx.store, &ctx.gw, &log_fn);
     sync_team_mirror(&ctx.store, &ctx.gw, &log_fn);
@@ -1729,7 +1796,10 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
     }
     release_freed_memory();
     if opts.one_shot {
-        // Every write the pass asked for is on disk before the process exits.
+        // Every write the pass asked for is on disk before the process exits,
+        // and every progress report has its answer: the TypeScript process
+        // stays alive until its pending fetches settle.
+        reports.wait();
         ctx.store.drain();
         return;
     }
