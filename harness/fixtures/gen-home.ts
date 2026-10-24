@@ -733,12 +733,13 @@ function writeScopedCcdStore(
   const b1 = `local_${r.uuid()}`;
   const b1Cli = r.uuid();
   const b2 = `local_${r.uuid()}`;
+  // writeCcd, like the first account's files: the saved index records this
+  // org directory's mtime, so it needs the fixed stamp too.
   for (const [localId, cliSessionId, idx] of [[b1, b1Cli, 0], [b2, null, 1]] as const) {
-    write(
+    writeCcd(
       ctx,
       `${f.ccdRoot}/claude-code-sessions/acct_second/org_second/${localId}.json`,
       JSON.stringify({ sessionId: localId, ...(cliSessionId ? { cliSessionId } : {}), title: `Second account session ${idx}`, titleSource: "user", isArchived: false, lastActivityAt: CONTENT_EPOCH + idx * HOUR, cwd: f.repo }),
-      -(80 + idx) * MIN,
     );
   }
   const code = (id: string): string => `code:${id}`;
