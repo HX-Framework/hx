@@ -1481,11 +1481,14 @@ async function syncGroupMirror(cfg: HxConfig, log: (msg: string) => void): Promi
     return;
   }
   // Exclude the volatile syncedAtMs from the gate — only content changes count.
+  // The scoped layouts' blob fields count too (a new session filter, another
+  // account); a flat blob has none, so its hash is what it always was.
   const hash = hashContent(
     JSON.stringify({
       enabled: mirror.groupingEnabled,
       groups: mirror.groups,
       unread: [...mirror.unreadIds].sort(),
+      ...(mirror.layout !== undefined ? { layout: mirror.layout, statusFilter: mirror.statusFilter, scope: mirror.scope } : {}),
     }),
   );
   const key = "ccd:group-mirror";
