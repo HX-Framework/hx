@@ -17,7 +17,9 @@
 //   ccd-index.json    the saved Claude Desktop index, normalized, when the
 //                     reference writes one (a candidate may not drop it)
 //   state journal     empty or absent at the end of every run
-//   expectations      facts the fixture manifest promises (the group mirror)
+//   expectations      facts the fixture manifest promises (the group mirror,
+//                     and for the per-account Claude Desktop store, the
+//                     mirror after an account switch and how soon it came)
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -138,6 +140,29 @@ export interface CompareOptions {
   candidateName: BinaryName;
 }
 
+/** The first versions that read Claude Desktop's per-account store. */
+const SCOPED_CCD_READER: Record<BinaryName, [number, number, number]> = { hx: [77, 14, 0], hx2: [78, 0, 1] };
+
+/** Does this run's binary read the per-account Claude Desktop store? A
+ *  version that cannot be read is held to it. */
+export function readsScopedCcdStore(meta: Pick<RunMeta, "name" | "version">): boolean {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
+  if (!m) return true;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const since = SCOPED_CCD_READER[meta.name] ?? SCOPED_CCD_READER.hx;
+  for (let i = 0; i < 3; i++) if (v[i] !== since[i]) return v[i]! > since[i]!;
+  return true;
+}
+
+function fixtureManifest(run: RunDir): Manifest | null {
+  const p = join(run.dir, "fixture.manifest.json");
+  return existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as Manifest) : null;
+}
+
+/** A CCD log line about the group mirror, after its timestamp: what it
+ *  synced, or why it could not. */
+const GROUP_MIRROR_LINE = /\[groups\] (synced \d+ CCD group\(s\)|sync failed: .*)$/;
+
 export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): CheckResult[] {
   const versions = [ref.meta.version, cand.meta.version].filter(Boolean);
   const tol = opts.scenario.compare.tsToleranceMs;
@@ -145,6 +170,22 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   const ctxRef = contextFor(ref, opts.candidateName, versions, tol, "diff");
   const ctxCand = contextFor(cand, opts.candidateName, versions, tol, "diff");
   const checks: CheckResult[] = [];
+
+  // The per-account Claude Desktop store (77.14.0 / hx2 78.0.1): a reference
+  // that predates its reader uploads another mirror (an older build's
+  // leftover key, or none), logs another group count and keeps another
+  // mirror hash. The candidate is held to the fixture instead
+  // (fixtureExpectationChecks), so for such a reference those three facts
+  // leave the comparison; for a reference that reads the store they stay.
+  const mirrorExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !readsScopedCcdStore(ref.meta);
+  if (mirrorExempt) {
+    checks.push({
+      name: "group mirror",
+      ok: true,
+      details: `the reference (${ref.meta.version}) predates the per-account Claude Desktop reader: its mirror upload, the stored mirror, its [groups] log line and its mirror hash are not compared; the candidate is held to the fixture`,
+    });
+  }
+  const dropMirrorLines = (s: string): string => (mirrorExempt ? s.split("\n").filter((l) => !GROUP_MIRROR_LINE.test(l)).join("\n") : s);
 
   // Driver-level failures first: a step that did not run as expected.
   for (const run of [ref, cand]) {
@@ -163,7 +204,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     const a = readStore(join(ref.dir, file));
     const b = readStore(join(cand.dir, file));
     const bytesOnly = (m: StoreManifest): Record<string, { bytes: number; sha256: string }> =>
-      Object.fromEntries(Object.entries(m).map(([k, v]) => [k, { bytes: v.bytes, sha256: v.sha256 }]));
+      Object.fromEntries(Object.entries(m).filter(([k]) => !(mirrorExempt && k === "device:group-mirror")).map(([k, v]) => [k, { bytes: v.bytes, sha256: v.sha256 }]));
     checks.push(check(label, deepDiff(bytesOnly(a), bytesOnly(b), 0), `${Object.keys(a).length} objects identical`));
     if (!endState) {
       const chunks = (m: StoreManifest): Record<string, number> =>
@@ -175,8 +216,9 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   // Requests.
   const daemonSteps = new Set(opts.scenario.steps.filter((s) => s.kind === "watch-for").map((s) => s.name));
   if (opts.scenario.compare.requests === "per-session") {
-    checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "gateway.jsonl", "requests", daemonSteps));
-    if (ref.meta.fortressUrl) checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "fortress.jsonl", "fortress requests", daemonSteps));
+    const skipPaths = new Set(mirrorExempt ? ["/sessions/group-mirror"] : []);
+    checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "gateway.jsonl", "requests", daemonSteps, skipPaths));
+    if (ref.meta.fortressUrl) checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "fortress.jsonl", "fortress requests", daemonSteps, skipPaths));
   } else {
     checks.push({ name: "requests", ok: true, details: "end-state scenario: request sequences not compared" });
   }
@@ -189,7 +231,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   {
     const a = readJsonFile(join(ref.dir, "state.json"));
     const b = readJsonFile(join(cand.dir, "state.json"));
-    const prep = (v: unknown, ctx: NormalizeContext): unknown => normalizeJson(endState ? dropRaceFields(v) : v, ctx);
+    const prep = (v: unknown, ctx: NormalizeContext): unknown => normalizeJson(dropMirrorHash(endState ? dropRaceFields(v) : v, mirrorExempt), ctx);
     checks.push(check("state.json", deepDiff(prep(a, ctxRef), prep(b, ctxCand), tolS), endState ? "identical after normalization (heal counters and attribution flags dropped: end-state scenario)" : "identical after normalization"));
     // Key order is not compared: the client adds a top-level key (`artifacts`,
     // `deletedSessions`) when it first records that kind of fact, so the
@@ -270,8 +312,8 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
       // backoff's length masked (it doubles once per failing tick in a row,
       // so it follows the same split).
       const distinct = step.kind === "watch-for";
-      const a = normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stdout`)), ctxRef);
-      const b = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stdout`)), ctxCand);
+      const a = dropMirrorLines(normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stdout`)), ctxRef));
+      const b = dropMirrorLines(normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stdout`)), ctxCand));
       const ea = normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stderr`)), ctxRef);
       const eb = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stderr`)), ctxCand);
       const prep = (s: string): string =>
@@ -431,7 +473,17 @@ function normalizeRequest(r: RecordedRequest, ctx: NormalizeContext): Normalized
   };
 }
 
-function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ctxCand: NormalizeContext, tolS: number, file: string, label: string, daemonSteps: Set<string> = new Set()): CheckResult[] {
+/** state.json without the group mirror's content hash, when the mirror is
+ *  not compared (see compareRuns). */
+function dropMirrorHash(v: unknown, drop: boolean): unknown {
+  if (!drop || typeof v !== "object" || v === null) return v;
+  const state = v as { artifacts?: Record<string, string> };
+  if (!state.artifacts || !("ccd:group-mirror" in state.artifacts)) return v;
+  const { "ccd:group-mirror": _hash, ...artifacts } = state.artifacts;
+  return { ...state, artifacts };
+}
+
+function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ctxCand: NormalizeContext, tolS: number, file: string, label: string, daemonSteps: Set<string> = new Set(), skipPaths: Set<string> = new Set()): CheckResult[] {
   const ra = readJsonl<RecordedRequest>(join(ref.dir, file));
   const rb = readJsonl<RecordedRequest>(join(cand.dir, file));
   const fortress = file === "fortress.jsonl";
@@ -504,6 +556,7 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
       const la = pa.get(key) ?? [];
       const lb = pb.get(key) ?? [];
       const path = key.split(" ")[1]!.split("?")[0]!;
+      if (skipPaths.has(path)) continue;
       if (key.includes(" (refused ")) {
         if (la.length !== lb.length) diffs.push(`${key}: ${la.length} ≠ ${lb.length} attempts`);
         continue;
@@ -563,13 +616,40 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   // mirror must be exactly what the leveldb fixture encodes; elsewhere the
   // client uploads the disabled-empty mirror.
   const mirrors = requests.filter((r) => r.path === "/sessions/group-mirror" && r.status === 200);
-  const first = mirrors[0]?.body as { mirror?: Record<string, unknown> } | undefined;
-  if (!first?.mirror) {
+  const mirrorOf = (r: RecordedRequest | undefined): Record<string, unknown> | undefined => (r?.body as { mirror?: Record<string, unknown> } | undefined)?.mirror;
+  const pick = (m: Record<string, unknown>, want: object): Record<string, unknown> => Object.fromEntries(Object.keys(want).map((k) => [k, m[k]]));
+  const first = mirrorOf(mirrors[0]);
+  const darwin = run.meta.platform === "darwin";
+  const scoped = manifest.ccdLayout === "scoped";
+  if (scoped && darwin && !readsScopedCcdStore(run.meta)) {
+    checks.push({ name: "fixture: group mirror matches the leveldb", ok: true, details: `${run.meta.name} ${run.meta.version} predates the per-account Claude Desktop reader: not held to this store` });
+  } else if (!first) {
     checks.push({ name: "fixture: group mirror uploaded", ok: false, details: "no successful /sessions/group-mirror request" });
   } else {
-    const got = { groupingEnabled: first.mirror.groupingEnabled, groups: first.mirror.groups, unreadIds: first.mirror.unreadIds };
-    const want = run.meta.platform === "darwin" ? manifest.expectations.groupMirror : { groupingEnabled: false, groups: [], unreadIds: [] };
-    checks.push(check("fixture: group mirror matches the leveldb", deepDiff(got, want, 0), run.meta.platform === "darwin" ? `${manifest.expectations.groupMirror.groups.length} groups read from the Snappy .ldb` : "no Claude Desktop on this platform: empty mirror"));
+    const want = darwin ? manifest.expectations.groupMirror : { groupingEnabled: false, groups: [], unreadIds: [] };
+    checks.push(
+      check(
+        "fixture: group mirror matches the leveldb",
+        deepDiff(pick(first, want), want, 0),
+        !darwin ? "no Claude Desktop on this platform: empty mirror" : scoped ? `the live account's ${want.groups.length} drawn groups, read from the newest write` : `${want.groups.length} groups read from the Snappy .ldb`,
+      ),
+    );
+  }
+
+  // The account switch a daemon step writes into the per-account store: the
+  // second account's mirror must be uploaded, and soon — the leveldb watch,
+  // not the 20 s mirror timer, which never fires in the run.
+  const switched = run.meta.steps.find((s) => s.ccdSwitchTMs !== undefined);
+  const afterWant = manifest.expectations.groupMirrorAfterSwitch;
+  if (scoped && darwin && readsScopedCcdStore(run.meta) && switched && afterWant) {
+    const at = switched.ccdSwitchTMs!;
+    const hit = mirrors.find((r) => r.tMs >= at && deepDiff(pick(mirrorOf(r) ?? {}, afterWant), afterWant, 0).length === 0);
+    const latency = hit ? hit.tMs - at : null;
+    checks.push(
+      latency === null
+        ? { name: "fixture: group mirror follows the account switch", ok: false, details: `no upload of the second account's mirror after the switch (${mirrors.filter((r) => r.tMs >= at).length} mirror uploads after it)` }
+        : { name: "fixture: group mirror follows the account switch", ok: latency <= 3_000, details: `uploaded ${latency} ms after Claude Desktop's write (limit 3000 ms)` },
+    );
   }
 
   // Codex titles: every rollout with a title in state_5.sqlite must have

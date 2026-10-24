@@ -48,6 +48,17 @@ stored bytes must match byte for byte).
 | `claude-like` | The core plus 600 sessions over 150 project dirs, 60 lanes, 30 workflow runs, 120 task sets, 300 Claude Desktop files: the shape of a real `~/.claude`. |
 | `synthetic-10k` | The core plus 10,000 sessions over 200 project dirs with 500 lanes, 30 KB each. |
 
+A scenario can ask for the Claude Desktop store of current builds instead
+(`fixture: { ccdLayout: "scoped" }`, used by `ccd-accounts`): the sidebar kept
+per account (`customGroupsByScope`, and the drawn sections in
+`codeSidebarByScope` in an order of their own), the live account named by
+`lastSidebarScopeKey`, thirty signed-out accounts' groups, the newest write in
+a log numbered BELOW an older table and spanning three log blocks, a flat
+`frame-store` of an older build left beside it, a session the group list's
+`order` still keeps in the group it was moved out of, and a stale
+`collapsedGroups`. The manifest carries the expected mirror, the write that
+switches to the second account (`ccdSwitch`) and the mirror after it.
+
 Timestamps inside files are fixed; only mtimes follow the clock. They are set
 relative to one moment per scenario, taken before the reference starts and
 shared by both runs, so the two binaries find the same mtimes and the same
@@ -77,6 +88,7 @@ stat pool returned first, an order no port can be held to.
 | `retry-all` | an outage, then `hx retry --all` | Backoffs clear and one foreground pass runs |
 | `fortress-direct` | a fortress-direct route | Session bytes go to the second gateway with the capability token; sidecars and child lanes stay on the cloud gateway |
 | `daemon-backoff` | a held vault, every workflow upload 503, a transcript grows 12 s in | The long-running daemon for 50 s then SIGTERM: held sessions retry on their 20 s backoff, the workflow sidecar retries on its own backoff (77.12) instead of every tick, the stuck line is logged once per hold, the grown transcript uploads within the run (file events or polling, never a fresh process's first sweep), and `hx status` reads a current snapshot after the stop |
+| `ccd-accounts` | the per-account Claude Desktop store; an account switch 6 s into a 15 s daemon run | The mirror is the live account's drawn groups, from the newest write wherever it sits; after the switch the second account's mirror is uploaded within 3 s (the leveldb watch: the 20 s mirror timer never fires in the run) |
 | `paused`, `excluded` | settings | Pause/resume; the personal gate and an exclude rule |
 
 Fault scenarios run with `tuning.uploadConcurrency: 1`, so which file hits a
@@ -93,7 +105,7 @@ fault first is not a race.
 | `ccd-index.json` | The saved Claude Desktop index (77.12), normalized, when the reference writes one; a reference that predates it says nothing about the candidate, a candidate that drops it while the reference writes it fails |
 | CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes; for a long-running daemon step the SET of distinct lines, with the per-tick `uploaded=`/`failed=` counters summed over the run and the pass-level backoff's length masked — which tick a session's retry lands in follows the clock, and the backoff doubles once per failing tick in a row) |
 | `hx ui` | Every probe's status and normalized JSON |
-| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); Codex titles come from `state_5.sqlite`; every discovered session reached the store |
+| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); with the per-account store, the second account's mirror is uploaded within 3 s of the switch (the check names the measured time); Codex titles come from `state_5.sqlite`; every discovered session reached the store |
 | Coverage | All 24 calls of the protocol appear in the reference recording |
 
 Normalization (`lib/normalize.ts`) hides exactly: the candidate's name (`hx2`
@@ -129,6 +141,20 @@ surface identical: stored bytes, request sequences, `state.json`,
 | (not a fix) the daemon's clock | The held sessions' retries land in two ticks whose split varies run to run, so the per-tick counters and the pass-level backoff length vary with them — found by the candidate-vs-itself jobs of the first run | per-tick counters summed, backoff length masked, in daemon steps |
 | Saved Claude Desktop index (`ccd-index.json`) | A new cache file in `~/.let/hx` | compared when the reference writes it |
 | File events as hints | Nothing, unless watching fails: one `[hx] file events unavailable (…)` line | none (a failure to arm shows up as a diff, which is the point) |
+
+### Contract taught for the per-account Claude Desktop reader (77.14.0, hx2 78.0.1)
+
+Claude Desktop now keeps its sidebar per account, and the drawn sections apart
+from the group list; the reader it replaced read fields current builds no
+longer write. On the flat store every scenario but `ccd-accounts` uses,
+nothing changed: the flat fixture is byte-identical, and so is everything
+compared. On the per-account store a client that predates the reader uploads
+another mirror (77.11.0 latches onto the older build's leftover `frame-store`
+and uploads its stale group), so:
+
+| What a server, a person or the UI can see | Rule |
+| --- | --- |
+| The mirror is the live account's drawn groups, and follows a write within about a second | a run whose version predates the reader (hx before 77.14.0, hx2 before 78.0.1) is not held to the per-account fixture; when the reference predates it, its `/sessions/group-mirror` requests, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison, and the candidate is held to the fixture instead. A reference that has the reader is compared as before |
 
 ### Goldens
 
@@ -222,7 +248,8 @@ configuration, steps. Step kinds: `run` (the binary with arguments),
 `gateway` / `fortress` (change faults, routes, tombstones at run time),
 `gateway-stop` / `gateway-start`, `watch-kill` (SIGKILL after N composed
 chunks), `watch-for` (run the daemon for a fixed time, optionally growing a
-transcript part-way, then SIGTERM), `ui` (start `hx ui` and probe its API),
+transcript or writing the Claude Desktop account switch part-way, then
+SIGTERM), `ui` (start `hx ui` and probe its API),
 `chmod-hx-dir`, `grow` (append to a transcript), `settings`. Gateway faults:
 `outageStatus` (every call), `workflowStatus` (`POST /sessions/workflow`
 only), `heldVaults`, `vault503`, `tombstones`, `putDelayMs`. Placeholders `<SELF>`, `<SELF+1>`,
