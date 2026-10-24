@@ -258,6 +258,16 @@ export const SCENARIOS: Scenario[] = [
     compare: { requests: "per-session", tsToleranceMs: 20_000 },
   },
   {
+    name: "ccd-accounts",
+    description:
+      "The Claude Desktop store of current builds: the sidebar kept per account, the drawn sections in an order of their own, the newest write in a log numbered below an older table and spanning three log blocks, a flat key of an older build left beside it. Two one-shot passes upload everything; then the daemon runs 15 s, and 6 s in Claude Desktop switches accounts (one more write to its log). The mirror follows from the leveldb watch within about a second; the 20 s mirror timer never fires in the run.",
+    shape: "small",
+    seed: "ccd-accounts",
+    fixture: { ccdLayout: "scoped" },
+    steps: [once("watch1"), once("watch2"), { kind: "watch-for", name: "daemon", durationMs: 15_000, ccdSwitch: { atMs: 6_000 } }, status("status1")],
+    compare: { requests: "per-session", tsToleranceMs: 20_000 },
+  },
+  {
     name: "paused",
     description: "settings.json pauses sync: the first pass uploads nothing and says so; resumed, the second pass uploads everything.",
     shape: "small",
