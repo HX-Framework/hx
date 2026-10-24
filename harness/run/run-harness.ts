@@ -86,7 +86,7 @@ for (const scenario of scenarios) {
   const checks: CheckResult[] = [
     ...compareRuns(ref, cand, { scenario, candidateName }),
     ...fixtureExpectationChecks(ref, scenario).map((c) => ({ ...c, name: `reference ${c.name}` })),
-    ...fixtureExpectationChecks(cand, scenario).map((c) => ({ ...c, name: `candidate ${c.name}` })),
+    ...fixtureExpectationChecks(cand, scenario, { requireCodexSections: true }).map((c) => ({ ...c, name: `candidate ${c.name}` })),
     ...goldenChecks(scenario, cand, candidateName, [ref.meta.version, cand.meta.version], goldensDir),
   ];
   if (writeGoldensDir) writeGoldens(scenario, ref, candidateName, [ref.meta.version, cand.meta.version], writeGoldensDir);

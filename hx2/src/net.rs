@@ -1043,6 +1043,17 @@ impl Gateway {
     }
 
     /// POST /sessions/group-mirror; returns the gateway's `groups` count.
+    /// POST /sessions/codex-sections with `{ sections }` (uploadCodexSections).
+    pub fn upload_codex_sections(&self, sections: Json) -> Result<f64, NetError> {
+        let body = obj(vec![("sections", sections)]);
+        let res = self.post("codex-sections upload", "/sessions/codex-sections", &body.stringify(), GATEWAY_TIMEOUT_MS)?;
+        if !res.ok() {
+            return Err(plain_error(&res, "codex-sections upload"));
+        }
+        let json = parse_json_body(&res, "codex-sections upload")?;
+        Ok(json.get_f64("groups").unwrap_or(0.0))
+    }
+
     pub fn upload_group_mirror(&self, mirror: Json) -> Result<f64, NetError> {
         let body = obj(vec![("mirror", mirror)]);
         let res = self.post("group-mirror upload", "/sessions/group-mirror", &body.stringify(), GATEWAY_TIMEOUT_MS)?;

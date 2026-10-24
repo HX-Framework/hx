@@ -30,7 +30,8 @@ use crate::home::homedir;
 use crate::js::{math_round, num_to_string, to_locale_time_string_en_us, JsStr};
 use crate::json::{obj, Json, OMap};
 use crate::logger::Logger;
-use crate::mirror::{sync_group_mirror, sync_team_mirror};
+use crate::codex_sections::CodexSidebarWatch;
+use crate::mirror::{sync_codex_sections, sync_group_mirror, sync_team_mirror};
 use crate::net::{put_chunk, vault_blocker_from_destinations, Blocker, Gateway, HxHttpError, NetError};
 use crate::orgnames::remember_org_names;
 use crate::parse::{summarise_chunk, ChunkSummary};
@@ -1718,6 +1719,7 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
     run(&mut watchdog_limit_ms, &mut upload_backoff_ms, &mut pause_uploads_until, &mut was_paused, &mut perf);
     beat_gateway();
     sync_group_mirror(&ctx.store, &ctx.gw, &log_fn);
+    sync_codex_sections(&ctx.store, &ctx.gw, &log_fn);
     sync_team_mirror(&ctx.store, &ctx.gw, &log_fn);
     if let Err(e) = run_reattribute_sweep(&ctx.cfg, &ctx.store, &ctx.gw, &log_fn, false) {
         ctx.log(&format!("[hx] attribution sweep error: {}", e.message()));
@@ -1737,6 +1739,15 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
         Some(h) => h,
         None => return,
     };
+
+    // Codex's sections sync on every change to Codex's sidebar files: the
+    // watch marks a burst, and the loop syncs once it is due (150 ms after
+    // the last change, at most 1 s after the first). The 20 s mirror timer is
+    // the safety net.
+    let codex_homes: Vec<String> = resolve_data_roots(&read_settings()).codex.iter().map(|r| r.config_dir.clone()).collect();
+    let codex_watch = CodexSidebarWatch::arm(&codex_homes, &|reason: String| {
+        ctx.log(&format!("[hx] Codex sidebar changes unwatched ({}); the 20 s sync still runs", reason))
+    });
 
     // Timers, on the daemon's clock.
     let start = now_ms();
@@ -1768,8 +1779,13 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
                 next_beat += HEARTBEAT_MS;
             }
         }
+        if codex_watch.due_at().map(|due| now >= due).unwrap_or(false) {
+            codex_watch.clear();
+            sync_codex_sections(&ctx.store, &ctx.gw, &log_fn);
+        }
         if now >= next_mirror {
             sync_group_mirror(&ctx.store, &ctx.gw, &log_fn);
+            sync_codex_sections(&ctx.store, &ctx.gw, &log_fn);
             sync_team_mirror(&ctx.store, &ctx.gw, &log_fn);
             while next_mirror <= now_ms() {
                 next_mirror += MIRROR_SYNC_MS;
@@ -1834,7 +1850,8 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
                 next_watchdog += WATCHDOG_CHECK_MS;
             }
         }
-        let next_due = [next_tick, next_beat, next_mirror, next_audit, next_flush, next_perf, next_watchdog].iter().cloned().fold(f64::INFINITY, f64::min);
+        let next_codex = codex_watch.due_at().unwrap_or(f64::INFINITY);
+        let next_due = [next_tick, next_beat, next_mirror, next_audit, next_flush, next_perf, next_watchdog, next_codex].iter().cloned().fold(f64::INFINITY, f64::min);
         let wait = (next_due - now_ms()).clamp(1.0, 500.0);
         std::thread::sleep(Duration::from_millis(wait as u64));
     }

@@ -10,7 +10,7 @@
 
 import type { HxConfig } from "./config.js";
 import type { Family } from "./sources.js";
-import type { HxCcdGroupMirrorBlob } from "./mirror-types.js";
+import type { HxCcdGroupMirrorBlob, HxCodexSectionsBlob } from "./mirror-types.js";
 import type { SyncBlockerDetails, SyncBlockerDestination } from "./state.js";
 import {
   GATEWAY_BATCH_TIMEOUT_MS,
@@ -665,6 +665,27 @@ export async function uploadPlan(
       throw new Error(`plan upload failed: ${res.status} ${txt.slice(0, 200)}`);
     }
     return (await res.json()) as { ok: true };
+  });
+}
+
+// Codex Desktop's sidebar sections: the device's whole set, rewritten in
+// place. Hash-gated by the caller, like the CCD mirror below.
+export async function uploadCodexSections(
+  cfg: HxConfig,
+  sections: HxCodexSectionsBlob,
+): Promise<{ ok: true; groups: number }> {
+  return withDeadline("codex-sections upload", GATEWAY_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/codex-sections`, {
+      method: "POST",
+      headers: authHeaders(cfg),
+      body: JSON.stringify({ sections }),
+      signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`codex-sections upload failed: ${res.status} ${txt.slice(0, 200)}`);
+    }
+    return (await res.json()) as { ok: true; groups: number };
   });
 }
 

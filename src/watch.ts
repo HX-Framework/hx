@@ -111,6 +111,7 @@ import {
   sendHeartbeat,
   sendSyncStatus,
   type SyncSnapshot,
+  uploadCodexSections,
   uploadGroupMirror,
   uploadPlan,
   uploadTasks,
@@ -122,6 +123,7 @@ import {
 import { summariseChunk } from "./parse.js";
 import { getCcdRecentsByCliId, saveCcdIndexIfChanged } from "./ccd.js";
 import { buildGroupMirror } from "./ccd-prefs.js";
+import { buildCodexSections, watchCodexSidebar } from "./codex-sections.js";
 import {
   findPlanPathInText,
   hashContent,
@@ -1496,6 +1498,40 @@ async function syncGroupMirror(cfg: HxConfig, log: (msg: string) => void): Promi
     log(`  [groups] synced ${res.groups} CCD group(s)`);
   } catch (err) {
     log(`  [groups] sync failed: ${(err as Error).message}`);
+  }
+}
+
+// Read Codex Desktop's sidebar sections (codex-sections.ts) and upload them if
+// they changed since the last sync. Hash-gated on the groups alone, like the
+// CCD mirror above. A read that fails uploads nothing: the server treats an
+// upload as the device's whole set of sections. A refused upload of the same
+// sections is not retried for ten minutes, so a gateway that does not take
+// them yet (a 404 from an older server) costs one request per ten minutes,
+// not one per change.
+const CODEX_SECTIONS_RETRY_MS = 10 * 60_000;
+let codexSectionsRefused: { hash: string; atMs: number } | null = null;
+async function syncCodexSections(cfg: HxConfig, log: (msg: string) => void): Promise<void> {
+  const scope = scopeOf(cfg);
+  let sections;
+  try {
+    const homes = resolveDataRoots(await readSettings()).codex.map((r) => r.configDir);
+    sections = buildCodexSections(homes, Date.now());
+  } catch {
+    return;
+  }
+  if (!sections) return;
+  const hash = hashContent(JSON.stringify(sections.groups));
+  const key = "codex:sections";
+  if ((await getArtifactHash(key, scope)) === hash) return;
+  if (codexSectionsRefused?.hash === hash && Date.now() - codexSectionsRefused.atMs < CODEX_SECTIONS_RETRY_MS) return;
+  try {
+    const res = await uploadCodexSections(cfg, sections);
+    await setArtifactHash(key, hash, scope);
+    codexSectionsRefused = null;
+    log(`  [codex] synced ${res.groups} Codex section(s)`);
+  } catch (err) {
+    codexSectionsRefused = { hash, atMs: Date.now() };
+    log(`  [codex] sections sync failed: ${(err as Error).message}`);
   }
 }
 
@@ -2970,6 +3006,7 @@ export async function startWatch(
   await run();
   await beat(); // announce liveness immediately so a fresh daemon reads "live"
   await syncGroupMirror(cfg, log); // push CCD's grouping on start
+  await syncCodexSections(cfg, log); // and Codex's sidebar sections
   await syncTeamMirror(cfg, log); // push active agent teams on start
   // One-shot attribution sweep — no-ops when every known file already carries
   // the current DETECTION_VERSION stamp, so a routine restart costs nothing.
@@ -2996,8 +3033,35 @@ export async function startWatch(
   // used to stack copies of itself — a 20 s mirror timer became back-to-back
   // scans of the CCD store, each adding its own allocation burst.
   const beatOnce = singleFlight(beat);
+  // Codex's sections sync on every change to Codex's sidebar files (a
+  // debounced watch on each Codex home), so a change reaches the server in
+  // about a second; the 20 s mirror timer below is the safety net. A change
+  // that lands while a sync runs runs it again once that sync ends.
+  let codexSyncing = false;
+  let codexAgain = false;
+  const codexSync = async (): Promise<void> => {
+    if (codexSyncing) {
+      codexAgain = true;
+      return;
+    }
+    codexSyncing = true;
+    try {
+      do {
+        codexAgain = false;
+        await syncCodexSections(cfg, log);
+      } while (codexAgain);
+    } finally {
+      codexSyncing = false;
+    }
+  };
+  const codexWatch = watchCodexSidebar(
+    resolveDataRoots(await readSettings()).codex.map((r) => r.configDir),
+    () => void codexSync(),
+    (reason) => log(`[hx] Codex sidebar changes unwatched (${reason}); the 20 s sync still runs`),
+  );
   const mirrorOnce = singleFlight(async () => {
     await syncGroupMirror(cfg, log);
+    await codexSync();
     await syncTeamMirror(cfg, log);
   });
   const hbTimer = setInterval(() => void beatOnce(), HEARTBEAT_MS);
@@ -3073,6 +3137,7 @@ export async function startWatch(
       clearInterval(timer);
       clearInterval(hbTimer);
       clearInterval(mirrorTimer);
+      codexWatch.close();
       clearInterval(auditTimer);
       clearInterval(flushTimer);
       clearInterval(perfTimer);

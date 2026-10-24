@@ -534,6 +534,11 @@ export class FakeGateway {
       );
       return json({ ok: true, groups: Array.isArray(mirror.groups) ? mirror.groups.length : 0 });
     }
+    if (method === "POST" && path === "/sessions/codex-sections") {
+      const sections = (b.sections ?? {}) as { groups?: unknown[] };
+      this.sidecars.set("device:codex-sections", JSON.stringify(sections.groups ?? []));
+      return json({ ok: true, groups: Array.isArray(sections.groups) ? sections.groups.length : 0 });
+    }
 
     annotate.noise = !path.startsWith("/sessions/") && !path.startsWith("/devices/");
     return json({ error: "not_found", path }, 404);
