@@ -142,7 +142,7 @@ export async function runScenario(o: DriverOptions): Promise<RunMeta> {
   const fixtureNowMs = o.fixtureNowMs ?? startedAtMs;
 
   // Fixture home.
-  const manifest = generateHome({ out: o.home, shape: scenario.shape, seed: scenario.seed, now: fixtureNowMs });
+  const manifest = generateHome({ out: o.home, shape: scenario.shape, seed: scenario.seed, now: fixtureNowMs, ccdLayout: scenario.fixture?.ccdLayout });
   cpSync(`${o.home}.manifest.json`, join(o.outDir, "fixture.manifest.json"));
   // A second, empty home for the "not connected" step.
   const emptyHome = `${o.home}-empty`;
@@ -310,10 +310,18 @@ async function runStep(step: Step, c: StepCtx): Promise<void> {
       const err = new Response(proc.stderr).text();
       const started = Date.now();
       let grown = false;
+      let switched = false;
       while (Date.now() - started < step.durationMs && proc.exitCode === null && proc.signalCode === null) {
         if (step.grow && !grown && Date.now() - started >= step.grow.atMs) {
           growSession(c, step.grow.sessionIndex, step.grow.bytes, `grow:${c.scenario.name}:${step.name}`);
           grown = true;
+        }
+        if (step.ccdSwitch && !switched && Date.now() - started >= step.ccdSwitch.atMs) {
+          const sw = c.manifest.ccdSwitch;
+          if (!sw) throw new Error("ccdSwitch: the fixture has no Claude Desktop account switch (ccdLayout scoped)");
+          appendFileSync(join(c.home, sw.file), Buffer.from(sw.appendBase64, "base64"));
+          c.rec.ccdSwitchTMs = c.cloud.clockMs();
+          switched = true;
         }
         await new Promise((r) => setTimeout(r, 50));
       }

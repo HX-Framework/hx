@@ -19,6 +19,7 @@ use std::time::Duration;
 use crate::activity::{append_activity, trim_activity};
 use crate::catalog::DiscoveryCatalog;
 use crate::ccd::{get_ccd_recents_by_cli_id, save_ccd_index_if_changed, CcdSessionMeta};
+use crate::ccd_prefs::SidebarWatch;
 use crate::children::{
     build_child_parent_index, child_needs_pass, contested_child_lanes, discover_child_backfill, elect_child_uploaders, ingest_child_one, latch_child_lane_pause,
     merge_child_backfill, plan_child_lane_resets, plan_workflow_sync, reconcile_child_parent, sync_workflow_run, workflow_lane_after_failure, WorkflowLane, WorkflowPlan,
@@ -1528,6 +1529,29 @@ pub struct DaemonHooks {
     pub stop_requested: Arc<AtomicBool>,
 }
 
+/// Ends the loop's sleep early: Claude Desktop's sidebar store was written,
+/// so the mirror is read on time (`SidebarWatch`) instead of after the rest of
+/// a sleep of up to 500 ms.
+#[derive(Default)]
+struct LoopWake {
+    woken: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl LoopWake {
+    fn wake(&self) {
+        *self.woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.cv.notify_all();
+    }
+
+    /// Sleep `ms`, or until woken.
+    fn sleep(&self, ms: u64) {
+        let guard = self.woken.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut guard, _) = self.cv.wait_timeout_while(guard, Duration::from_millis(ms), |woken| !*woken).unwrap_or_else(|e| e.into_inner());
+        *guard = false;
+    }
+}
+
 /// `startWatch`: the whole loop. Returns after one pass for a one-shot run, or
 /// when the daemon is asked to stop.
 pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>) {
@@ -1738,6 +1762,20 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
         None => return,
     };
 
+    // A write to Claude Desktop's sidebar store reaches the mirror within about
+    // a second (debounced in SidebarWatch); the 20 s timer stays as the safety
+    // net for a missed event or a store that cannot be watched.
+    let wake = Arc::new(LoopWake::default());
+    let wake_fn: Arc<dyn Fn() + Send + Sync> = {
+        let w = wake.clone();
+        Arc::new(move || w.wake())
+    };
+    let sidebar_failed: Arc<dyn Fn(String) + Send + Sync> = {
+        let logger = ctx.clone();
+        Arc::new(move |reason: String| logger.log(&format!("[hx] Claude Desktop sidebar events unavailable ({}); its groups sync every {} s", reason, num_to_string(MIRROR_SYNC_MS / 1000.0))))
+    };
+    let sidebar = SidebarWatch::arm(wake_fn, sidebar_failed);
+
     // Timers, on the daemon's clock.
     let start = now_ms();
     let mut next_tick = start + FAST_POLL_MS;
@@ -1774,6 +1812,9 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
             while next_mirror <= now_ms() {
                 next_mirror += MIRROR_SYNC_MS;
             }
+        }
+        if sidebar.as_ref().map(|s| s.take_due(now_ms())).unwrap_or(false) {
+            sync_group_mirror(&ctx.store, &ctx.gw, &log_fn);
         }
         if now >= next_audit {
             audit();
@@ -1834,9 +1875,10 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
                 next_watchdog += WATCHDOG_CHECK_MS;
             }
         }
-        let next_due = [next_tick, next_beat, next_mirror, next_audit, next_flush, next_perf, next_watchdog].iter().cloned().fold(f64::INFINITY, f64::min);
+        let sidebar_due = sidebar.as_ref().and_then(|s| s.due_at()).unwrap_or(f64::INFINITY);
+        let next_due = [next_tick, next_beat, next_mirror, next_audit, next_flush, next_perf, next_watchdog, sidebar_due].iter().cloned().fold(f64::INFINITY, f64::min);
         let wait = (next_due - now_ms()).clamp(1.0, 500.0);
-        std::thread::sleep(Duration::from_millis(wait as u64));
+        wake.sleep(wait as u64);
     }
 
     // stop(): close events, a parting checkpoint, the index saved once more,
