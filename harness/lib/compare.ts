@@ -227,8 +227,9 @@ function fixtureManifest(run: RunDir): Manifest | null {
   return existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as Manifest) : null;
 }
 
-/** A CCD log line about the group mirror: what it synced, or why it could not. */
-const GROUP_MIRROR_LINE = /^\s*\[groups\] (synced \d+ CCD group\(s\)|sync failed: .*)$/;
+/** A CCD log line about the group mirror, after its timestamp: what it
+ *  synced, or why it could not. */
+const GROUP_MIRROR_LINE = /\[groups\] (synced \d+ CCD group\(s\)|sync failed: .*)$/;
 
 export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): CheckResult[] {
   const versions = [ref.meta.version, cand.meta.version].filter(Boolean);
@@ -249,7 +250,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     checks.push({
       name: "group mirror",
       ok: true,
-      details: `the reference (${ref.meta.version}) predates the per-account Claude Desktop reader: its mirror upload, its [groups] log line and its mirror hash are not compared; the candidate is held to the fixture`,
+      details: `the reference (${ref.meta.version}) predates the per-account Claude Desktop reader: its mirror upload, the stored mirror, its [groups] log line and its mirror hash are not compared; the candidate is held to the fixture`,
     });
   }
   const dropMirrorLines = (s: string): string => (mirrorExempt ? s.split("\n").filter((l) => !GROUP_MIRROR_LINE.test(l)).join("\n") : s);
@@ -271,7 +272,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     const a = readStore(join(ref.dir, file));
     const b = readStore(join(cand.dir, file));
     const bytesOnly = (m: StoreManifest): Record<string, { bytes: number; sha256: string }> =>
-      Object.fromEntries(Object.entries(m).map(([k, v]) => [k, { bytes: v.bytes, sha256: v.sha256 }]));
+      Object.fromEntries(Object.entries(m).filter(([k]) => !(mirrorExempt && k === "device:group-mirror")).map(([k, v]) => [k, { bytes: v.bytes, sha256: v.sha256 }]));
     checks.push(check(label, deepDiff(bytesOnly(a), bytesOnly(b), 0), `${Object.keys(a).length} objects identical`));
     if (!endState) {
       const chunks = (m: StoreManifest): Record<string, number> =>
