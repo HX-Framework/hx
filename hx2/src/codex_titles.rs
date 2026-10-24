@@ -40,7 +40,7 @@ fn cache() -> &'static Mutex<HashMap<String, Cached>> {
 }
 
 /// Newest `state_<N>.sqlite` under a Codex home, or None.
-fn state_db_path(codex_home: &str) -> Option<String> {
+pub fn state_db_path(codex_home: &str) -> Option<String> {
     let entries = fs::read_dir(codex_home).ok()?;
     let mut best: Option<(u64, String)> = None;
     for e in entries.filter_map(|e| e.ok()) {

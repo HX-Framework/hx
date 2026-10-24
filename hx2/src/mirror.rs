@@ -4,8 +4,10 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use crate::ccd_prefs::{build_group_mirror, group_mirror_gate};
+use crate::codex_sections::build_codex_sections;
 use crate::fsutil::{join, now_ms, readdir_safe, stat_safe};
 use crate::json::{obj, Json};
 
@@ -40,6 +42,54 @@ pub fn sync_group_mirror(store: &Store, gw: &Gateway, log: &dyn Fn(&str)) {
     match result {
         Ok(groups) => log(&format!("  [groups] synced {} CCD group(s)", crate::js::num_to_string(groups))),
         Err(e) => log(&format!("  [groups] sync failed: {}", e)),
+    }
+}
+
+/// A refused upload of the same sections is not retried for ten minutes, so a
+/// gateway without the endpoint (a 404) costs one request per ten minutes.
+const CODEX_SECTIONS_RETRY_MS: f64 = 10.0 * 60_000.0;
+
+fn codex_sections_refused() -> &'static Mutex<Option<(String, f64)>> {
+    static REFUSED: OnceLock<Mutex<Option<(String, f64)>>> = OnceLock::new();
+    REFUSED.get_or_init(|| Mutex::new(None))
+}
+
+/// `syncCodexSections`: Codex Desktop's sidebar sections, hash-gated on the
+/// groups; a read that fails uploads nothing.
+pub fn sync_codex_sections(store: &Store, gw: &Gateway, log: &dyn Fn(&str)) {
+    let homes: Vec<String> = resolve_data_roots(&read_settings()).codex.iter().map(|r| r.config_dir.clone()).collect();
+    let sections = match build_codex_sections(&homes, now_ms()) {
+        Some(s) => s,
+        None => return,
+    };
+    let hash = sha1_hex(&sections.groups_json().stringify());
+    let key = "codex:sections";
+    if store.get_artifact_hash(key).as_deref() == Some(hash.as_str()) {
+        return;
+    }
+    {
+        let refused = codex_sections_refused().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((h, at)) = refused.as_ref() {
+            if *h == hash && now_ms() - at < CODEX_SECTIONS_RETRY_MS {
+                return;
+            }
+        }
+    }
+    let result: Result<f64, String> = (|| {
+        let groups = gw.upload_codex_sections(sections.to_json()).map_err(|e| e.message())?;
+        store.set_artifact_hash(key, &hash)?;
+        Ok(groups)
+    })();
+    let mut refused = codex_sections_refused().lock().unwrap_or_else(|e| e.into_inner());
+    match result {
+        Ok(groups) => {
+            *refused = None;
+            log(&format!("  [codex] synced {} Codex section(s)", crate::js::num_to_string(groups)));
+        }
+        Err(e) => {
+            *refused = Some((hash, now_ms()));
+            log(&format!("  [codex] sections sync failed: {}", e));
+        }
     }
 }
 

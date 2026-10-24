@@ -45,7 +45,7 @@ stored bytes must match byte for byte).
 
 | Shape | What it holds |
 | --- | --- |
-| `small` | The curated core: 13 Claude Code transcripts covering every parsing quirk (a user and an AI title, a plan attachment, a cwd-change twin, a 70 MB file past the 64 MB per-pass budget, a 5 MiB single line, emoji/CJK/a lone surrogate, a message past the 4,000-unit cap, a file and a directory older than the 30-day window, an empty file), two subagent lanes with meta sidecars, a workflow run (journal + script + lane), tasks for two sessions, a team config, git repositories the cwds point at (a clone, a linked worktree, a non-GitHub remote) and an encoded `@owner@name@xxxxxx` scratch cwd; four Codex rollouts (CLI, desktop originator, archived) and a `state_5.sqlite` with a user name, an AI title and a missing row; five Claude Desktop session files and a Local Storage leveldb with a stale `.log` and an authoritative Snappy-compressed `.ldb` (two groups, assignments, unread ids, a vestigial `dframe-store`). |
+| `small` | The curated core: 13 Claude Code transcripts covering every parsing quirk (a user and an AI title, a plan attachment, a cwd-change twin, a 70 MB file past the 64 MB per-pass budget, a 5 MiB single line, emoji/CJK/a lone surrogate, a message past the 4,000-unit cap, a file and a directory older than the 30-day window, an empty file), two subagent lanes with meta sidecars, a workflow run (journal + script + lane), tasks for two sessions, a team config, git repositories the cwds point at (a clone, a linked worktree, a non-GitHub remote) and an encoded `@owner@name@xxxxxx` scratch cwd; four Codex rollouts (CLI, desktop originator, archived), a `state_5.sqlite` with a user name, an AI title and a missing row, and Codex Desktop's sidebar (a `.codex-global-state.json` with two accounts' sections; the database's sections, a pinned thread and threads the sidebar does not list; a project placed in a section); five Claude Desktop session files and a Local Storage leveldb with a stale `.log` and an authoritative Snappy-compressed `.ldb` (two groups, assignments, unread ids, a vestigial `dframe-store`). |
 | `claude-like` | The core plus 600 sessions over 150 project dirs, 60 lanes, 30 workflow runs, 120 task sets, 300 Claude Desktop files: the shape of a real `~/.claude`. |
 | `synthetic-10k` | The core plus 10,000 sessions over 200 project dirs with 500 lanes, 30 KB each. |
 | `hot-small`, `hot-claude-like`, `hot-10k` | The hot-path shapes: the same Claude Code parent transcripts and git repositories, nothing else (see The hot-path surface below). |
@@ -97,8 +97,8 @@ fault first is not a race.
 | `ccd-index.json` | The saved Claude Desktop index (77.12), when the reference writes one; a reference that predates it says nothing about the candidate, a candidate that drops it while the reference writes it fails. Compared twice: normalized, and byte for byte per entry (`ccd-index.json bytes`): each file is exactly what `JSON.stringify` writes for its own content, the top-level keys come in the same order, and every `dirs` and `files` entry is byte-identical to the reference's for the same path. Not compared: `savedAtMs` (the save's clock) and the order of the `files` entries, which the reference writes in the order its 32 parallel stat-and-read workers complete, so two reference runs on one tree differ there. The fixture gives the Claude Desktop store fixed mtimes with sub-millisecond fractions (`ccdMtimeSec` in `fixtures/gen-home.ts`), so both runs stat the same stamps |
 | CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes; for a long-running daemon step the SET of distinct lines, with the per-tick `uploaded=`/`failed=` counters summed over the run and the pass-level backoff's length masked — which tick a session's retry lands in follows the clock, and the backoff doubles once per failing tick in a row) |
 | `hx ui` | Every probe's status and normalized JSON |
-| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); Codex titles come from `state_5.sqlite`; every discovered session reached the store |
-| Coverage | All 24 calls of the protocol appear in the reference recording |
+| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); Codex titles come from `state_5.sqlite`; the uploaded Codex sections equal the signed-in account's saved sidebar (every platform; required of the candidate, checked in a reference that sends them); every discovered session reached the store |
+| Coverage | All 24 calls of the protocol appear in the reference recording, and from a 77.14 reference on, `POST /sessions/codex-sections` too |
 
 Normalization (`lib/normalize.ts`) hides exactly: the candidate's name (`hx2`
 → `hx`, the one allowed difference, in output and asset names; for hx2 the
@@ -253,6 +253,17 @@ to run outside CI or over an existing path (`harness/run/service-home.ts`).
 (`harness/run/phys-footprint.c`, compiled once per run with `cc`): RSS counts
 pages the allocator has handed back through `malloc_zone_pressure_relief`,
 the footprint does not.
+
+### Contracts taught for 77.14
+
+77.14 uploads Codex Desktop's sidebar sections (`src/codex-sections.ts`): a
+new call, `POST /sessions/codex-sections`, at start and whenever Codex's
+sidebar files change. A reference before 77.14 makes no such call, so it says
+nothing about the candidate's; a reference that makes it is compared in full.
+
+| Change | What a server, a person or the UI can see | Rule |
+| --- | --- | --- |
+| Codex sections upload | One `POST /sessions/codex-sections` per change of the sections, a `codex:sections` hash in `state.json`'s artifacts, a `device:codex-sections` sidecar in the fake gateway's store, a `[codex] synced N Codex section(s)` line | Against a reference that made no such call: the candidate's call, sidecar, artifact hash and `[codex]` lines are left out of the comparison, and the fixture check requires the candidate's upload to equal the saved sidebar |
 
 ### Goldens
 

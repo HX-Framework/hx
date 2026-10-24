@@ -18,7 +18,14 @@
 //                     writes one (a candidate may not drop it): normalized,
 //                     and byte for byte per entry (ccdIndexByteDiffs)
 //   state journal     empty or absent at the end of every run
-//   expectations      facts the fixture manifest promises (the group mirror)
+//   expectations      facts the fixture manifest promises (the group mirror,
+//                     Codex titles, Codex's sidebar sections)
+//
+// A reference that predates the Codex sections upload (before 77.14) makes no
+// /sessions/codex-sections call, stores no `device:codex-sections` sidecar,
+// records no `codex:sections` artifact hash and logs no `[codex]` line; that
+// reference says nothing about the candidate's, so those are left out of the
+// candidate's side. A reference that has it is compared in full.
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -199,6 +206,33 @@ function check(name: string, diffs: Difference[] | string[], okDetails: string):
   return { name, ok: false, details: lines.slice(0, 40).join("\n") };
 }
 
+// ── A reference that predates the Codex sections upload ────────────────────
+
+const CODEX_SECTIONS_PATH = "/sessions/codex-sections";
+const CODEX_SECTIONS_SIDECAR = "device:codex-sections";
+const CODEX_SECTIONS_ARTIFACT = "codex:sections";
+
+/** True when the run made no Codex sections upload at all: a client before 77.14. */
+export function predatesCodexSections(run: RunDir): boolean {
+  return !readJsonl<RecordedRequest>(join(run.dir, "gateway.jsonl")).some((r) => r.path === CODEX_SECTIONS_PATH);
+}
+
+/** The candidate's output without the lines a reference before 77.14 cannot print. */
+export function dropCodexSectionLines(text: string): string {
+  return text
+    .split("\n")
+    .filter((l) => !/\[codex\] /.test(l) && !l.includes("[hx] Codex sidebar changes unwatched"))
+    .join("\n");
+}
+
+function dropCodexSectionsArtifact(state: unknown): unknown {
+  if (!state || typeof state !== "object") return state;
+  const s = state as { artifacts?: Record<string, unknown> };
+  if (!s.artifacts || !(CODEX_SECTIONS_ARTIFACT in s.artifacts)) return state;
+  const { [CODEX_SECTIONS_ARTIFACT]: _dropped, ...artifacts } = s.artifacts;
+  return { ...s, artifacts };
+}
+
 // ── The comparisons ────────────────────────────────────────────────────────
 
 export interface CompareOptions {
@@ -213,6 +247,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   const ctxRef = contextFor(ref, opts.candidateName, versions, tol, "diff");
   const ctxCand = contextFor(cand, opts.candidateName, versions, tol, "diff");
   const checks: CheckResult[] = [];
+  const refPredatesCodex = predatesCodexSections(ref);
 
   // Driver-level failures first: a step that did not run as expected.
   for (const run of [ref, cand]) {
@@ -230,6 +265,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   for (const [file, label] of storeFiles) {
     const a = readStore(join(ref.dir, file));
     const b = readStore(join(cand.dir, file));
+    if (refPredatesCodex) delete b[CODEX_SECTIONS_SIDECAR];
     const bytesOnly = (m: StoreManifest): Record<string, { bytes: number; sha256: string }> =>
       Object.fromEntries(Object.entries(m).map(([k, v]) => [k, { bytes: v.bytes, sha256: v.sha256 }]));
     checks.push(check(label, deepDiff(bytesOnly(a), bytesOnly(b), 0), `${Object.keys(a).length} objects identical`));
@@ -243,7 +279,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   // Requests.
   const daemonSteps = new Set(opts.scenario.steps.filter((s) => s.kind === "watch-for").map((s) => s.name));
   if (opts.scenario.compare.requests === "per-session") {
-    checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "gateway.jsonl", "requests", daemonSteps));
+    checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "gateway.jsonl", "requests", daemonSteps, refPredatesCodex));
     if (ref.meta.fortressUrl) checks.push(...compareRequests(ref, cand, ctxRef, ctxCand, tolS, "fortress.jsonl", "fortress requests", daemonSteps));
   } else {
     checks.push({ name: "requests", ok: true, details: "end-state scenario: request sequences not compared" });
@@ -257,7 +293,8 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   // those fields; everything else in the state must still agree.
   {
     const a = readJsonFile(join(ref.dir, "state.json"));
-    const b = readJsonFile(join(cand.dir, "state.json"));
+    const b0 = readJsonFile(join(cand.dir, "state.json"));
+    const b = refPredatesCodex ? dropCodexSectionsArtifact(b0) : b0;
     const prep = (v: unknown, ctx: NormalizeContext): unknown => normalizeJson(endState ? dropRaceFields(v) : v, ctx);
     checks.push(check("state.json", deepDiff(prep(a, ctxRef), prep(b, ctxCand), tolS), endState ? "identical after normalization (heal counters and attribution flags dropped: end-state scenario)" : "identical after normalization"));
     // Key order is not compared: the client adds a top-level key (`artifacts`,
@@ -346,7 +383,8 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
       // so it follows the same split).
       const distinct = step.kind === "watch-for";
       const a = normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stdout`)), ctxRef);
-      const b = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stdout`)), ctxCand);
+      const b0 = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stdout`)), ctxCand);
+      const b = refPredatesCodex ? dropCodexSectionLines(b0) : b0;
       const ea = normalizeText(readText(join(ref.dir, "steps", `${stepFile(rs)}.stderr`)), ctxRef);
       const eb = normalizeText(readText(join(cand.dir, "steps", `${stepFile(cs)}.stderr`)), ctxCand);
       const prep = (s: string): string =>
@@ -531,9 +569,9 @@ function userAgentCheck(cand: RunDir): CheckResult {
   return check("hx2 user-agent", wrong, `every request carries user-agent: ${want}`);
 }
 
-function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ctxCand: NormalizeContext, tolS: number, file: string, label: string, daemonSteps: Set<string> = new Set()): CheckResult[] {
+function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ctxCand: NormalizeContext, tolS: number, file: string, label: string, daemonSteps: Set<string> = new Set(), refPredatesCodex = false): CheckResult[] {
   const ra = readJsonl<RecordedRequest>(join(ref.dir, file));
-  const rb = readJsonl<RecordedRequest>(join(cand.dir, file));
+  const rb = readJsonl<RecordedRequest>(join(cand.dir, file)).filter((r) => !(refPredatesCodex && r.path === CODEX_SECTIONS_PATH));
   const fortress = file === "fortress.jsonl";
   const checks: CheckResult[] = [];
   const stepsA = ref.meta.steps;
@@ -652,7 +690,7 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
 
 // ── Fixture expectations and coverage ──────────────────────────────────────
 
-export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): CheckResult[] {
+export function fixtureExpectationChecks(run: RunDir, scenario: Scenario, opts: { requireCodexSections?: boolean } = {}): CheckResult[] {
   const manifestPath = join(run.dir, "fixture.manifest.json");
   if (!existsSync(manifestPath)) return [];
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Manifest;
@@ -684,6 +722,23 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   }
   checks.push(check("fixture: codex titles from state_5.sqlite", missing, `${Object.keys(manifest.expectations.codexTitles).length} titles`));
 
+  // Codex Desktop's sidebar sections: the first upload must be exactly the
+  // sections the fixture's .codex-global-state.json and state_5.sqlite hold
+  // for the signed-in account, on every platform. A client before 77.14
+  // uploads none; the candidate built from this source must.
+  const codexUploads = requests.filter((r) => r.path === CODEX_SECTIONS_PATH && r.status === 200);
+  const firstCodex = codexUploads[0]?.body as { sections?: { groups?: unknown } } | undefined;
+  if (!firstCodex?.sections) {
+    checks.push(
+      opts.requireCodexSections
+        ? { name: "fixture: codex sections uploaded", ok: false, details: `no successful ${CODEX_SECTIONS_PATH} request` }
+        : { name: "fixture: codex sections uploaded", ok: true, details: "this client predates the Codex sections upload" },
+    );
+  } else {
+    const want = manifest.expectations.codexSections ?? [];
+    checks.push(check("fixture: codex sections match the saved sidebar", deepDiff(firstCodex.sections.groups, want, 0), `${want.length} sections, ${want.reduce((n, g) => n + g.sessionIds.length, 0)} threads`));
+  }
+
   // Every in-window session reached a store (the cloud one or the fortress),
   // unless the scenario keeps sessions back on purpose.
   if (scenario.storeComplete !== false) {
@@ -697,8 +752,9 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   return checks;
 }
 
-/** The 24 calls the client makes, as path patterns. */
-export const PROTOCOL_CALLS: Array<{ name: string; method: string; path: RegExp }> = [
+/** The calls the client makes, as path patterns. A call with `since` is
+ *  required only of references at that version or later. */
+export const PROTOCOL_CALLS: Array<{ name: string; method: string; path: RegExp; since?: string }> = [
   { name: "devices/code", method: "POST", path: /^\/devices\/code$/ },
   { name: "devices/poll", method: "POST", path: /^\/devices\/poll$/ },
   { name: "whoami", method: "GET", path: /^\/whoami$/ },
@@ -721,14 +777,25 @@ export const PROTOCOL_CALLS: Array<{ name: string; method: string; path: RegExp 
   { name: "sessions/workflow", method: "POST", path: /^\/sessions\/workflow$/ },
   { name: "sessions/team-mirror", method: "POST", path: /^\/sessions\/team-mirror$/ },
   { name: "sessions/group-mirror", method: "POST", path: /^\/sessions\/group-mirror$/ },
+  { name: "sessions/codex-sections", method: "POST", path: /^\/sessions\/codex-sections$/, since: "77.14.0" },
   { name: "download/hx-version", method: "GET", path: /^\/download\/hx2?-version$/ },
   { name: "download/hx-<os>-<arch>.gz + .sha256", method: "GET", path: /^\/download\/hx2?-[a-z]+-[a-z0-9]+\.(gz|sha256)$/ },
 ];
 
+function atLeast(version: string, since: string): boolean {
+  const a = version.split(".").map(Number);
+  const b = since.split(".").map(Number);
+  for (let i = 0; i < 3; i++) if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+  return true;
+}
+
 /** Every protocol call seen at least once across the runs. `excluded` names
  *  the calls a selection cannot make (the M5 steps' calls under
- *  `--scenarios daemon`); they are listed but not required. */
+ *  `--scenarios daemon`); they are listed but not required. A call with
+ *  `since` is required only of references at that version or later. */
 export function coverageCheck(runDirs: string[], required = true, excluded: readonly string[] = []): CheckResult {
+  const versions = runDirs.map((d) => loadRun(d).meta.version);
+  const due = (c: { since?: string }): boolean => !c.since || versions.every((v) => atLeast(v, c.since!));
   const seen = new Map<string, number>();
   for (const dir of runDirs) {
     for (const file of ["gateway.jsonl", "fortress.jsonl"]) {
@@ -739,9 +806,15 @@ export function coverageCheck(runDirs: string[], required = true, excluded: read
       }
     }
   }
-  const calls = PROTOCOL_CALLS.filter((c) => !excluded.includes(c.name));
+  const calls = PROTOCOL_CALLS.filter((c) => !excluded.includes(c.name) && due(c));
   const missing = calls.filter((c) => !seen.has(c.name)).map((c) => c.name);
-  const lines = PROTOCOL_CALLS.map((c) => `${seen.has(c.name) ? "✓" : excluded.includes(c.name) ? "–" : "✗"} ${c.name}: ${seen.get(c.name) ?? 0}${excluded.includes(c.name) ? " (not part of this selection)" : ""}`);
+  const lines = PROTOCOL_CALLS.map((c) =>
+    excluded.includes(c.name)
+      ? `${seen.has(c.name) ? "✓" : "–"} ${c.name}: ${seen.get(c.name) ?? 0} (not part of this selection)`
+      : due(c)
+        ? `${seen.has(c.name) ? "✓" : "✗"} ${c.name}: ${seen.get(c.name) ?? 0}`
+        : `– ${c.name}: ${seen.get(c.name) ?? 0} (the reference predates ${c.since})`,
+  );
   if (!required) lines.push("(advisory: not every scenario ran)");
   return { name: `coverage: all ${calls.length} calls recorded`, ok: missing.length === 0 || !required, details: lines.join("\n") };
 }

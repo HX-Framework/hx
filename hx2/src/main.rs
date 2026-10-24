@@ -15,6 +15,7 @@ mod ccd;
 mod ccd_leveldb;
 mod ccd_prefs;
 mod children;
+mod codex_sections;
 mod codex_titles;
 mod commands;
 mod config;
