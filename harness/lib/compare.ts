@@ -140,10 +140,12 @@ export interface CompareOptions {
   candidateName: BinaryName;
 }
 
-/** The first versions that read Claude Desktop's per-account store. */
-const SCOPED_CCD_READER: Record<BinaryName, [number, number, number]> = { hx: [77, 14, 0], hx2: [78, 0, 1] };
+/** The first versions that mirror Claude Desktop's per-account sidebar as it
+ *  is drawn. hx 77.14.0 read the store but sent the stored sort direction,
+ *  which for alphabetical sorting is the opposite of the drawn one. */
+const SCOPED_CCD_READER: Record<BinaryName, [number, number, number]> = { hx: [77, 14, 1], hx2: [78, 0, 1] };
 
-/** Does this run's binary read the per-account Claude Desktop store? A
+/** Is this run's binary held to the per-account Claude Desktop fixture? A
  *  version that cannot be read is held to it. */
 export function readsScopedCcdStore(meta: Pick<RunMeta, "name" | "version">): boolean {
   const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
@@ -171,8 +173,8 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   const ctxCand = contextFor(cand, opts.candidateName, versions, tol, "diff");
   const checks: CheckResult[] = [];
 
-  // The per-account Claude Desktop store (77.14.0 / hx2 78.0.1): a reference
-  // that predates its reader uploads another mirror (an older build's
+  // The per-account Claude Desktop store (hx 77.14.1 / hx2 78.0.1): a reference
+  // that predates that mirror uploads another one (an older build's
   // leftover key, or none), logs another group count and keeps another
   // mirror hash. The candidate is held to the fixture instead
   // (fixtureExpectationChecks), so for such a reference those three facts
@@ -182,7 +184,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     checks.push({
       name: "group mirror",
       ok: true,
-      details: `the reference (${ref.meta.version}) predates the per-account Claude Desktop reader: its mirror upload, the stored mirror, its [groups] log line and its mirror hash are not compared; the candidate is held to the fixture`,
+      details: `the reference (${ref.meta.version}) predates the per-account Claude Desktop mirror (hx 77.14.1, hx2 78.0.1): its mirror upload, the stored mirror, its [groups] log line and its mirror hash are not compared; the candidate is held to the fixture`,
     });
   }
   const dropMirrorLines = (s: string): string => (mirrorExempt ? s.split("\n").filter((l) => !GROUP_MIRROR_LINE.test(l)).join("\n") : s);
@@ -622,7 +624,7 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   const darwin = run.meta.platform === "darwin";
   const scoped = manifest.ccdLayout === "scoped";
   if (scoped && darwin && !readsScopedCcdStore(run.meta)) {
-    checks.push({ name: "fixture: group mirror matches the leveldb", ok: true, details: `${run.meta.name} ${run.meta.version} predates the per-account Claude Desktop reader: not held to this store` });
+    checks.push({ name: "fixture: group mirror matches the leveldb", ok: true, details: `${run.meta.name} ${run.meta.version} predates the per-account Claude Desktop mirror (hx 77.14.1, hx2 78.0.1): not held to this store` });
   } else if (!first) {
     checks.push({ name: "fixture: group mirror uploaded", ok: false, details: "no successful /sessions/group-mirror request" });
   } else {

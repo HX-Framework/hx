@@ -14,15 +14,20 @@ export interface HxCcdGroup {
    *  that couldn't be resolved keeps its "local_<uuid>" form as a fallback. */
   sessionIds: string[];
   /** The scoped layouts only (blob `layout` set). How CCD sorts the group's
-   *  sessions ("created", "recency", "alpha"…; null when it does not say):
-   *  the members above are in stored order, never sorted by activity here, so
+   *  sessions ("created", "recency" or "alpha"; null when it does not say),
+   *  and the direction the rows are drawn in (true: oldest first, A to Z).
+   *  For "alpha" CCD stores the opposite direction; this is the drawn one.
+   *  The members above are in stored order, never sorted by activity here, so
    *  session activity never changes the blob. */
   sortBy?: string | null;
   ascending?: boolean | null;
-  /** false: the user switched the group's section off, and CCD does not draw it. */
+  /** false: CCD does not draw the group's section. Current builds draw every
+   *  group's section (only Routines can be switched off), so the sections
+   *  layout always sends true. */
   shown?: boolean;
-  /** CCD's "show empty groups" for the section: false hides the section when
-   *  no session it would show is left (archived ones are hidden by statusFilter). */
+  /** CCD's "show empty groups", one setting for every group: false hides a
+   *  group when no session it would show is left (archived ones are hidden
+   *  by statusFilter). */
   showEmpty?: boolean;
 }
 

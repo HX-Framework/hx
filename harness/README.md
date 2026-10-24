@@ -142,7 +142,7 @@ surface identical: stored bytes, request sequences, `state.json`,
 | Saved Claude Desktop index (`ccd-index.json`) | A new cache file in `~/.let/hx` | compared when the reference writes it |
 | File events as hints | Nothing, unless watching fails: one `[hx] file events unavailable (…)` line | none (a failure to arm shows up as a diff, which is the point) |
 
-### Contract taught for the per-account Claude Desktop reader (77.14.0, hx2 78.0.1)
+### Contract taught for the per-account Claude Desktop reader (77.14.1, hx2 78.0.1)
 
 Claude Desktop now keeps its sidebar per account, and the drawn sections apart
 from the group list; the reader it replaced read fields current builds no
@@ -150,11 +150,15 @@ longer write. On the flat store every scenario but `ccd-accounts` uses,
 nothing changed: the flat fixture is byte-identical, and so is everything
 compared. On the per-account store a client that predates the reader uploads
 another mirror (77.11.0 latches onto the older build's leftover `frame-store`
-and uploads its stale group), so:
+and uploads its stale group). hx 77.14.0 read the per-account store but sent
+each group's stored sort direction, which for alphabetical sorting is the
+opposite of the one Claude Desktop draws, and each group's own "show empty"
+flag, which Claude Desktop never reads; the fixture holds clients to the drawn
+values, so hx is held from 77.14.1. So:
 
 | What a server, a person or the UI can see | Rule |
 | --- | --- |
-| The mirror is the live account's drawn groups, and follows a write within about a second | a run whose version predates the reader (hx before 77.14.0, hx2 before 78.0.1) is not held to the per-account fixture; when the reference predates it, its `/sessions/group-mirror` requests, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison, and the candidate is held to the fixture instead. A reference that has the reader is compared as before |
+| The mirror is the live account's drawn groups, and follows a write within about a second | a run whose version predates the reader (hx before 77.14.1, hx2 before 78.0.1) is not held to the per-account fixture; when the reference predates it, its `/sessions/group-mirror` requests, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison, and the candidate is held to the fixture instead. A reference that has the reader is compared as before |
 
 ### Goldens
 

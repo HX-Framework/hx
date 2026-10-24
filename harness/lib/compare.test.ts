@@ -104,10 +104,11 @@ describe("compareRuns with one fixture clock for both runs", () => {
 });
 
 describe("readsScopedCcdStore", () => {
-  it("holds hx from 77.14.0 and hx2 from 78.0.1 to the per-account Claude Desktop store", () => {
+  it("holds hx from 77.14.1 and hx2 from 78.0.1 to the per-account Claude Desktop fixture", () => {
     expect(readsScopedCcdStore({ name: "hx", version: "77.11.0" })).toBe(false);
     expect(readsScopedCcdStore({ name: "hx", version: "77.13.9" })).toBe(false);
-    expect(readsScopedCcdStore({ name: "hx", version: "77.14.0" })).toBe(true);
+    expect(readsScopedCcdStore({ name: "hx", version: "77.14.0" })).toBe(false);
+    expect(readsScopedCcdStore({ name: "hx", version: "77.14.1" })).toBe(true);
     expect(readsScopedCcdStore({ name: "hx", version: "78.0.0" })).toBe(true);
     expect(readsScopedCcdStore({ name: "hx2", version: "78.0.0" })).toBe(false);
     expect(readsScopedCcdStore({ name: "hx2", version: "78.0.1" })).toBe(true);

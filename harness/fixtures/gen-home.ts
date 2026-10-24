@@ -729,18 +729,28 @@ function writeScopedCcdStore(
       },
       codeSidebarByScope: {
         [A]: {
+          // Read as CCD draws them: alpha with a stored false is A to Z; a
+          // group's own `shown` and `show.emptyGroups` are never read (only
+          // Routines can be switched off; "show empty groups" lives on the
+          // Sessions section).
           sections: [
             builtin("pinned", 0, { collapsed: true }),
             builtin("routines", 1, { shown: false }),
-            manual("cg-gamma", "Gamma", 2, [ids.repoDesktop], { sortBy: "alpha", ascending: true }),
-            manual("cg-alpha", alphaName, 3, [ids.repoCli], { collapsed: true }),
+            manual("cg-gamma", "Gamma", 2, [ids.repoDesktop], { sortBy: "alpha", ascending: false }),
+            manual("cg-alpha", alphaName, 3, [ids.repoCli], { collapsed: true, shown: false }),
             manual("cg-beta", "Beta", 4, [ids.unknown, ids.archived, ids.noCli], { show: { ...show, emptyGroups: true } }),
             builtin("sessions", 5),
           ],
           migratedFrom: 1,
           prefsSeeded: true,
         },
-        [B]: { sections: [builtin("pinned", 0), manual("cg-old", "Old Project", 2, [b1, b2]), builtin("sessions", 3)], migratedFrom: 1, prefsSeeded: true },
+        // No stored sort (CCD reads "recency", newest first), and "show empty
+        // groups" switched on.
+        [B]: {
+          sections: [builtin("pinned", 0), manual("cg-old", "Old Project", 2, [b1, b2], { sortBy: undefined, ascending: undefined }), builtin("sessions", 3, { show: { ...show, emptyGroups: true } })],
+          migratedFrom: 1,
+          prefsSeeded: true,
+        },
       },
       pendingLegacyGroupMigration: null,
       lastSidebarScopeKey: live,
@@ -784,7 +794,7 @@ function writeScopedCcdStore(
     groups: [
       group("cg-gamma", "Gamma", false, [f.repoDesktop], "alpha", true, false),
       group("cg-alpha", "Alpha", true, [f.repoCli], "created", false, false),
-      group("cg-beta", "Beta", false, [f.unknownCli, f.archivedCli, ids.noCli], "created", false, true),
+      group("cg-beta", "Beta", false, [f.unknownCli, f.archivedCli, ids.noCli], "created", false, false),
     ],
     unreadIds,
     layout: "sections",
@@ -794,7 +804,7 @@ function writeScopedCcdStore(
   };
   ctx.manifest.expectations.groupMirrorAfterSwitch = {
     groupingEnabled: true,
-    groups: [group("cg-old", "Old Project", false, [b1Cli, b2], "created", false, false)],
+    groups: [group("cg-old", "Old Project", false, [b1Cli, b2], "recency", false, true)],
     unreadIds,
     layout: "sections",
     statusFilter: "active",
