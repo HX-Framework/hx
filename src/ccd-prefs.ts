@@ -441,10 +441,12 @@ async function readRecordJson(dir: string, r: LeveldbRecord): Promise<Obj | null
 let viewCache: { id: string; view: SidebarView } | null = null;
 
 /** The sidebar view and the unread ids. `view` is null when the store holds no
- *  sidebar state at all. */
-async function readStore(dir: string): Promise<{ view: SidebarView | null; unreadIds: string[] }> {
+ *  sidebar state at all. `failed` when the read cannot be trusted: files kept
+ *  moving under it, or the newest sidebar write could not be read. */
+async function readStore(dir: string): Promise<{ view: SidebarView | null; unreadIds: string[]; failed: boolean }> {
   for (let attempt = 0; ; attempt++) {
-    const recs = await readerFor(dir).newest();
+    const reader = readerFor(dir);
+    const recs = await reader.newest();
     const sidebar: LeveldbRecord[] = [];
     const unread: LeveldbRecord[] = [];
     for (const r of recs.values()) {
@@ -454,7 +456,8 @@ async function readStore(dir: string): Promise<{ view: SidebarView | null; unrea
     }
     const scan = sidebar.length === 0 || unread.length === 0 ? await scanLeveldbOnce(dir, sidebar.length === 0, unread.length === 0) : null;
 
-    let moved = false;
+    let moved = !reader.complete;
+    let unreadable = false;
     let view: SidebarView | null = null;
     if (sidebar.length === 0) {
       view = scan?.dframe ? resolveView(scan.dframe) : null;
@@ -471,7 +474,12 @@ async function readStore(dir: string): Promise<{ view: SidebarView | null; unrea
           moved = true;
           break;
         }
-        const state = obj && isObj(obj.state) ? (obj.state as DframeState) : null;
+        if (obj === null) {
+          // A sidebar write that cannot be read: what the sidebar shows is unknown.
+          unreadable = true;
+          break;
+        }
+        const state = isObj(obj.state) ? (obj.state as DframeState) : null;
         if (!isGroupingState(state)) continue;
         view = resolveView(state);
         viewCache = { id, view };
@@ -492,8 +500,50 @@ async function readStore(dir: string): Promise<{ view: SidebarView | null; unrea
         }
       }
     }
-    if (!moved || attempt >= 2) return { view, unreadIds };
+    if (unreadable || !moved || attempt >= 2) return { view, unreadIds, failed: moved || unreadable };
   }
+}
+
+// ── The server's limits ─────────────────────────────────────────────────────
+
+// The gateway refuses a whole upload with one value over its limits (the
+// group-mirror schema), so the blob is cut to them here: groups past the 500th
+// and ids past the 5,000th of a list are left out, as is an id longer than 200
+// characters; a name, subtitle, section name or note is cut to its length; a
+// sort or session filter longer than 40 characters is not one, and is null.
+const MAX_GROUPS = 500;
+const MAX_IDS = 5_000;
+const MAX_ID = 200;
+
+function capIds(ids: string[]): string[] {
+  return ids.filter((id) => id.length <= MAX_ID).slice(0, MAX_IDS);
+}
+
+function capText(v: unknown, max: number): unknown {
+  return typeof v === "string" && v.length > max ? v.slice(0, max) : v;
+}
+
+function capWord(v: string | null | undefined): string | null | undefined {
+  return typeof v === "string" && v.length > 40 ? null : v;
+}
+
+function capBlob(blob: HxCcdGroupMirrorBlob): HxCcdGroupMirrorBlob {
+  const out: HxCcdGroupMirrorBlob = {
+    ...blob,
+    groups: blob.groups
+      .filter((g) => typeof g.id === "string" && g.id.length >= 1 && g.id.length <= MAX_ID)
+      .slice(0, MAX_GROUPS)
+      .map((g) => {
+        const c: HxCcdGroup = { ...g, name: capText(g.name, 400) as string, subtitle: capText(g.subtitle, 400) as string | null, sectionName: capText(g.sectionName, 200) as string | null, sessionIds: capIds(g.sessionIds) };
+        if ("sortBy" in g) c.sortBy = capWord(g.sortBy);
+        return c;
+      }),
+    unreadIds: capIds(blob.unreadIds),
+    note: capText(blob.note, 2_000) as string | null | undefined,
+  };
+  if ("statusFilter" in blob) out.statusFilter = capWord(blob.statusFilter);
+  if ("archivedIds" in blob) out.archivedIds = capIds(blob.archivedIds ?? []);
+  return out;
 }
 
 // ── The mirror ─────────────────────────────────────────────────────────────
@@ -512,8 +562,10 @@ let mirrorInFlight: Promise<HxCcdGroupMirrorBlob> | null = null;
 
 /**
  * Assemble the CCD sidebar mirror the gateway stores. Returns a disabled-empty
- * mirror when CCD shows no custom groups or nothing could be read — the UI then
- * falls back to its own grouping dimensions.
+ * mirror when CCD shows no custom groups — the UI then falls back to its own
+ * grouping dimensions. Throws when the store could not be read whole: every
+ * upload is the device's whole sidebar, so the caller skips the cycle rather
+ * than send one that would empty it.
  */
 export function buildGroupMirror(nowMs: number): Promise<HxCcdGroupMirrorBlob> {
   if (mirrorInFlight) return mirrorInFlight.then((blob) => ({ ...blob, syncedAtMs: nowMs }));
@@ -547,23 +599,19 @@ async function buildGroupMirrorNow(nowMs: number): Promise<HxCcdGroupMirrorBlob>
   }
 
   if (LS_DIR === null) return empty;
-  let view: SidebarView | null;
-  let unreadIds: string[];
-  try {
-    ({ view, unreadIds } = await readStore(LS_DIR));
-  } catch {
-    return empty;
-  }
+  const read = await readStore(LS_DIR);
+  if (read.failed) throw new Error("the Claude Desktop store changed under the read, or its newest sidebar write could not be read");
+  const { view, unreadIds } = read;
 
-  // The scoped layouts name the layout, the view filter and the live account
-  // (hashed) even when the account has no groups, so a reader can tell an
-  // empty account from a client that predates them.
-  const scoped = (blob: HxCcdGroupMirrorBlob, v: SidebarView): HxCcdGroupMirrorBlob =>
-    v.layout === null ? blob : { ...blob, layout: v.layout, statusFilter: v.statusFilter, scope: v.scope };
+  // The scoped layouts name the layout, the view filter, the archived members
+  // and the live account (hashed) even when the account has no groups, so a
+  // reader can tell an empty account from a client that predates them.
+  const scoped = (blob: HxCcdGroupMirrorBlob, v: SidebarView, archivedIds: string[]): HxCcdGroupMirrorBlob =>
+    v.layout === null ? blob : { ...blob, layout: v.layout, statusFilter: v.statusFilter, archivedIds, scope: v.scope };
 
   if (view === null || !view.enabled) {
     const base: HxCcdGroupMirrorBlob = { ...empty, unreadIds: (unreadIds ?? []).map(stripCodePrefix) };
-    const blob = view === null ? base : scoped({ ...base, note: view.note }, view);
+    const blob = capBlob(view === null ? base : scoped({ ...base, note: view.note }, view, []));
     mirrorCache = { ldbFp, indexVersion, blob };
     return blob;
   }
@@ -578,11 +626,13 @@ async function buildGroupMirrorNow(nowMs: number): Promise<HxCcdGroupMirrorBlob>
   // session.sessionId. An id that can't be resolved keeps its local_<uuid> form
   // so a freshly-stamped session still matches via the ccdSessionId fallback.
   const cliByCcd = new Map<string, string>();
+  const archived = new Set<string>();
   try {
     // The index was refreshed above, so this is the mapping as of
     // `indexVersion` — exactly what the cache entry below is keyed by.
     for (const r of await readCcdRecentsCached(nowMs)) {
       if (r.cliSessionId) cliByCcd.set(r.ccdSessionId, r.cliSessionId);
+      if (r.isArchived) archived.add(r.ccdSessionId);
     }
   } catch {
     /* no CCD session metadata — fall back to the local_<uuid> ids */
@@ -607,15 +657,33 @@ async function buildGroupMirrorNow(nowMs: number): Promise<HxCcdGroupMirrorBlob>
     return out;
   });
 
-  const blob = scoped(
-    {
-      groupingEnabled: true,
-      groups,
-      unreadIds: (unreadIds ?? []).map(stripCodePrefix).map(toCli),
-      note: view.note,
-      syncedAtMs: nowMs,
-    },
-    view,
+  // The members CCD has archived, which its "active" session filter hides
+  // (the server has no archived flag of its own), in group order, in the id
+  // space of sessionIds.
+  const archivedIds: string[] = [];
+  const seenArchived = new Set<string>();
+  for (const g of view.groups) {
+    for (const m of g.members) {
+      if (!archived.has(m)) continue;
+      const id = toCli(m);
+      if (seenArchived.has(id)) continue;
+      seenArchived.add(id);
+      archivedIds.push(id);
+    }
+  }
+
+  const blob = capBlob(
+    scoped(
+      {
+        groupingEnabled: true,
+        groups,
+        unreadIds: (unreadIds ?? []).map(stripCodePrefix).map(toCli),
+        note: view.note,
+        syncedAtMs: nowMs,
+      },
+      view,
+      archivedIds,
+    ),
   );
   mirrorCache = { ldbFp, indexVersion, blob };
   return blob;

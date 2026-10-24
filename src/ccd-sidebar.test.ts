@@ -33,7 +33,8 @@ afterEach(() => {
 });
 
 /** A fixture root with CCD session files for local_a..local_e (cli-a..cli-e;
- *  local_e has no cli id yet) and an empty leveldb directory. */
+ *  local_e has no cli id yet, local_b is archived) and an empty leveldb
+ *  directory. */
 function setup(): void {
   root = mkdtempSync(join(tmpdir(), "hx-ccd-sidebar-"));
   ldb = join(root, "leveldb");
@@ -43,7 +44,7 @@ function setup(): void {
   for (const id of ["a", "b", "c", "d", "e"]) {
     writeFileSync(
       join(org, `local_${id}.json`),
-      JSON.stringify({ sessionId: `local_${id}`, ...(id === "e" ? {} : { cliSessionId: `cli-${id}` }), title: id, titleSource: "user", isArchived: false, lastActivityAt: 1 }),
+      JSON.stringify({ sessionId: `local_${id}`, ...(id === "e" ? {} : { cliSessionId: `cli-${id}` }), title: id, titleSource: "user", isArchived: id === "b", lastActivityAt: 1 }),
     );
   }
   setCcdLeveldbDirForTests(ldb);
@@ -131,9 +132,31 @@ describe("CCD mirror: current builds (drawn sections per account)", () => {
       ],
     );
     assert.deepEqual(blob.unreadIds, ["cli-a", "local_e"]);
+    assert.deepEqual(blob.archivedIds, ["cli-b"], "the archived member, which CCD's active filter hides");
     assert.ok(!blob.groups.some((g) => g.name === "Second account"), "another account's group never reaches the mirror");
     assert.deepEqual(Object.keys(blob.groups[0]!), ["id", "name", "subtitle", "sectionName", "collapsed", "sessionIds", "sortBy", "ascending", "shown", "showEmpty"]);
-    assert.deepEqual(Object.keys(blob), ["groupingEnabled", "groups", "unreadIds", "note", "syncedAtMs", "layout", "statusFilter", "scope"]);
+    assert.deepEqual(Object.keys(blob), ["groupingEnabled", "groups", "unreadIds", "note", "syncedAtMs", "layout", "statusFilter", "archivedIds", "scope"]);
+  });
+
+  it("throws, so the cycle uploads nothing, when the newest sidebar write cannot be read", async () => {
+    setup();
+    writeFileSync(join(ldb, "000005.ldb"), buildLdbEntries([{ key: DFRAME, seq: 10, value: json(scopedState(A)) }]));
+    writeFileSync(join(ldb, "000004.log"), buildLogBatches([{ seq: 12, entries: [{ key: DFRAME, value: localStorageValue("{not json") }] }]));
+    await assert.rejects(buildGroupMirror((nowMs += 1000)), /could not be read/);
+  });
+
+  it("cuts the blob to the gateway's limits", async () => {
+    setup();
+    const st = scopedState(A) as { state: { codeSidebarByScope: Record<string, { sections: Array<Record<string, unknown>> }> } };
+    const one = st.state.codeSidebarByScope[A]!.sections.find((s) => s.id === "g1")!;
+    one.name = "N".repeat(450);
+    one.members = Array.from({ length: 5_003 }, (_, i) => `code:local_m${i}`);
+    one.sortBy = "s".repeat(41);
+    writeFileSync(join(ldb, "000005.ldb"), buildLdbEntries([{ key: DFRAME, seq: 10, value: json(st) }]));
+    const g = (await buildGroupMirror((nowMs += 1000))).groups.find((x) => x.id === "g1")!;
+    assert.equal(g.name.length, 400);
+    assert.equal(g.sessionIds.length, 5_000);
+    assert.equal(g.sortBy, null);
   });
 
   it("follows an account switch written to the log", async () => {

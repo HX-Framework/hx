@@ -22,7 +22,9 @@ afterAll(() => {
 const pick = (blob: Record<string, unknown>, want: ExpectedGroupMirror): Record<string, unknown> =>
   Object.fromEntries(Object.keys(want).map((k) => [k, blob[k]]));
 
-describe("gen-home ccdLayout scoped", () => {
+// The fixture generator writes POSIX-shaped homes; the harness runs on Linux
+// and macOS only.
+describe.skipIf(process.platform === "win32")("gen-home ccdLayout scoped", () => {
   it("reads to the expected mirror, then to the second account's after the switch", async () => {
     const home = join(work, "home");
     const m = generateHome({ out: home, shape: "small", seed: "ccd-accounts", now: Date.now(), ccdLayout: "scoped" });

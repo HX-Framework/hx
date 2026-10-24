@@ -85,9 +85,11 @@ export interface ExpectedGroupMirror {
     showEmpty?: boolean;
   }>;
   unreadIds: string[];
-  /** The scoped layouts: which one, CCD's session filter, the hashed account. */
+  /** The scoped layouts: which one, CCD's session filter, the archived
+   *  members, the hashed account. */
   layout?: string;
   statusFilter?: string | null;
+  archivedIds?: string[];
   scope?: string | null;
 }
 
@@ -787,6 +789,7 @@ function writeScopedCcdStore(
     unreadIds,
     layout: "sections",
     statusFilter: "active",
+    archivedIds: [f.archivedCli],
     scope: hash16(A),
   };
   ctx.manifest.expectations.groupMirrorAfterSwitch = {
@@ -795,6 +798,7 @@ function writeScopedCcdStore(
     unreadIds,
     layout: "sections",
     statusFilter: "active",
+    archivedIds: [],
     scope: hash16(B),
   };
 }

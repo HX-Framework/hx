@@ -1488,7 +1488,7 @@ async function syncGroupMirror(cfg: HxConfig, log: (msg: string) => void): Promi
       enabled: mirror.groupingEnabled,
       groups: mirror.groups,
       unread: [...mirror.unreadIds].sort(),
-      ...(mirror.layout !== undefined ? { layout: mirror.layout, statusFilter: mirror.statusFilter, scope: mirror.scope } : {}),
+      ...(mirror.layout !== undefined ? { layout: mirror.layout, statusFilter: mirror.statusFilter, archivedIds: mirror.archivedIds, scope: mirror.scope } : {}),
     }),
   );
   const key = "ccd:group-mirror";

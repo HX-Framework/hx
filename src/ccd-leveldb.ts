@@ -16,7 +16,7 @@
 // framing. Anything unexpected degrades to "yield nothing", so a format change
 // can't crash the daemon.
 
-import { open, readFile, readdir, stat } from "node:fs/promises";
+import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 
 // ── Snappy raw-block decompressor (not the framed stream format) ───────────
@@ -466,6 +466,10 @@ function isStoreFile(name: string): boolean {
  */
 export class LeveldbKeyReader {
   private readonly files = new Map<string, { stamp: string; records: LeveldbRecord[] }>();
+  /** Whether the last newest() read every file it listed. False when files
+   *  kept vanishing through three reads, or the directory could not be listed:
+   *  what it returned may be missing the newest write. */
+  complete = true;
 
   constructor(
     readonly dir: string,
@@ -477,10 +481,11 @@ export class LeveldbKeyReader {
    *  the whole read runs again, up to three times. */
   async newest(): Promise<Map<string, LeveldbRecord>> {
     let records: LeveldbRecord[] = [];
-    for (let attempt = 0; attempt < 3; attempt++) {
+    this.complete = false;
+    for (let attempt = 0; attempt < 3 && !this.complete; attempt++) {
       const got = await this.readOnce();
       records = got.records;
-      if (got.complete) break;
+      this.complete = got.complete;
     }
     const best = new Map<string, LeveldbRecord>();
     for (const r of records) {
@@ -494,42 +499,45 @@ export class LeveldbKeyReader {
     let names: string[];
     try {
       names = await readdir(this.dir);
-    } catch {
+    } catch (err) {
+      // No directory is no store; a directory that cannot be listed is a
+      // read that failed.
       this.files.clear();
-      return { records: [], complete: true };
+      return { records: [], complete: (err as NodeJS.ErrnoException).code === "ENOENT" };
     }
     names = names.filter(isStoreFile).sort();
     const records: LeveldbRecord[] = [];
     const present = new Set<string>();
     let complete = true;
     for (const name of names) {
-      const p = path.join(this.dir, name);
-      let stamp: string;
+      // One open file for the stamp and the bytes: the stamp then describes
+      // exactly the file that was read, even while leveldb replaces files.
+      let fh: Awaited<ReturnType<typeof open>>;
       try {
         // eslint-disable-next-line security/detect-non-literal-fs-filename -- a file of the Local Storage leveldb
-        const st = await stat(p);
-        stamp = `${st.size}:${st.mtimeMs}`;
+        fh = await open(path.join(this.dir, name), "r");
       } catch {
         complete = false;
         continue;
       }
-      present.add(name);
-      const hit = this.files.get(name);
-      if (hit && hit.stamp === stamp) {
-        records.push(...hit.records);
-        continue;
-      }
-      let buf: Buffer;
       try {
-        // eslint-disable-next-line security/detect-non-literal-fs-filename -- a file of the Local Storage leveldb
-        buf = await readFile(p);
+        const st = await fh.stat();
+        const stamp = `${st.size}:${st.mtimeMs}`;
+        present.add(name);
+        const hit = this.files.get(name);
+        if (hit && hit.stamp === stamp) {
+          records.push(...hit.records);
+          continue;
+        }
+        const buf = await fh.readFile();
+        const found = name.endsWith(".log") ? logFileRecords(buf, name, this.match) : tableFileRecords(buf, name, this.match);
+        this.files.set(name, { stamp, records: found });
+        records.push(...found);
       } catch {
         complete = false;
-        continue;
+      } finally {
+        await fh.close().catch(() => {});
       }
-      const found = name.endsWith(".log") ? logFileRecords(buf, name, this.match) : tableFileRecords(buf, name, this.match);
-      this.files.set(name, { stamp, records: found });
-      records.push(...found);
     }
     for (const name of [...this.files.keys()]) if (!present.has(name)) this.files.delete(name);
     return { records, complete };

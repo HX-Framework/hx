@@ -40,6 +40,10 @@ export interface HxCcdGroupMirrorBlob {
   /** CCD's session filter for its sidebar ("active" hides archived sessions),
    *  or null. Present with `layout`. */
   statusFilter?: string | null;
+  /** The group members CCD has archived, in the id space of `sessionIds` (the
+   *  server has no archived flag of its own, so this is what `statusFilter`
+   *  hides). Present with `layout`. */
+  archivedIds?: string[];
   /** The live CCD account, as the first 16 hex of sha256 of its scope key;
    *  changes when CCD switches accounts. Present with `layout`; null when CCD
    *  names no live account. */
