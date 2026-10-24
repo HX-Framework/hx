@@ -39,7 +39,7 @@ const cache = new Map<string, Cached>();
 /** Newest `state_<N>.sqlite` under a codex home, or null. Codex bakes the schema
  *  epoch into the filename (state_5.sqlite today); picking the highest N follows
  *  a bump without a code change and ignores stale older epochs left on disk. */
-function stateDbPath(codexHome: string): string | null {
+export function codexStateDbPath(codexHome: string): string | null {
   let best: { n: number; p: string } | null = null;
   let entries: string[];
   try {
@@ -89,7 +89,7 @@ function pick(nameRaw: unknown, titleRaw: unknown): CodexTitle | null {
  *  failure (no DB, locked, corrupt, unexpected schema) yields an empty map. */
 function loadMap(codexHome: string): Map<string, CodexTitle> {
   const out = new Map<string, CodexTitle>();
-  const dbPath = stateDbPath(codexHome);
+  const dbPath = codexStateDbPath(codexHome);
   if (!dbPath) return out;
   let db: Database | null = null;
   try {
@@ -121,7 +121,7 @@ function loadMap(codexHome: string): Map<string, CodexTitle> {
 
 function mapFor(codexHome: string): Map<string, CodexTitle> {
   const nowMs = Date.now();
-  const dbPath = stateDbPath(codexHome);
+  const dbPath = codexStateDbPath(codexHome);
   const fp = dbPath ? fingerprint(dbPath) : "absent";
   const hit = cache.get(codexHome);
   if (hit && nowMs - hit.atMs < TTL_MS && hit.fp === fp) return hit.map;

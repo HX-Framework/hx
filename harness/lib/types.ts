@@ -45,6 +45,9 @@ export type Step =
       /** Append the fixture's Claude Desktop account switch (manifest
        *  `ccdSwitch`, ccdLayout "scoped") to its log `atMs` into the run. */
       ccdSwitch?: { atMs: number };
+      /** Write the fixture's change to Codex Desktop's sidebar (manifest
+       *  `codexChange`) `atMs` into the run, as Codex writes it. */
+      codexChange?: { atMs: number };
       stopTimeoutMs?: number;
     }
   | { kind: "ui"; name: string; port: number }
@@ -104,6 +107,9 @@ export interface StepRecord {
   /** watch-for with ccdSwitch: when the switch was written, on the cloud
    *  gateway's clock (the recording's `tMs`). */
   ccdSwitchTMs?: number;
+  /** watch-for with codexChange: when the change was written, on the cloud
+   *  gateway's clock. */
+  codexChangeTMs?: number;
   exitCode?: number | null;
   signal?: string | null;
   timedOut?: boolean;
