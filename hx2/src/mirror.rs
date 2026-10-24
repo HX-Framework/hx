@@ -26,7 +26,11 @@ pub fn sha1_hex(text: &str) -> String {
 /// `syncGroupMirror`: hash-gated on the meaningful content (groups, enabled,
 /// the sorted unread ids), best-effort.
 pub fn sync_group_mirror(store: &Store, gw: &Gateway, log: &dyn Fn(&str)) {
-    let mirror = build_group_mirror(now_ms());
+    // A store that could not be read whole uploads nothing this cycle.
+    let mirror = match build_group_mirror(now_ms()) {
+        Some(m) => m,
+        None => return,
+    };
     let hash = sha1_hex(&group_mirror_gate(&mirror).stringify());
     let key = "ccd:group-mirror";
     if store.get_artifact_hash(key).as_deref() == Some(hash.as_str()) {
