@@ -1,7 +1,7 @@
 // Shapes shared by the driver, the comparators and the report.
 
 import type { GatewayConfig } from "../gateway/gateway.js";
-import type { Shape } from "../fixtures/gen-home.js";
+import type { CcdLayout, Shape } from "../fixtures/gen-home.js";
 
 export type BinaryName = "hx" | "hx2";
 
@@ -42,6 +42,12 @@ export type Step =
       name: string;
       durationMs: number;
       grow?: { atMs: number; sessionIndex: number; bytes: number };
+      /** Append the fixture's Claude Desktop account switch (manifest
+       *  `ccdSwitch`, ccdLayout "scoped") to its log `atMs` into the run. */
+      ccdSwitch?: { atMs: number };
+      /** Write the fixture's change to Codex Desktop's sidebar (manifest
+       *  `codexChange`) `atMs` into the run, as Codex writes it. */
+      codexChange?: { atMs: number };
       stopTimeoutMs?: number;
     }
   | { kind: "ui"; name: string; port: number }
@@ -70,6 +76,8 @@ export interface Scenario {
   description: string;
   shape: Shape;
   seed: string;
+  /** Fixture variations beyond the shape. */
+  fixture?: { ccdLayout?: CcdLayout };
   /** Written to ~/.let/hx/settings.json before the first step. */
   settings?: Record<string, unknown>;
   /** Initial cloud gateway configuration. */
@@ -96,6 +104,12 @@ export interface StepRecord {
   fortressSeqTo: number;
   startedAtMs: number;
   endedAtMs: number;
+  /** watch-for with ccdSwitch: when the switch was written, on the cloud
+   *  gateway's clock (the recording's `tMs`). */
+  ccdSwitchTMs?: number;
+  /** watch-for with codexChange: when the change was written, on the cloud
+   *  gateway's clock. */
+  codexChangeTMs?: number;
   exitCode?: number | null;
   signal?: string | null;
   timedOut?: boolean;

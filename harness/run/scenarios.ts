@@ -258,6 +258,31 @@ export const SCENARIOS: Scenario[] = [
     compare: { requests: "per-session", tsToleranceMs: 20_000 },
   },
   {
+    name: "ccd-accounts",
+    description:
+      "The Claude Desktop store of current builds: the sidebar kept per account, the drawn sections in an order of their own, the newest write in a log numbered below an older table and spanning three log blocks, a flat key of an older build left beside it. Two one-shot passes upload everything and a transcript grows; then the daemon runs 15 s, and 6 s in Claude Desktop switches accounts (one more write to its log). The mirror follows from the leveldb watch within about a second; the 20 s mirror timer never fires in the run. (The grown transcript gives the daemon's first pass an upload, which counts as contact, so no run sends the start-up heartbeat; with nothing to upload, whether it goes out races the reply to the progress report.)",
+    shape: "small",
+    seed: "ccd-accounts",
+    fixture: { ccdLayout: "scoped" },
+    steps: [
+      once("watch1"),
+      once("watch2"),
+      { kind: "grow", name: "grow", sessionIndex: 2, bytes: 3000 },
+      { kind: "watch-for", name: "daemon", durationMs: 15_000, ccdSwitch: { atMs: 6_000 } },
+      status("status1"),
+    ],
+    compare: { requests: "per-session", tsToleranceMs: 20_000 },
+  },
+  {
+    name: "codex-sections",
+    description:
+      "Codex Desktop's sidebar sections ride in the group mirror as `codex`: two one-shot passes upload them with everything else; then the daemon runs 12 s, and 5 s in Codex rewrites its sidebar state the way it does, a temp file renamed over the old one (a section renamed and collapsed, a thread moved into another section). The mirror follows from the watch on the Codex home within about a second; the 20 s mirror timer never fires in the run.",
+    shape: "small",
+    seed: "codex-sections",
+    steps: [once("watch1"), once("watch2"), { kind: "watch-for", name: "daemon", durationMs: 12_000, codexChange: { atMs: 5_000 } }, status("status1")],
+    compare: { requests: "per-session", tsToleranceMs: 20_000 },
+  },
+  {
     name: "paused",
     description: "settings.json pauses sync: the first pass uploads nothing and says so; resumed, the second pass uploads everything.",
     shape: "small",

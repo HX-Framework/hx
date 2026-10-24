@@ -25,23 +25,33 @@
 //   • git repositories the cwds point at (a normal clone, a linked worktree,
 //     a non-GitHub remote) and an encoded `@owner@name@xxxxxx` scratch cwd;
 //   • Codex rollouts (CLI, desktop originator, an archived one) and a
-//     state_5.sqlite with a user name, an AI title and a missing row;
+//     state_5.sqlite with a user name, an AI title and a missing row; Codex
+//     Desktop's sidebar sections (.codex-global-state.json for two accounts,
+//     the database's sections, a pinned thread, a project placed in a
+//     section, threads the sidebar does not list) and a later change to them;
 //   • Claude Desktop session metadata files and a Local Storage leveldb with
 //     a stale .log and an authoritative Snappy-compressed .ldb (grouping,
-//     unread ids, a vestigial dframe-store).
+//     unread ids, a vestigial dframe-store) — or, with ccdLayout "scoped",
+//     the store of current builds (writeScopedCcdStore).
 //
 // The manifest written beside the tree lists every session with its expected
 // identity, plus what the group mirror must contain, so the harness can
 // assert fixture-level facts and not only that two binaries agree.
 
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { Prng } from "../lib/prng.js";
-import { buildLdb, buildLog, localStorageKey, localStorageValue, type KeyValue } from "../lib/leveldb-writer.js";
+import { buildLdb, buildLdbEntries, buildLog, buildLogBatches, localStorageKey, localStorageValue, type KeyValue } from "../lib/leveldb-writer.js";
 
 export type Shape = "small" | "claude-like" | "synthetic-10k";
+
+/** The layout of the Claude Desktop Local Storage store: "flat", the
+ *  grouping fields of builds until 2026 (the default), or "scoped", the
+ *  per-account store of current builds with its drawn sections. */
+export type CcdLayout = "flat" | "scoped";
 
 export interface GenOptions {
   out: string;
@@ -49,6 +59,7 @@ export interface GenOptions {
   seed: string;
   /** Epoch ms the mtimes are relative to; defaults to Date.now(). */
   now?: number;
+  ccdLayout?: CcdLayout;
 }
 
 export interface ManifestSession {
@@ -62,22 +73,66 @@ export interface ManifestSession {
   note?: string;
 }
 
+export interface ExpectedGroupMirror {
+  groupingEnabled: boolean;
+  groups: Array<{
+    id: string;
+    name: string;
+    subtitle: string | null;
+    sectionName: string | null;
+    collapsed: boolean;
+    sessionIds: string[];
+    sortBy?: string | null;
+    ascending?: boolean | null;
+    shown?: boolean;
+    showEmpty?: boolean;
+  }>;
+  unreadIds: string[];
+  /** The scoped layouts: which one, CCD's session filter, the archived
+   *  members, the hashed account. */
+  layout?: string;
+  statusFilter?: string | null;
+  archivedIds?: string[];
+  scope?: string | null;
+}
+
 export interface Manifest {
   shape: Shape;
   seed: string;
   now: number;
   home: string;
+  ccdLayout?: CcdLayout;
   sessions: ManifestSession[];
   /** Files written but expected to be ignored by discovery, with the reason. */
   ignored: Array<{ path: string; reason: string }>;
   expectations: {
-    groupMirror: {
-      groupingEnabled: boolean;
-      groups: Array<{ id: string; name: string; subtitle: string | null; sectionName: string | null; collapsed: boolean; sessionIds: string[] }>;
-      unreadIds: string[];
-    };
+    groupMirror: ExpectedGroupMirror;
+    /** ccdLayout "scoped": the mirror once `ccdSwitch` is written. */
+    groupMirrorAfterSwitch?: ExpectedGroupMirror;
     codexTitles: Record<string, { title: string; source: "user" | "ai" }>;
+    /** The group mirror's `codex`: Codex Desktop's sidebar sections. */
+    codexSections: ExpectedCodexSection[];
+    /** The same once `codexChange` is written. */
+    codexSectionsAfterChange: ExpectedCodexSection[];
   };
+  /** ccdLayout "scoped": the write that switches Claude Desktop to its second
+   *  account, to append to `file` (relative to the home) during a run. */
+  ccdSwitch?: { file: string; appendBase64: string };
+  /** A change to Codex Desktop's sidebar: the new content of `file`
+   *  (relative to the home), written the way Codex writes it (a temp file
+   *  renamed over it) during a run. */
+  codexChange: { file: string; contentBase64: string };
+  /** The home holds Codex's state (a Codex home with its sidebar), so the
+   *  group mirror's `codex` is an object, not null. */
+  codexHome: boolean;
+}
+
+export interface ExpectedCodexSection {
+  id: string;
+  name: string;
+  collapsed: boolean;
+  sessionIds: string[];
+  showEmpty: boolean;
 }
 
 const MIN = 60_000;
@@ -91,6 +146,7 @@ const CONTENT_EPOCH = Date.UTC(2026, 0, 5, 9, 0, 0);
 interface Ctx {
   home: string;
   now: number;
+  ccdLayout: CcdLayout;
   rng: Prng;
   manifest: Manifest;
   /** Paths whose mtime to set, applied after all writes (writes bump dirs). */
@@ -287,6 +343,98 @@ interface CodexSessionSpec {
   contentIndex: number;
   /** Day of the session folder (YYYY/MM/DD) and the file stamp. */
   day: { y: number; m: number; d: number };
+}
+
+// ── Codex Desktop's sidebar sections ───────────────────────────────────────
+
+// The pinned list's fixed id in Codex's app-server (src/codex-sections.ts).
+const CODEX_PINNED_SECTION_ID = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
+
+/**
+ * Codex Desktop's saved sidebar for two accounts and the database rows behind
+ * it. `ids` are the four rollouts' thread ids [c1 cli/repo, c2 cli/scratch,
+ * c3 desktop/repo with no database row, c4 archived/repo]. The signed-in
+ * account (named by environment-catalog-cache-v1) shows, in this order:
+ *   Review    c1, then a thread hx has no rollout for; an archived thread, a
+ *             subagent thread and c3 (no row: deleted) are left out
+ *   Pinned    the app-server's pinned thread, then an older pin it has not
+ *             taken over yet
+ *   Old work  (collapsed) the project placed in it: x1 under the repo's
+ *             root first (newest, missing from the saved order), then c2
+ *             (assigned to the project by hand, the saved order); c1 is
+ *             under the root too but Review keeps it
+ *   Empty     no threads
+ * The other account's section never shows. The change written during a run
+ * renames Review, collapses it, and moves its second thread into Empty.
+ */
+function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: string; scratch: string }): void {
+  const rng = new Prng("codex-sections");
+  const [c1, c2, c3, c4] = ids as [string, string, string, string];
+  const x = { listed: rng.uuid(), archived: rng.uuid(), subagent: rng.uuid(), underRoot: rng.uuid(), pinned: rng.uuid(), oldPin: rng.uuid() };
+  const row = (id: string, o: { archived?: number; source?: string; threadSource?: string; cwd: string; recency: number; section?: string; position?: number }): void => {
+    db.run(
+      "INSERT INTO threads (id, title, created_at, archived, source, preview, thread_source, cwd, recency_at_ms, thread_section_id, section_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [id, "A Codex thread", 1760000000, o.archived ?? 0, o.source ?? "vscode", "A Codex thread", o.threadSource ?? "user", o.cwd, o.recency, o.section ?? null, o.position ?? null],
+    );
+  };
+  db.run("INSERT INTO thread_sections (id, name) VALUES (?, 'Pinned')", [CODEX_PINNED_SECTION_ID]);
+  db.run("INSERT INTO thread_sections (id, name) VALUES ('db-review', 'Review')");
+  db.run("INSERT INTO thread_sections (id, name) VALUES ('db-empty', 'Empty')");
+  db.run("UPDATE threads SET thread_section_id = 'db-review', section_position = 1000 WHERE id = ?", [c1]);
+  row(x.listed, { cwd: dirs.scratch, recency: CONTENT_EPOCH + 9 * HOUR, section: "db-review", position: 2000 });
+  row(x.archived, { archived: 1, cwd: dirs.repo, recency: CONTENT_EPOCH + 8 * HOUR, section: "db-review", position: 3000 });
+  row(x.subagent, { source: '{"subagent":{"other":"guardian"}}', threadSource: "guardian_review", cwd: dirs.repo, recency: CONTENT_EPOCH + 10 * HOUR });
+  row(x.underRoot, { cwd: join(dirs.repo, "packages", "core"), recency: CONTENT_EPOCH + 7 * HOUR });
+  row(x.pinned, { cwd: dirs.scratch, recency: CONTENT_EPOCH + 2 * HOUR, section: CODEX_PINNED_SECTION_ID, position: 1000 });
+  row(x.oldPin, { cwd: dirs.scratch, recency: CONTENT_EPOCH + HOUR });
+  void c4; // archived, under the repo's root: never listed
+
+  const item = (id: string): string => `codex:thread:local:${id}`;
+  const sidebar = (review: { name: string; collapsed: boolean; items: string[] }, empty: string[]): Record<string, unknown> => ({
+    "environment-catalog-cache-v1": { accountId: "acct-fixture", refreshedAt: CONTENT_EPOCH },
+    "prompt-history": { entries: [rng.sentence(12), rng.sentence(9)] },
+    "local-projects": {
+      "local-repo": { id: "local-repo", name: "acme-repo", rootPaths: [dirs.repo], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
+      "local-scratch": { id: "local-scratch", name: "notes", rootPaths: [dirs.scratch], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
+    },
+    "thread-project-assignments": { [c2]: { projectKind: "local", projectId: "local-repo" } },
+    "projectless-thread-ids": [],
+    "sidebar-project-thread-orders": { "local-repo": { threadIds: [c2, x.subagent] } },
+    "pinned-thread-ids": [x.oldPin, x.pinned],
+    "app-server-migrated-pinned-thread-ids-by-host": { "local:codex-home": [x.pinned] },
+    "pinned-project-ids": [],
+    "electron-persisted-atom-state": {
+      "sidebar-custom-sections-v3": {
+        "acct-fixture": {
+          sections: [
+            { id: "sec-review", name: review.name, hostSectionIds: { local: "db-review" }, itemKeys: review.items, appearance: null },
+            { id: "sec-old", name: "Old work", hostSectionIds: {}, itemKeys: ["codex:project:local-repo"], appearance: null },
+            { id: "sec-empty", name: "Empty", hostSectionIds: { local: "db-empty" }, itemKeys: empty, appearance: null },
+          ],
+          collapsedSectionIds: review.collapsed ? ["sec-review", "sec-old"] : ["sec-old"],
+          sectionOrder: ["custom:sec-review", "agents", "pinned", "custom:sec-old", "custom:sec-empty", "threads", "chats"],
+          appServerMigratedHostIds: ["local"],
+        },
+        "acct-other": {
+          sections: [{ id: "sec-other", name: "Another account", hostSectionIds: {}, itemKeys: [item(c2)], appearance: null }],
+          collapsedSectionIds: [],
+          sectionOrder: ["custom:sec-other"],
+        },
+      },
+      "chatgpt-sidebar-state-v1": { "acct-fixture": { pinnedConversations: [], projects: [], pinnedProjects: [] } },
+      "flat-project-sidebar-preferences-v1": { chatSortMode: "updated_at", initialized: true, mode: "project", projectSortMode: "manual" },
+    },
+  });
+  const reviewItems = [item(c1), item(x.listed), item(x.archived), item(x.subagent), item(c3)];
+  write(ctx, ".codex/.codex-global-state.json", JSON.stringify(sidebar({ name: "Review", collapsed: false, items: reviewItems }, [])), -2 * HOUR);
+  const changed = sidebar({ name: "Review this week", collapsed: true, items: reviewItems.filter((k) => k !== item(x.listed)) }, [item(x.listed)]);
+  ctx.manifest.codexChange = { file: ".codex/.codex-global-state.json", contentBase64: Buffer.from(JSON.stringify(changed)).toString("base64") };
+  ctx.manifest.codexHome = true;
+  const section = (id: string, name: string, collapsed: boolean, sessionIds: string[]): ExpectedCodexSection => ({ id, name, collapsed, sessionIds, showEmpty: true });
+  const pinned = section("pinned", "Pinned", false, [x.pinned, x.oldPin]);
+  const old = section("sec-old", "Old work", true, [x.underRoot, c2]);
+  ctx.manifest.expectations.codexSections = [section("sec-review", "Review", false, [c1, x.listed]), pinned, old, section("sec-empty", "Empty", false, [])];
+  ctx.manifest.expectations.codexSectionsAfterChange = [section("sec-review", "Review this week", true, [c1]), pinned, old, section("sec-empty", "Empty", false, [x.listed])];
 }
 
 function codexRollout(spec: CodexSessionSpec): { name: string; content: string } {
@@ -514,7 +662,12 @@ function writeCore(ctx: Ctx): Core {
   ];
   mkdirSync(join(home, ".codex"), { recursive: true });
   const db = new Database(join(home, ".codex", "state_5.sqlite"), { create: true });
-  db.run("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL, name TEXT, created_at INTEGER)");
+  // The columns Codex's app-server keeps that hx reads: the title and name,
+  // and for the sidebar sections whether and where a thread is listed.
+  db.run(
+    "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL, name TEXT, created_at INTEGER, archived INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'vscode', preview TEXT NOT NULL DEFAULT '', thread_source TEXT, cwd TEXT NOT NULL DEFAULT '', recency_at_ms INTEGER NOT NULL DEFAULT 0, thread_section_id TEXT, section_position INTEGER)",
+  );
+  db.run("CREATE TABLE thread_sections (id TEXT PRIMARY KEY, name TEXT NOT NULL, appearance TEXT)");
   for (const c of codexSpecs) {
     const { name, content } = codexRollout(c);
     const dayDir = `.codex/${c.archived ? "archived_sessions" : "sessions"}/${c.day.y}/${String(c.day.m).padStart(2, "0")}/${String(c.day.d).padStart(2, "0")}`;
@@ -529,10 +682,21 @@ function writeCore(ctx: Ctx): Core {
       note: c.archived ? "codex archived rollout" : `codex ${c.originator}`,
     });
     if (c.title) {
-      db.run("INSERT INTO threads (id, title, name, created_at) VALUES (?, ?, ?, ?)", [c.id, c.title.title, c.title.name, 1760000000]);
+      db.run("INSERT INTO threads (id, title, name, created_at, archived, preview, thread_source, cwd, recency_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+        c.id,
+        c.title.title,
+        c.title.name,
+        1760000000,
+        c.archived ? 1 : 0,
+        c.title.title,
+        "user",
+        c.cwd,
+        CONTENT_EPOCH + c.contentIndex * HOUR,
+      ]);
       ctx.manifest.expectations.codexTitles[c.id] = c.title.name ? { title: c.title.name, source: "user" } : { title: c.title.title, source: "ai" };
     }
   }
+  writeCodexSidebar(ctx, db, codexSpecs.map((c) => c.id), { repo, scratch });
   db.close();
   ctx.mtimes.push({ path: join(home, ".codex", "state_5.sqlite"), offsetMs: -3 * HOUR, kind: "file" });
 
@@ -555,7 +719,8 @@ function writeCore(ctx: Ctx): Core {
   ccdFile(localIds.repoCli, repoCli.sessionId, "Offsets journal design (desktop name)", "ai", false, 0);
   ccdFile(localIds.repoDesktop, repoDesktop.sessionId, "Pipeline review", "user", false, 1);
   ccdFile(localIds.unknown, unknownCli, "A session with no transcript on disk", "ai", false, 2);
-  ccdFile(localIds.archived, rng.uuid(), "Archived session", "user", true, 3);
+  const archivedCli = rng.uuid();
+  ccdFile(localIds.archived, archivedCli, "Archived session", "user", true, 3);
   ccdFile(localIds.noCli, null, "Session without a CLI id yet", "ai", false, 4);
 
   const state = {
@@ -580,9 +745,13 @@ function writeCore(ctx: Ctx): Core {
   // Filler entries push the table to several Snappy blocks. Their names sort
   // after the three above and share no prefix with them, so each key keeps
   // its full spelling in the block (leveldb stores keys as deltas).
-  for (let i = 0; i < 48; i++) {
-    kvs.push({ key: localStorageKey("file://", `pref-${String(i).padStart(3, "0")}`), value: localStorageValue(JSON.stringify({ value: rng.paragraph(300) })) });
+  const filler: Array<{ name: string; value: string }> = [];
+  for (let i = 0; i < 48; i++) filler.push({ name: `pref-${String(i).padStart(3, "0")}`, value: JSON.stringify({ value: rng.paragraph(300) }) });
+  if (ctx.ccdLayout === "scoped") {
+    writeScopedCcdStore(ctx, { ccdRoot, scope: `${account}/${org}`, repo, localIds, repoCli: repoCli.sessionId, repoDesktop: repoDesktop.sessionId, unknownCli, archivedCli, filler });
+    return { repoCli, repoDesktop, subagentParent };
   }
+  for (const f of filler) kvs.push({ key: localStorageKey("file://", f.name), value: localStorageValue(f.value) });
   write(ctx, `${ccdRoot}/Local Storage/leveldb/000012.ldb`, buildLdb(kvs, { compress: true, blockSize: 4096 }), -70 * MIN);
   // A stale write-ahead log that sorts BEFORE the table: grouping off. The
   // client reads newest-first, so the .ldb's value must win.
@@ -605,6 +774,163 @@ function writeCore(ctx: Ctx): Core {
   };
 
   return { repoCli, repoDesktop, subagentParent };
+}
+
+/**
+ * The Local Storage store of current Claude Desktop builds: the sidebar kept
+ * per account scope (`<accountId>/<orgId>`), the live one named by
+ * `lastSidebarScopeKey`, and the drawn sections (`codeSidebarByScope`) in an
+ * order of their own beside the group list (`customGroupsByScope`, creation
+ * order). The newest write sits in a log numbered BELOW the table that holds
+ * an older one, as on a live machine, and is long enough (thirty signed-out
+ * accounts' groups) to span three log blocks. A flat `frame-store` from an
+ * older build is left in the table. The group list's `order` still keeps a
+ * moved session in its old group, and `collapsedGroups` still says a section
+ * is closed that the drawn sections show open: the mirror follows the
+ * sections. `ccdSwitch` is the write that switches to the second account.
+ */
+function writeScopedCcdStore(
+  ctx: Ctx,
+  f: {
+    ccdRoot: string;
+    scope: string;
+    repo: string;
+    localIds: { repoCli: string; repoDesktop: string; unknown: string; archived: string; noCli: string };
+    repoCli: string;
+    repoDesktop: string;
+    unknownCli: string;
+    archivedCli: string;
+    filler: Array<{ name: string; value: string }>;
+  },
+): void {
+  const ORIGIN = "https://claude.ai";
+  const A = f.scope;
+  const B = "acct_second/org_second";
+  const ids = f.localIds;
+  // A generator of its own, so the flat layout's files stay byte-identical.
+  const r = new Prng(`${ctx.manifest.seed}:ccd-scoped`);
+  const b1 = `local_${r.uuid()}`;
+  const b1Cli = r.uuid();
+  const b2 = `local_${r.uuid()}`;
+  for (const [localId, cliSessionId, idx] of [[b1, b1Cli, 0], [b2, null, 1]] as const) {
+    write(
+      ctx,
+      `${f.ccdRoot}/claude-code-sessions/acct_second/org_second/${localId}.json`,
+      JSON.stringify({ sessionId: localId, ...(cliSessionId ? { cliSessionId } : {}), title: `Second account session ${idx}`, titleSource: "user", isArchived: false, lastActivityAt: CONTENT_EPOCH + idx * HOUR, cwd: f.repo }),
+      -(80 + idx) * MIN,
+    );
+  }
+  const code = (id: string): string => `code:${id}`;
+  const show = { metadata: false, emptyGroups: false, sideChats: false };
+  const builtin = (id: string, order: number, extra: Record<string, unknown> = {}): Record<string, unknown> => ({ id, kind: id, v: 2, name: "", order, sortBy: "recency", ascending: false, show, collapsed: false, shown: true, groupBy: "none", ...extra });
+  const manual = (id: string, name: string, order: number, members: string[], extra: Record<string, unknown> = {}): Record<string, unknown> => ({ id, kind: "manual", v: 2, name, order, sortBy: "created", ascending: false, show, collapsed: false, shown: true, groupBy: "none", members: members.map(code), ...extra });
+  const dead: Record<string, unknown> = {};
+  for (let i = 0; i < 30; i++) {
+    const members = Array.from({ length: 24 }, () => code(`local_${r.uuid()}`));
+    dead[`acct_dead_${i}/org_dead_${i}`] = {
+      groups: [
+        { id: `cg-dead-${i}-a`, name: "Old work" },
+        { id: `cg-dead-${i}-b`, name: "Ideas" },
+      ],
+      assignments: Object.fromEntries(members.map((m, j) => [m, j % 2 ? `cg-dead-${i}-b` : `cg-dead-${i}-a`])),
+      order: { [`cg-dead-${i}-a`]: members.filter((_, j) => j % 2 === 0), [`cg-dead-${i}-b`]: members.filter((_, j) => j % 2 === 1) },
+    };
+  }
+  const stateFor = (live: string, alphaName: string): unknown => ({
+    state: {
+      collapsed: false,
+      sidebarWidth: 420,
+      lastKnownMode: "code",
+      groupByByMode: { code: "custom" },
+      recentsStatusFilter: "active",
+      collapsedGroups: ["pinned", "custom-cg-beta"],
+      customGroupsByScope: {
+        ...dead,
+        [A]: {
+          groups: [
+            { id: "cg-alpha", name: alphaName },
+            { id: "cg-beta", name: "Beta" },
+            { id: "cg-gamma", name: "Gamma" },
+          ],
+          assignments: { [code(ids.repoCli)]: "cg-alpha", [code(ids.repoDesktop)]: "cg-gamma", [code(ids.unknown)]: "cg-beta", [code(ids.archived)]: "cg-beta", [code(ids.noCli)]: "cg-beta" },
+          order: { "cg-alpha": [code(ids.repoCli), code(ids.repoDesktop)], "cg-beta": [code(ids.unknown), code(ids.archived), code(ids.noCli)], "cg-gamma": [code(ids.repoDesktop)] },
+        },
+        [B]: { groups: [{ id: "cg-old", name: "Old Project" }], assignments: { [code(b1)]: "cg-old", [code(b2)]: "cg-old" }, order: { "cg-old": [code(b1), code(b2)] } },
+      },
+      codeSidebarByScope: {
+        [A]: {
+          sections: [
+            builtin("pinned", 0, { collapsed: true }),
+            builtin("routines", 1, { shown: false }),
+            manual("cg-gamma", "Gamma", 2, [ids.repoDesktop], { sortBy: "alpha", ascending: true }),
+            manual("cg-alpha", alphaName, 3, [ids.repoCli], { collapsed: true }),
+            manual("cg-beta", "Beta", 4, [ids.unknown, ids.archived, ids.noCli], { show: { ...show, emptyGroups: true } }),
+            builtin("sessions", 5),
+          ],
+          migratedFrom: 1,
+          prefsSeeded: true,
+        },
+        [B]: { sections: [builtin("pinned", 0), manual("cg-old", "Old Project", 2, [b1, b2]), builtin("sessions", 3)], migratedFrom: 1, prefsSeeded: true },
+      },
+      pendingLegacyGroupMigration: null,
+      lastSidebarScopeKey: live,
+    },
+    version: 1,
+    shared: {},
+  });
+  const value = (v: unknown): Buffer => localStorageValue(JSON.stringify(v));
+  const key = (name: string): Buffer => localStorageKey(ORIGIN, name);
+  const legacy = { state: { groupByByMode: { code: "custom" }, customGroups: [{ id: "cg-legacy", name: "Legacy" }], customGroupOrder: { "cg-legacy": [code(ids.repoCli)] }, customGroupAssignments: {}, collapsedGroups: [] }, version: 0 };
+  const dir = `${f.ccdRoot}/Local Storage/leveldb`;
+  write(
+    ctx,
+    `${dir}/000012.ldb`,
+    buildLdbEntries(
+      [
+        { key: localStorageKey("file://", "frame-store"), seq: 5, value: value(legacy) },
+        { key: key("dframe-store.backup.v1"), seq: 29, value: value({ state: { collapsed: false, sidebarWidth: 420, lastSidebarScopeKey: A }, version: 1, shared: {} }) },
+        { key: key("dframe-store"), seq: 30, value: value(stateFor(A, "Alpha (old name)")) },
+        { key: key("epitaxy-unread-v1"), seq: 31, value: value({ state: { unreadIds: [ids.repoCli, ids.unknown], explicitUnreadIds: [] }, version: 1 }) },
+        ...f.filler.map((x, i) => ({ key: key(x.name), seq: 32 + i, value: localStorageValue(x.value) })),
+      ],
+      { compress: true, blockSize: 4096 },
+    ),
+    -70 * MIN,
+  );
+  const log = buildLogBatches([{ seq: 100, entries: [{ key: key("branch-status-cache"), value: value({ entries: [] }) }, { key: key("dframe-store"), value: value(stateFor(A, "Alpha")) }] }]);
+  write(ctx, `${dir}/000011.log`, log, -5 * MIN);
+  write(ctx, `${dir}/CURRENT`, "MANIFEST-000010\n", -70 * MIN);
+  write(ctx, `${dir}/LOCK`, "", -70 * MIN);
+  ctx.manifest.ccdSwitch = {
+    file: `${dir}/000011.log`,
+    appendBase64: buildLogBatches([{ seq: 102, entries: [{ key: key("dframe-store"), value: value(stateFor(B, "Alpha")) }] }], { startOffset: log.length }).toString("base64"),
+  };
+
+  const hash16 = (s: string): string => createHash("sha256").update(s).digest("hex").slice(0, 16);
+  const group = (id: string, name: string, collapsed: boolean, sessionIds: string[], sortBy: string, ascending: boolean, showEmpty: boolean) => ({ id, name, subtitle: null, sectionName: null, collapsed, sessionIds, sortBy, ascending, shown: true, showEmpty });
+  const unreadIds = [f.repoCli, f.unknownCli];
+  ctx.manifest.expectations.groupMirror = {
+    groupingEnabled: true,
+    groups: [
+      group("cg-gamma", "Gamma", false, [f.repoDesktop], "alpha", true, false),
+      group("cg-alpha", "Alpha", true, [f.repoCli], "created", false, false),
+      group("cg-beta", "Beta", false, [f.unknownCli, f.archivedCli, ids.noCli], "created", false, true),
+    ],
+    unreadIds,
+    layout: "sections",
+    statusFilter: "active",
+    archivedIds: [f.archivedCli],
+    scope: hash16(A),
+  };
+  ctx.manifest.expectations.groupMirrorAfterSwitch = {
+    groupingEnabled: true,
+    groups: [group("cg-old", "Old Project", false, [b1Cli, b2], "created", false, false)],
+    unreadIds,
+    layout: "sections",
+    statusFilter: "active",
+    archivedIds: [],
+    scope: hash16(B),
+  };
 }
 
 // ── Generated bulk for the larger shapes ───────────────────────────────────
@@ -672,18 +998,23 @@ export function generateHome(opts: GenOptions): Manifest {
   const now = opts.now ?? Date.now();
   rmSync(opts.out, { recursive: true, force: true });
   mkdirSync(opts.out, { recursive: true });
+  const ccdLayout = opts.ccdLayout ?? "flat";
   const ctx: Ctx = {
     home: opts.out,
     now,
+    ccdLayout,
     rng: new Prng(`${opts.shape}:${opts.seed}`),
     manifest: {
       shape: opts.shape,
       seed: opts.seed,
       now,
       home: opts.out,
+      ...(ccdLayout === "flat" ? {} : { ccdLayout }),
       sessions: [],
       ignored: [],
-      expectations: { groupMirror: { groupingEnabled: false, groups: [], unreadIds: [] }, codexTitles: {} },
+      codexChange: { file: ".codex/.codex-global-state.json", contentBase64: "" },
+      codexHome: false,
+      expectations: { groupMirror: { groupingEnabled: false, groups: [], unreadIds: [] }, codexTitles: {}, codexSections: [], codexSectionsAfterChange: [] },
     },
     mtimes: [],
   };
@@ -723,7 +1054,7 @@ export function generateHome(opts: GenOptions): Manifest {
   return ctx.manifest;
 }
 
-// CLI entry: bun harness/fixtures/gen-home.ts --out <home> --shape <s> --seed <s> [--now <ms>]
+// CLI entry: bun harness/fixtures/gen-home.ts --out <home> --shape <s> --seed <s> [--now <ms>] [--ccd-layout flat|scoped]
 if (import.meta.main) {
   const arg = (name: string, fallback?: string): string | undefined => {
     const i = process.argv.indexOf(`--${name}`);
@@ -733,11 +1064,12 @@ if (import.meta.main) {
   const shape = (arg("shape", "small") ?? "small") as Shape;
   const seed = arg("seed", "harness") ?? "harness";
   const nowArg = arg("now");
+  const ccdLayout = (arg("ccd-layout", "flat") ?? "flat") as CcdLayout;
   if (!out) {
-    console.error("usage: gen-home.ts --out <home> [--shape small|claude-like|synthetic-10k] [--seed s] [--now ms]");
+    console.error("usage: gen-home.ts --out <home> [--shape small|claude-like|synthetic-10k] [--seed s] [--now ms] [--ccd-layout flat|scoped]");
     process.exit(64);
   }
   const started = Date.now();
-  const m = generateHome({ out, shape, seed, now: nowArg ? Number(nowArg) : undefined });
+  const m = generateHome({ out, shape, seed, now: nowArg ? Number(nowArg) : undefined, ccdLayout });
   console.log(`generated ${m.sessions.length} sessions (${m.ignored.length} ignored) under ${out} in ${Date.now() - started} ms`);
 }
