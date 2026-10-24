@@ -106,7 +106,7 @@ fault first is not a race.
 | `ccd-index.json` | The saved Claude Desktop index (77.12), normalized, when the reference writes one; a reference that predates it says nothing about the candidate, a candidate that drops it while the reference writes it fails |
 | CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes; for a long-running daemon step the SET of distinct lines, with the per-tick `uploaded=`/`failed=` counters summed over the run and the pass-level backoff's length masked — which tick a session's retry lands in follows the clock, and the backoff doubles once per failing tick in a row) |
 | `hx ui` | Every probe's status and normalized JSON |
-| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); with the per-account store, the second account's mirror is uploaded within 3 s of the switch (the check names the measured time); Codex titles come from `state_5.sqlite`; the mirror's `codex` equals the signed-in account's saved sidebar on every platform, and after a change the changed sections are uploaded within 3 s (required of the candidate, checked in a reference that sends `codex`); every discovered session reached the store |
+| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); with the per-account store, the second account's mirror is uploaded within 3 s of the switch (the check names the measured time); Codex titles come from `state_5.sqlite`; the mirror's `codex` equals the signed-in account's saved sidebar on every platform, and after a change the changed sections are uploaded within 3 s (hx from 77.15.0, hx2 from 78.0.2); every discovered session reached the store |
 | Coverage | All 24 calls of the protocol appear in the reference recording |
 
 Normalization (`lib/normalize.ts`) hides exactly: the candidate's name (`hx2`
@@ -167,7 +167,7 @@ count and keeps another mirror hash, so:
 
 | What a server, a person or the UI can see | Rule |
 | --- | --- |
-| The mirror carries Codex's sections, and follows a change to them within about a second | when the reference's group mirror uploads carry no `codex`, its `/sessions/group-mirror` requests, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison (the same rule as the per-account reader's), and the candidate is held to the fixture instead. A reference that sends `codex` is compared in full |
+| The mirror carries Codex's sections, and follows a change to them within about a second | a run whose version predates them (hx before 77.15.0, hx2 before 78.0.2) is not held to the Codex fixture; when the reference predates them, its `/sessions/group-mirror` requests, the stored mirror, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison (the same rule as the per-account reader's), and the candidate is held to the fixture instead. A reference that sends `codex` is compared in full |
 
 ### Goldens
 

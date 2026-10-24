@@ -165,13 +165,18 @@ function fixtureManifest(run: RunDir): Manifest | null {
  *  synced (with the Codex count since 77.15), or why it could not. */
 const GROUP_MIRROR_LINE = /\[groups\] (synced \d+ CCD group\(s\)(, \d+ Codex section\(s\))?|sync failed: .*)$/;
 
-/** Did this run upload Codex Desktop's sections in the group mirror (since
- *  77.15)? A client before that sends no `codex` key at all. */
-export function uploadsCodexSections(run: RunDir): boolean {
-  return readJsonl<RecordedRequest>(join(run.dir, "gateway.jsonl")).some((r) => {
-    const mirror = (r.body as { mirror?: unknown } | undefined)?.mirror;
-    return r.path === "/sessions/group-mirror" && typeof mirror === "object" && mirror !== null && "codex" in mirror;
-  });
+/** The first versions that send Codex Desktop's sections in the group mirror. */
+const CODEX_SECTIONS: Record<BinaryName, [number, number, number]> = { hx: [77, 15, 0], hx2: [78, 0, 2] };
+
+/** Does this run's binary send Codex Desktop's sections in the group mirror
+ *  (`codex`)? A version that cannot be read is held to it. */
+export function sendsCodexSections(meta: Pick<RunMeta, "name" | "version">): boolean {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
+  if (!m) return true;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const since = CODEX_SECTIONS[meta.name] ?? CODEX_SECTIONS.hx;
+  for (let i = 0; i < 3; i++) if (v[i] !== since[i]) return v[i]! > since[i]!;
+  return true;
 }
 
 export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): CheckResult[] {
@@ -194,7 +199,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   // [groups] line, keeps another hash and makes no upload when only Codex
   // changed, so the same three facts leave the comparison against it.
   const scopedExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !readsScopedCcdStore(ref.meta);
-  const codexExempt = !uploadsCodexSections(ref);
+  const codexExempt = !sendsCodexSections(ref.meta);
   const mirrorExempt = scopedExempt || codexExempt;
   if (mirrorExempt) {
     const why = [
@@ -627,7 +632,7 @@ function compareRequests(ref: RunDir, cand: RunDir, ctxRef: NormalizeContext, ct
 
 // ── Fixture expectations and coverage ──────────────────────────────────────
 
-export function fixtureExpectationChecks(run: RunDir, scenario: Scenario, opts: { requireCodexSections?: boolean } = {}): CheckResult[] {
+export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): CheckResult[] {
   const manifestPath = join(run.dir, "fixture.manifest.json");
   if (!existsSync(manifestPath)) return [];
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Manifest;
@@ -680,19 +685,17 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario, opts: 
   // on every platform. After a daemon step rewrites Codex's sidebar the way
   // Codex does, the changed sections must follow within 3 s: the watch on the
   // Codex home, not the 20 s mirror timer, which never fires in the run. A
-  // client before 77.15 sends no `codex`; the candidate built from this
-  // source must.
+  // client before 77.15 (hx2 before 78.0.2) sends no `codex` and is not held
+  // to it.
   const codexOf = (r: RecordedRequest | undefined): unknown => {
     const m = mirrorOf(r);
     return m && "codex" in m ? m.codex : undefined;
   };
   const withCodex = mirrors.filter((r) => codexOf(r) !== undefined);
-  if (withCodex.length === 0) {
-    checks.push(
-      opts.requireCodexSections
-        ? { name: "fixture: codex sections in the group mirror", ok: false, details: "no successful group mirror upload carried `codex`" }
-        : { name: "fixture: codex sections in the group mirror", ok: true, details: `${run.meta.name} ${run.meta.version} predates Codex sections in the mirror` },
-    );
+  if (!sendsCodexSections(run.meta)) {
+    checks.push({ name: "fixture: codex sections in the group mirror", ok: true, details: `${run.meta.name} ${run.meta.version} predates Codex sections in the mirror: not held to them` });
+  } else if (withCodex.length === 0) {
+    checks.push({ name: "fixture: codex sections in the group mirror", ok: false, details: "no successful group mirror upload carried `codex`" });
   } else {
     const want = manifest.codexHome ? { groups: manifest.expectations.codexSections } : null;
     checks.push(
