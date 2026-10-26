@@ -120,11 +120,12 @@ describe("readsScopedCcdStore", () => {
 });
 
 describe("side sessions in the fixture", () => {
-  it("holds hx from 77.16.0 and hx2 from 78.0.4 to each group's side sessions", () => {
+  it("holds hx from 77.16.0 and hx2 from 78.0.5 to each group's side sessions", () => {
     expect(sendsSideSessions({ name: "hx", version: "77.15.1" })).toBe(false);
     expect(sendsSideSessions({ name: "hx", version: "77.16.0" })).toBe(true);
     expect(sendsSideSessions({ name: "hx2", version: "78.0.3" })).toBe(false);
-    expect(sendsSideSessions({ name: "hx2", version: "78.0.4" })).toBe(true);
+    expect(sendsSideSessions({ name: "hx2", version: "78.0.4" })).toBe(false);
+    expect(sendsSideSessions({ name: "hx2", version: "78.0.5" })).toBe(true);
     expect(sendsSideSessions({ name: "hx", version: "dev" })).toBe(true);
   });
 

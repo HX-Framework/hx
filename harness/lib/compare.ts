@@ -183,7 +183,7 @@ export function sendsCodexSections(meta: Pick<RunMeta, "name" | "version">): boo
 }
 
 /** The first versions that send each group's side sessions (`sideSessions`). */
-const SIDE_SESSIONS: Record<BinaryName, [number, number, number]> = { hx: [77, 16, 0], hx2: [78, 0, 4] };
+const SIDE_SESSIONS: Record<BinaryName, [number, number, number]> = { hx: [77, 16, 0], hx2: [78, 0, 5] };
 
 /** Does this run's binary send each group's side sessions in the group
  *  mirror? A version that cannot be read is held to it. */
@@ -226,7 +226,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   // reference that sends no `codex` uploads another body, logs another
   // [groups] line, keeps another hash and makes no upload when only Codex
   // changed, so the same three facts leave the comparison against it. So do
-  // a group's side sessions (77.16.0 / hx2 78.0.4) on the per-account store.
+  // a group's side sessions (77.16.0 / hx2 78.0.5) on the per-account store.
   const scopedExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !readsScopedCcdStore(ref.meta);
   const codexExempt = !sendsCodexSections(ref.meta);
   const sideExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !sendsSideSessions(ref.meta);
@@ -235,7 +235,7 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     const why = [
       ...(scopedExempt ? ["the per-account Claude Desktop mirror (hx 77.15.1, hx2 78.0.3)"] : []),
       ...(codexExempt ? ["Codex Desktop's sections in the mirror"] : []),
-      ...(sideExempt ? ["side sessions in the mirror (hx 77.16.0, hx2 78.0.4)"] : []),
+      ...(sideExempt ? ["side sessions in the mirror (hx 77.16.0, hx2 78.0.5)"] : []),
     ].join(" and ");
     checks.push({
       name: "group mirror",
