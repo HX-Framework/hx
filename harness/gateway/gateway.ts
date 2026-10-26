@@ -225,6 +225,11 @@ export class FakeGateway {
     return `${prefix}_${key.replace(/[^A-Za-z0-9._-]/g, ".")}.${String(n).padStart(4, "0")}`;
   }
 
+  /** Now on the clock the recording's `tMs` uses (ms since start). */
+  clockMs(): number {
+    return Date.now() - this.startedAt;
+  }
+
   private note(entry: Omit<RecordedRequest, "seq" | "tMs" | "label">): void {
     const rec: RecordedRequest = { seq: ++this.seq, tMs: Date.now() - this.startedAt, label: this.config.label, ...entry };
     this.requests += 1;

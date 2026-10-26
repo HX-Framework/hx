@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { compareRuns, loadRun } from "./compare.js";
+import { compareRuns, loadRun, readsScopedCcdStore } from "./compare.js";
 import type { RunMeta, Scenario } from "./types.js";
 
 // Both runs of a scenario generate their homes from one fixture clock
@@ -100,5 +100,18 @@ describe("compareRuns with one fixture clock for both runs", () => {
 
   it("would see one instant 277 s apart if each run measured it from its own start", () => {
     expect(failing(reference({ fixtureNowMs: undefined }), candidate({ fixtureNowMs: undefined }))).toEqual(["state.json"]);
+  });
+});
+
+describe("readsScopedCcdStore", () => {
+  it("holds hx from 77.14.0 and hx2 from 78.0.1 to the per-account Claude Desktop store", () => {
+    expect(readsScopedCcdStore({ name: "hx", version: "77.11.0" })).toBe(false);
+    expect(readsScopedCcdStore({ name: "hx", version: "77.13.9" })).toBe(false);
+    expect(readsScopedCcdStore({ name: "hx", version: "77.14.0" })).toBe(true);
+    expect(readsScopedCcdStore({ name: "hx", version: "78.0.0" })).toBe(true);
+    expect(readsScopedCcdStore({ name: "hx2", version: "78.0.0" })).toBe(false);
+    expect(readsScopedCcdStore({ name: "hx2", version: "78.0.1" })).toBe(true);
+    expect(readsScopedCcdStore({ name: "hx2", version: "79.0.0" })).toBe(true);
+    expect(readsScopedCcdStore({ name: "hx", version: "dev" })).toBe(true);
   });
 });
