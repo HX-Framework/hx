@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { readCodexTitle, resetCodexTitleCacheForTests } from "./codex-titles.js";
+import { immutableDbUri, readCodexTitle, resetCodexTitleCacheForTests } from "./codex-titles.js";
 
 let home: string;
 
@@ -105,6 +105,26 @@ describe("readCodexTitle", () => {
     } finally {
       writer.close();
     }
+  });
+
+  it("reads a WAL database whose -wal and -shm files are gone, as Codex leaves it when idle", () => {
+    // Codex's last close checkpoints the WAL and deletes both files; a plain
+    // read-only open then fails with "unable to open database file".
+    makeDb(5, [{ id: "s1", title: "From the main file" }]);
+    const p = join(home, "state_5.sqlite");
+    const db = new Database(p);
+    db.exec("PRAGMA journal_mode = WAL");
+    db.run(`INSERT INTO threads (id, title, name) VALUES ('s2', 'auto', 'Checkpointed')`);
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.close();
+    for (const f of [`${p}-wal`, `${p}-shm`]) if (existsSync(f)) unlinkSync(f);
+    assert.deepEqual(readCodexTitle(home, "s1"), { title: "From the main file", source: "ai" });
+    assert.deepEqual(readCodexTitle(home, "s2"), { title: "Checkpointed", source: "user" });
+  });
+
+  it("builds a SQLite URI that survives special characters and Windows drives", () => {
+    assert.equal(immutableDbUri("/a b/c%d?e#f.sqlite"), "file:/a b/c%25d%3fe%23f.sqlite?immutable=1");
+    assert.equal(immutableDbUri("C:\\Users\\x\\.codex\\state_5.sqlite"), "file:/C:/Users/x/.codex/state_5.sqlite?immutable=1");
   });
 
   it("re-reads after the DB changes (fingerprint invalidates the cache)", () => {

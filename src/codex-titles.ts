@@ -17,10 +17,11 @@
 // auto `title`. Read-only and non-throwing: an absent DB, a locked/corrupt file,
 // an older schema without `name`, or a codex install predating the state DB all
 // degrade to "no title" (the session keeps its first-message floor), retried next
-// pass.
+// pass. A database Codex has closed (no -wal file) is opened immutable
+// (`openCodexStateDb`), which the sections reader shares.
 
-import { Database } from "bun:sqlite";
-import { readdirSync, statSync } from "node:fs";
+import { constants, Database } from "bun:sqlite";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
 export type CodexTitle = { title: string; source: "user" | "ai" };
@@ -75,6 +76,25 @@ function fingerprint(dbPath: string): string {
   return `${db}|${part(`${dbPath}-wal`)}`;
 }
 
+/** A SQLite URI that opens `p` read-only and ignores any WAL. */
+export function immutableDbUri(p: string): string {
+  let u = p.replace(/\\/g, "/");
+  if (/^[A-Za-z]:\//.test(u)) u = `/${u}`;
+  u = u.replace(/%/g, "%25").replace(/\?/g, "%3f").replace(/#/g, "%23");
+  return `file:${u}?immutable=1`;
+}
+
+// Codex's app-server closes the database when it has nothing to do, and the
+// last close checkpoints the WAL and deletes the -wal and -shm files. A
+// read-only connection cannot open a WAL database in that state (SQLite
+// answers "unable to open database file"), so with no -wal file the database
+// is opened immutable: everything is in the main file then. With a -wal file
+// the ordinary read-only open also sees the writes not yet checkpointed.
+export function openCodexStateDb(dbPath: string): Database {
+  if (existsSync(`${dbPath}-wal`)) return new Database(dbPath, { readonly: true });
+  return new Database(immutableDbUri(dbPath), constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI);
+}
+
 /** codex's own name for one row: a user rename beats the auto title; both trimmed
  *  and empty-rejected so a blank never becomes a title. */
 function pick(nameRaw: unknown, titleRaw: unknown): CodexTitle | null {
@@ -93,7 +113,7 @@ function loadMap(codexHome: string): Map<string, CodexTitle> {
   if (!dbPath) return out;
   let db: Database | null = null;
   try {
-    db = new Database(dbPath, { readonly: true });
+    db = openCodexStateDb(dbPath);
     // `name` (migration 0041) is absent on older schemas — try with it, fall
     // back to title-only rather than introspect, so both schemas just work.
     let rows: Array<{ id: unknown; name?: unknown; title: unknown }>;
