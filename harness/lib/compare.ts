@@ -19,7 +19,9 @@
 //   state journal     empty or absent at the end of every run
 //   expectations      facts the fixture manifest promises (the group mirror,
 //                     and for the per-account Claude Desktop store, the
-//                     mirror after an account switch and how soon it came)
+//                     mirror after an account switch and how soon it came;
+//                     Codex Desktop's sections in the mirror's `codex`, and
+//                     after a change to them, how soon they came)
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -160,8 +162,22 @@ function fixtureManifest(run: RunDir): Manifest | null {
 }
 
 /** A CCD log line about the group mirror, after its timestamp: what it
- *  synced, or why it could not. */
-const GROUP_MIRROR_LINE = /\[groups\] (synced \d+ CCD group\(s\)|sync failed: .*)$/;
+ *  synced (with the Codex count since 77.15), or why it could not. */
+const GROUP_MIRROR_LINE = /\[groups\] (synced \d+ CCD group\(s\)(, \d+ Codex section\(s\))?|sync failed: .*)$/;
+
+/** The first versions that send Codex Desktop's sections in the group mirror. */
+const CODEX_SECTIONS: Record<BinaryName, [number, number, number]> = { hx: [77, 15, 0], hx2: [78, 0, 2] };
+
+/** Does this run's binary send Codex Desktop's sections in the group mirror
+ *  (`codex`)? A version that cannot be read is held to it. */
+export function sendsCodexSections(meta: Pick<RunMeta, "name" | "version">): boolean {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
+  if (!m) return true;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const since = CODEX_SECTIONS[meta.name] ?? CODEX_SECTIONS.hx;
+  for (let i = 0; i < 3; i++) if (v[i] !== since[i]) return v[i]! > since[i]!;
+  return true;
+}
 
 export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): CheckResult[] {
   const versions = [ref.meta.version, cand.meta.version].filter(Boolean);
@@ -177,12 +193,23 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   // mirror hash. The candidate is held to the fixture instead
   // (fixtureExpectationChecks), so for such a reference those three facts
   // leave the comparison; for a reference that reads the store they stay.
-  const mirrorExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !readsScopedCcdStore(ref.meta);
+  //
+  // Codex Desktop's sections ride in the same upload (77.15 / hx2 78.0.2): a
+  // reference that sends no `codex` uploads another body, logs another
+  // [groups] line, keeps another hash and makes no upload when only Codex
+  // changed, so the same three facts leave the comparison against it.
+  const scopedExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !readsScopedCcdStore(ref.meta);
+  const codexExempt = !sendsCodexSections(ref.meta);
+  const mirrorExempt = scopedExempt || codexExempt;
   if (mirrorExempt) {
+    const why = [
+      ...(scopedExempt ? ["the per-account Claude Desktop reader"] : []),
+      ...(codexExempt ? ["Codex Desktop's sections in the mirror"] : []),
+    ].join(" and ");
     checks.push({
       name: "group mirror",
       ok: true,
-      details: `the reference (${ref.meta.version}) predates the per-account Claude Desktop reader: its mirror upload, the stored mirror, its [groups] log line and its mirror hash are not compared; the candidate is held to the fixture`,
+      details: `the reference (${ref.meta.version}) predates ${why}: its mirror upload, the stored mirror, its [groups] log line and its mirror hash are not compared; the candidate is held to the fixture`,
     });
   }
   const dropMirrorLines = (s: string): string => (mirrorExempt ? s.split("\n").filter((l) => !GROUP_MIRROR_LINE.test(l)).join("\n") : s);
@@ -650,6 +677,45 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
         ? { name: "fixture: group mirror follows the account switch", ok: false, details: `no upload of the second account's mirror after the switch (${mirrors.filter((r) => r.tMs >= at).length} mirror uploads after it)` }
         : { name: "fixture: group mirror follows the account switch", ok: latency <= 3_000, details: `uploaded ${latency} ms after Claude Desktop's write (limit 3000 ms)` },
     );
+  }
+
+  // Codex Desktop's sections in the mirror's `codex`: the first upload must
+  // carry exactly the sections the fixture's .codex-global-state.json and
+  // state_5.sqlite hold for the signed-in account (null with no Codex home),
+  // on every platform. After a daemon step rewrites Codex's sidebar the way
+  // Codex does, the changed sections must follow within 3 s: the watch on the
+  // Codex home, not the 20 s mirror timer, which never fires in the run. A
+  // client before 77.15 (hx2 before 78.0.2) sends no `codex` and is not held
+  // to it.
+  const codexOf = (r: RecordedRequest | undefined): unknown => {
+    const m = mirrorOf(r);
+    return m && "codex" in m ? m.codex : undefined;
+  };
+  const withCodex = mirrors.filter((r) => codexOf(r) !== undefined);
+  if (!sendsCodexSections(run.meta)) {
+    checks.push({ name: "fixture: codex sections in the group mirror", ok: true, details: `${run.meta.name} ${run.meta.version} predates Codex sections in the mirror: not held to them` });
+  } else if (withCodex.length === 0) {
+    checks.push({ name: "fixture: codex sections in the group mirror", ok: false, details: "no successful group mirror upload carried `codex`" });
+  } else {
+    const want = manifest.codexHome ? { groups: manifest.expectations.codexSections } : null;
+    checks.push(
+      check(
+        "fixture: codex sections in the group mirror",
+        deepDiff(codexOf(withCodex[0]), want, 0),
+        want ? `${want.groups.length} sections, ${want.groups.reduce((n, g) => n + g.sessionIds.length, 0)} threads, from the saved sidebar` : "no Codex home: null",
+      ),
+    );
+    const changed = run.meta.steps.find((s) => s.codexChangeTMs !== undefined);
+    if (changed) {
+      const at = changed.codexChangeTMs!;
+      const after = { groups: manifest.expectations.codexSectionsAfterChange };
+      const hit = withCodex.find((r) => r.tMs >= at && deepDiff(codexOf(r), after, 0).length === 0);
+      checks.push(
+        hit
+          ? { name: "fixture: codex sections follow a change", ok: hit.tMs - at <= 3_000, details: `uploaded ${hit.tMs - at} ms after Codex's write (limit 3000 ms)` }
+          : { name: "fixture: codex sections follow a change", ok: false, details: `no upload of the changed sections after the write (${mirrors.filter((r) => r.tMs >= at).length} mirror uploads after it)` },
+      );
+    }
   }
 
   // Codex titles: every rollout with a title in state_5.sqlite must have

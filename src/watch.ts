@@ -122,6 +122,7 @@ import {
 import { summariseChunk } from "./parse.js";
 import { getCcdRecentsByCliId, saveCcdIndexIfChanged } from "./ccd.js";
 import { buildGroupMirror, watchCcdSidebarStore } from "./ccd-prefs.js";
+import { buildCodexSections, watchCodexSidebar } from "./codex-sections.js";
 import {
   findPlanPathInText,
   hashContent,
@@ -1480,6 +1481,16 @@ async function syncGroupMirror(cfg: HxConfig, log: (msg: string) => void): Promi
   } catch {
     return;
   }
+  // Codex Desktop's sidebar sections ride in the same upload as `codex`
+  // (codex-sections.ts): left out when the Codex read failed, so the server
+  // keeps the last sections it had; null when no Codex home holds Codex's state.
+  let codex;
+  try {
+    codex = buildCodexSections(resolveDataRoots(await readSettings()).codex.map((r) => r.configDir));
+  } catch {
+    codex = undefined;
+  }
+  if (codex !== undefined) mirror = { ...mirror, codex };
   // Exclude the volatile syncedAtMs from the gate — only content changes count.
   // The scoped layouts' blob fields count too (a new session filter, another
   // account); a flat blob has none, so its hash is what it always was.
@@ -1489,6 +1500,7 @@ async function syncGroupMirror(cfg: HxConfig, log: (msg: string) => void): Promi
       groups: mirror.groups,
       unread: [...mirror.unreadIds].sort(),
       ...(mirror.layout !== undefined ? { layout: mirror.layout, statusFilter: mirror.statusFilter, archivedIds: mirror.archivedIds, scope: mirror.scope } : {}),
+      codex,
     }),
   );
   const key = "ccd:group-mirror";
@@ -1496,7 +1508,7 @@ async function syncGroupMirror(cfg: HxConfig, log: (msg: string) => void): Promi
   try {
     const res = await uploadGroupMirror(cfg, mirror);
     await setArtifactHash(key, hash, scope);
-    log(`  [groups] synced ${res.groups} CCD group(s)`);
+    log(`  [groups] synced ${res.groups} CCD group(s)${codex ? `, ${codex.groups.length} Codex section(s)` : ""}`);
   } catch (err) {
     log(`  [groups] sync failed: ${(err as Error).message}`);
   }
@@ -3026,6 +3038,13 @@ export async function startWatch(
     () => void syncGroupsNow(),
     (reason) => log(`[hx] Claude Desktop sidebar events unavailable (${reason}); its groups sync every ${MIRROR_SYNC_MS / 1000} s`),
   );
+  // So does a change to Codex Desktop's sidebar files (debounced in
+  // watchCodexSidebar), whose sections ride in the same upload.
+  const codexWatch = watchCodexSidebar(
+    resolveDataRoots(await readSettings()).codex.map((r) => r.configDir),
+    () => void syncGroupsNow(),
+    (reason) => log(`[hx] Codex sidebar events unavailable (${reason}); its sections sync every ${MIRROR_SYNC_MS / 1000} s`),
+  );
   const hbTimer = setInterval(() => void beatOnce(), HEARTBEAT_MS);
   const mirrorTimer = setInterval(() => void mirrorOnce(), MIRROR_SYNC_MS);
   const auditTimer = setInterval(() => void audit(), VERIFY_INTERVAL_MS);
@@ -3108,6 +3127,7 @@ export async function startWatch(
       // retry loop. Events close; the index saves once more.
       catalogFor(scope).disableFileEvents();
       sidebarWatch?.close();
+      codexWatch.close();
       checkpointState(scope).catch(() => {});
       void saveCcdIndexIfChanged(Date.now(), { force: true });
       disarmCoalescedPersistence(scope);

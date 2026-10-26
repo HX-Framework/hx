@@ -234,6 +234,22 @@ Watch mechanism is mtime-polling at ~1.5s (chokidar 4 drops fsevents, and a
 recursive watch on `~/.claude/projects/<encoded-path>/` would blow the FD
 limit).
 
+### Desktop sidebars
+
+hx also mirrors how you group sessions in the two desktop apps, so the web UI
+shows the same groups. It uploads group names, their order, whether each is
+collapsed, and which session ids sit in each, never message content:
+
+- Claude Code Desktop's groups, read from its Local Storage leveldb;
+- Codex Desktop's sidebar sections (`src/codex-sections.ts`), read from
+  `~/.codex/.codex-global-state.json` (the signed-in account's sections) and
+  `~/.codex/state_<N>.sqlite` (which threads Codex lists, and its Pinned
+  list). Both files are opened read-only.
+
+Both go up in one upload (`POST /sessions/group-mirror`, Codex's as its
+`codex` field), on start, within about a second of a change to either app's
+files, and every 20 s as a safety net.
+
 ### Watched locations (custom data roots)
 
 The paths above are relative to a **data root** — `~/.claude` / `~/.codex` by
