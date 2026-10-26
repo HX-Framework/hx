@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "hx2"
-version = "78.0.2"
+version = "78.0.3"
 dependencies = [
  "brotli-decompressor",
  "chrono",
