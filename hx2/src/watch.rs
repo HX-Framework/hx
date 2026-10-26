@@ -24,6 +24,7 @@ use crate::children::{
     build_child_parent_index, child_needs_pass, contested_child_lanes, discover_child_backfill, elect_child_uploaders, ingest_child_one, latch_child_lane_pause,
     merge_child_backfill, plan_child_lane_resets, plan_workflow_sync, reconcile_child_parent, sync_workflow_run, workflow_lane_after_failure, WorkflowLane, WorkflowPlan,
 };
+use crate::codex_sections::CodexSidebarWatch;
 use crate::codex_titles::{read_codex_title, CodexTitle};
 use crate::config::HxConfig;
 use crate::fsutil::{basename, node_error, now_ms, relative, release_freed_memory, stat_safe};
@@ -1844,7 +1845,15 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
         let logger = ctx.clone();
         Arc::new(move |reason: String| logger.log(&format!("[hx] Claude Desktop sidebar events unavailable ({}); its groups sync every {} s", reason, num_to_string(MIRROR_SYNC_MS / 1000.0))))
     };
-    let sidebar = SidebarWatch::arm(wake_fn, sidebar_failed);
+    let sidebar = SidebarWatch::arm(wake_fn.clone(), sidebar_failed);
+    // So does a change to Codex Desktop's sidebar files, whose sections ride in
+    // the same upload (debounced in CodexSidebarWatch).
+    let codex_failed: Arc<dyn Fn(String) + Send + Sync> = {
+        let logger = ctx.clone();
+        Arc::new(move |reason: String| logger.log(&format!("[hx] Codex sidebar events unavailable ({}); its sections sync every {} s", reason, num_to_string(MIRROR_SYNC_MS / 1000.0))))
+    };
+    let codex_homes: Vec<String> = resolve_data_roots(&read_settings()).codex.iter().map(|r| r.config_dir.clone()).collect();
+    let codex_watch = CodexSidebarWatch::arm(&codex_homes, wake_fn, codex_failed);
 
     // Timers, on the daemon's clock.
     let start = now_ms();
@@ -1883,7 +1892,10 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
                 next_mirror += MIRROR_SYNC_MS;
             }
         }
-        if sidebar.as_ref().map(|s| s.take_due(now_ms())).unwrap_or(false) {
+        // One sync serves a due burst from either app's sidebar.
+        let ccd_due = sidebar.as_ref().map(|s| s.take_due(now_ms())).unwrap_or(false);
+        let codex_due = codex_watch.take_due(now_ms());
+        if ccd_due || codex_due {
             sync_group_mirror(&ctx.store, &ctx.gw, &log_fn);
         }
         if now >= next_audit {
@@ -1946,7 +1958,8 @@ pub fn start_watch(ctx: Arc<Ctx>, opts: WatchOptions, hooks: Option<DaemonHooks>
             }
         }
         let sidebar_due = sidebar.as_ref().and_then(|s| s.due_at()).unwrap_or(f64::INFINITY);
-        let next_due = [next_tick, next_beat, next_mirror, next_audit, next_flush, next_perf, next_watchdog, sidebar_due].iter().cloned().fold(f64::INFINITY, f64::min);
+        let codex_due_at = codex_watch.due_at().unwrap_or(f64::INFINITY);
+        let next_due = [next_tick, next_beat, next_mirror, next_audit, next_flush, next_perf, next_watchdog, sidebar_due, codex_due_at].iter().cloned().fold(f64::INFINITY, f64::min);
         let wait = (next_due - now_ms()).clamp(1.0, 500.0);
         wake.sleep(wait as u64);
     }

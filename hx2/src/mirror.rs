@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::ccd_prefs::{build_group_mirror, group_mirror_gate};
+use crate::codex_sections::{build_codex_sections, codex_mirror_value};
 use crate::fsutil::{join, now_ms, readdir_safe, stat_safe};
 use crate::json::{obj, Json};
 
@@ -27,10 +28,19 @@ pub fn sha1_hex(text: &str) -> String {
 /// the sorted unread ids), best-effort.
 pub fn sync_group_mirror(store: &Store, gw: &Gateway, log: &dyn Fn(&str)) {
     // A store that could not be read whole uploads nothing this cycle.
-    let mirror = match build_group_mirror(now_ms()) {
+    let mut mirror = match build_group_mirror(now_ms()) {
         Some(m) => m,
         None => return,
     };
+    // Codex Desktop's sidebar sections ride in the same upload as `codex`
+    // (codex_sections.rs): left out when the Codex read failed, so the server
+    // keeps the last sections it had; null when no Codex home holds Codex's state.
+    let homes: Vec<String> = resolve_data_roots(&read_settings()).codex.iter().map(|r| r.config_dir.clone()).collect();
+    let codex = codex_mirror_value(&build_codex_sections(&homes));
+    let codex_count = codex.as_ref().and_then(|c| c.get("groups")).and_then(|g| g.as_arr()).map(|g| g.len());
+    if let Some(c) = codex {
+        mirror.set("codex", c);
+    }
     let hash = sha1_hex(&group_mirror_gate(&mirror).stringify());
     let key = "ccd:group-mirror";
     if store.get_artifact_hash(key).as_deref() == Some(hash.as_str()) {
@@ -42,7 +52,11 @@ pub fn sync_group_mirror(store: &Store, gw: &Gateway, log: &dyn Fn(&str)) {
         Ok(groups)
     })();
     match result {
-        Ok(groups) => log(&format!("  [groups] synced {} CCD group(s)", crate::js::num_to_string(groups))),
+        Ok(groups) => log(&format!(
+            "  [groups] synced {} CCD group(s){}",
+            crate::js::num_to_string(groups),
+            codex_count.map(|n| format!(", {} Codex section(s)", n)).unwrap_or_default()
+        )),
         Err(e) => log(&format!("  [groups] sync failed: {}", e)),
     }
 }
