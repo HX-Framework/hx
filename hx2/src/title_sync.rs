@@ -14,7 +14,10 @@ use crate::settings::read_settings;
 use crate::sources::discover_codex_files;
 use crate::state::Store;
 
-pub const TITLE_SYNC_VERSION: f64 = 1.0;
+/// 2 (78.0.4): before it, the reader could not open Codex's database while
+/// Codex had it closed (no -wal file), so a sweep at such a start found no
+/// titles and stamped every file as having none.
+pub const TITLE_SYNC_VERSION: f64 = 2.0;
 const BATCH_SIZE: usize = 100;
 const TITLE_MAX_LEN: usize = 1024;
 

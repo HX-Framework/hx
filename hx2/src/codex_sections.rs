@@ -22,9 +22,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags};
 
-use crate::codex_titles::state_db_path;
+use crate::codex_titles::{open_codex_state_db, state_db_path};
 use crate::fsutil::{join, now_ms, stat_safe};
 use crate::js::{eq_str, js, lossy, starts_with, trim, JsStr};
 use crate::json::{obj, Json, OMap};
@@ -90,31 +89,6 @@ pub struct CodexDbRead {
     pub members: HashMap<JsStr, Vec<JsStr>>,
 }
 
-/// A SQLite URI that opens `p` read-only and ignores any WAL.
-pub fn immutable_db_uri(p: &str) -> String {
-    let mut u = p.replace('\\', "/");
-    let b = u.as_bytes();
-    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/' {
-        u = format!("/{}", u);
-    }
-    let u = u.replace('%', "%25").replace('?', "%3f").replace('#', "%23");
-    format!("file:{}?immutable=1", u)
-}
-
-/// Codex's app-server closes the database when idle, and the last close
-/// deletes the -wal and -shm files; a read-only connection cannot open a WAL
-/// database in that state, so with no -wal file the database is opened
-/// immutable (everything is in the main file then).
-fn open_state_db(db_path: &str) -> rusqlite::Result<Connection> {
-    if Path::new(&format!("{}-wal", db_path)).exists() {
-        return Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX);
-    }
-    Connection::open_with_flags(
-        immutable_db_uri(db_path),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-}
-
 /// `Number(value)` for a column value the way bun:sqlite hands it over.
 fn js_number(v: ValueRef<'_>) -> f64 {
     match v {
@@ -148,7 +122,7 @@ fn text_of(v: ValueRef<'_>) -> Option<String> {
 /// Everything the sections need from the database; Err when it cannot be read.
 pub fn read_codex_state_db(db_path: &str) -> Result<CodexDbRead, String> {
     let mut out = CodexDbRead::default();
-    let conn = open_state_db(db_path).map_err(|e| e.to_string())?;
+    let conn = open_codex_state_db(db_path).map_err(|e| e.to_string())?;
     let names = |sql: &str, col: usize| -> Result<HashSet<String>, String> {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
@@ -794,6 +768,7 @@ impl CodexSidebarWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     fn home(name: &str) -> String {
         let dir = std::env::temp_dir().join(format!("hx2-codex-sections-{}-{}", name, std::process::id()));
@@ -863,12 +838,6 @@ mod tests {
         for n in ["logs_2.sqlite-wal", "state_5.sqlite-shm", "state_.sqlite", "sessions", "goals_1.sqlite"] {
             assert!(!is_codex_sidebar_file(n), "{}", n);
         }
-    }
-
-    #[test]
-    fn builds_the_immutable_uri() {
-        assert_eq!(immutable_db_uri("/a b/c%d?e#f.sqlite"), "file:/a b/c%25d%3fe%23f.sqlite?immutable=1");
-        assert_eq!(immutable_db_uri("C:\\Users\\x\\.codex\\state_5.sqlite"), "file:/C:/Users/x/.codex/state_5.sqlite?immutable=1");
     }
 
     /// The harness fixture's shape: order, Pinned, visibility, a project

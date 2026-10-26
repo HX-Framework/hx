@@ -5,9 +5,11 @@
 //! migration 0041 `name`, the user's rename). A `name` wins over the auto
 //! `title`; both are trimmed and an empty one is no title. Read-only and never
 //! failing: an absent database, a locked or corrupt file, an older schema or a
-//! Codex too old for the table all read as "no title". The id → title map is
-//! cached per Codex home until the database or its `-wal` sidecar changes, or
-//! a short TTL lapses, so a pass over many sessions opens the database once.
+//! Codex too old for the table all read as "no title". A database Codex has
+//! closed (no `-wal` file) is opened immutable (`open_codex_state_db`). The
+//! id → title map is cached per Codex home until the database or its `-wal`
+//! sidecar changes, or a short TTL lapses, so a pass over many sessions opens
+//! the database once.
 
 use std::collections::HashMap;
 use std::fs;
@@ -69,6 +71,32 @@ pub fn state_db_path(codex_home: &str) -> Option<String> {
     best.map(|(_, p)| p)
 }
 
+/// A SQLite URI that opens `p` read-only and ignores any WAL.
+pub fn immutable_db_uri(p: &str) -> String {
+    let mut u = p.replace('\\', "/");
+    let b = u.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/' {
+        u = format!("/{}", u);
+    }
+    let u = u.replace('%', "%25").replace('?', "%3f").replace('#', "%23");
+    format!("file:{}?immutable=1", u)
+}
+
+/// Codex's app-server closes the database when idle, and the last close
+/// deletes the -wal and -shm files; a read-only connection cannot open a WAL
+/// database in that state, so with no -wal file the database is opened
+/// immutable (everything is in the main file then). The sections reader
+/// (codex_sections.rs) opens it the same way.
+pub fn open_codex_state_db(db_path: &str) -> rusqlite::Result<Connection> {
+    if Path::new(&format!("{}-wal", db_path)).exists() {
+        return Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX);
+    }
+    Connection::open_with_flags(
+        immutable_db_uri(db_path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+}
+
 /// `${size}:${Math.trunc(mtimeMs)}` of the database and its -wal sidecar.
 fn fingerprint(db_path: &str) -> String {
     let part = |p: &str| -> String {
@@ -115,7 +143,7 @@ fn load_map(codex_home: &str) -> HashMap<String, CodexTitle> {
         Some(p) => p,
         None => return out,
     };
-    let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX) {
+    let conn = match open_codex_state_db(&db_path) {
         Ok(c) => c,
         Err(_) => return out,
     };
@@ -175,4 +203,45 @@ pub fn read_codex_title(codex_home: &str, session_id: &str) -> Option<CodexTitle
         c.insert(codex_home.to_string(), Cached { at_ms: now, fp, map });
     }
     c.get(codex_home).and_then(|hit| hit.map.get(session_id).cloned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("hx2-codex-titles-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn builds_the_immutable_uri() {
+        assert_eq!(immutable_db_uri("/a b/c%d?e#f.sqlite"), "file:/a b/c%25d%3fe%23f.sqlite?immutable=1");
+        assert_eq!(immutable_db_uri("C:\\Users\\x\\.codex\\state_5.sqlite"), "file:/C:/Users/x/.codex/state_5.sqlite?immutable=1");
+    }
+
+    /// Codex's last close checkpoints the WAL and deletes both files; a plain
+    /// read-only open then fails with "unable to open database file".
+    #[test]
+    fn reads_a_wal_database_whose_wal_is_gone() {
+        let h = home("idle");
+        let p = join(&h, "state_5.sqlite");
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT); INSERT INTO threads (id, title, name) VALUES ('s1', 'From the main file', NULL);").unwrap();
+            let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
+            conn.execute("INSERT INTO threads (id, title, name) VALUES ('s2', 'auto', 'Checkpointed')", []).unwrap();
+            let _: (i64, i64, i64) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        }
+        for f in [format!("{}-wal", p), format!("{}-shm", p)] {
+            let _ = fs::remove_file(f);
+        }
+        let s1 = read_codex_title(&h, "s1").expect("a title from the main file");
+        assert_eq!((s1.title, s1.source), (js("From the main file"), "ai"));
+        let s2 = read_codex_title(&h, "s2").expect("the checkpointed rename");
+        assert_eq!((s2.title, s2.source), (js("Checkpointed"), "user"));
+        let _ = fs::remove_dir_all(&h);
+    }
 }

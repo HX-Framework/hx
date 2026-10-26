@@ -126,7 +126,10 @@ paths, local ports, pids and launch tokens, and the two numbers in the stuck
 line (`waiting out a retry backoff for another <n> min (<n> consecutive
 failures`): the countdown is measured against the moment the tick ran and the
 failure count climbs with every retry a run had time for, so both follow
-timing — the reason and the hold it names are the fact. Object key order is
+timing — the reason and the hold it names are the fact. The Codex title
+sweep's version in its log line (`[retitle] v<n>:`) is masked too: hx 77.15.2
+and hx2 78.0.4 raised it to sweep once more, and a fresh home sweeps every
+file under any version, so the counts after it are the fact. Object key order is
 not compared either: the client adds a top-level key to `state.json` when it
 first records that kind of fact, so the order follows which session it
 ingested first.
