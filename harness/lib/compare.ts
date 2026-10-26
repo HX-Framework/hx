@@ -27,7 +27,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import type { RecordedRequest } from "../gateway/gateway.js";
-import type { Manifest } from "../fixtures/gen-home.js";
+import type { ExpectedGroupMirror, Manifest } from "../fixtures/gen-home.js";
 import { isRelTime, normalizeJson, normalizeText, type NormalizeContext, DEFAULT_WINDOW_AFTER_MS, DEFAULT_WINDOW_BEFORE_MS } from "./normalize.js";
 import type { BinaryName, CheckResult, RunMeta, Scenario, StepRecord } from "./types.js";
 
@@ -182,6 +182,31 @@ export function sendsCodexSections(meta: Pick<RunMeta, "name" | "version">): boo
   return true;
 }
 
+/** The first versions that send each group's side sessions (`sideSessions`). */
+const SIDE_SESSIONS: Record<BinaryName, [number, number, number]> = { hx: [77, 16, 0], hx2: [78, 0, 4] };
+
+/** Does this run's binary send each group's side sessions in the group
+ *  mirror? A version that cannot be read is held to it. */
+export function sendsSideSessions(meta: Pick<RunMeta, "name" | "version">): boolean {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
+  if (!m) return true;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const since = SIDE_SESSIONS[meta.name] ?? SIDE_SESSIONS.hx;
+  for (let i = 0; i < 3; i++) if (v[i] !== since[i]) return v[i]! > since[i]!;
+  return true;
+}
+
+/** The fixture's mirror as a client before side sessions uploads it: no
+ *  `sideSessions`, and no archived side session in `archivedIds`. */
+export function withoutSideSessions(want: ExpectedGroupMirror): ExpectedGroupMirror {
+  const side = new Set(want.groups.flatMap((g) => (g.sideSessions ?? []).map((x) => x.id)));
+  return {
+    ...want,
+    groups: want.groups.map(({ sideSessions: _omit, ...g }) => g),
+    ...(want.archivedIds ? { archivedIds: want.archivedIds.filter((id) => !side.has(id)) } : {}),
+  };
+}
+
 export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): CheckResult[] {
   const versions = [ref.meta.version, cand.meta.version].filter(Boolean);
   const tol = opts.scenario.compare.tsToleranceMs;
@@ -200,14 +225,17 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   // Codex Desktop's sections ride in the same upload (77.15 / hx2 78.0.2): a
   // reference that sends no `codex` uploads another body, logs another
   // [groups] line, keeps another hash and makes no upload when only Codex
-  // changed, so the same three facts leave the comparison against it.
+  // changed, so the same three facts leave the comparison against it. So do
+  // a group's side sessions (77.16.0 / hx2 78.0.4) on the per-account store.
   const scopedExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !readsScopedCcdStore(ref.meta);
   const codexExempt = !sendsCodexSections(ref.meta);
-  const mirrorExempt = scopedExempt || codexExempt;
+  const sideExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !sendsSideSessions(ref.meta);
+  const mirrorExempt = scopedExempt || codexExempt || sideExempt;
   if (mirrorExempt) {
     const why = [
       ...(scopedExempt ? ["the per-account Claude Desktop mirror (hx 77.15.1, hx2 78.0.3)"] : []),
       ...(codexExempt ? ["Codex Desktop's sections in the mirror"] : []),
+      ...(sideExempt ? ["side sessions in the mirror (hx 77.16.0, hx2 78.0.4)"] : []),
     ].join(" and ");
     checks.push({
       name: "group mirror",
@@ -304,6 +332,8 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     if (a === null && b === null) checks.push({ name: "ccd-index.json", ok: true, details: "neither run wrote one (no Claude Desktop store on this platform, or a client that predates the saved index)" });
     else if (a === null) checks.push({ name: "ccd-index.json", ok: true, details: "the reference predates the saved index; the candidate's is not compared" });
     else if (b === null) checks.push({ name: "ccd-index.json", ok: false, details: "the reference wrote ccd-index.json and the candidate did not" });
+    else if ((a as { v?: unknown }).v !== (b as { v?: unknown }).v)
+      checks.push({ name: "ccd-index.json", ok: true, details: `the runs save the index in different formats (v${String((a as { v?: unknown }).v)} and v${String((b as { v?: unknown }).v)}; v2 gives each record its parentId): not compared` });
     else checks.push(check("ccd-index.json", deepDiff(normalizeJson(a, ctxRef), normalizeJson(b, ctxCand), tolS), "identical after normalization"));
   }
 
@@ -656,7 +686,8 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   } else if (!first) {
     checks.push({ name: "fixture: group mirror uploaded", ok: false, details: "no successful /sessions/group-mirror request" });
   } else {
-    const want = darwin ? manifest.expectations.groupMirror : { groupingEnabled: false, groups: [], unreadIds: [] };
+    const full = manifest.expectations.groupMirror;
+    const want = !darwin ? { groupingEnabled: false, groups: [], unreadIds: [] } : scoped && !sendsSideSessions(run.meta) ? withoutSideSessions(full) : full;
     checks.push(
       check(
         "fixture: group mirror matches the leveldb",
@@ -670,7 +701,8 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   // second account's mirror must be uploaded, and soon — the leveldb watch,
   // not the 20 s mirror timer, which never fires in the run.
   const switched = run.meta.steps.find((s) => s.ccdSwitchTMs !== undefined);
-  const afterWant = manifest.expectations.groupMirrorAfterSwitch;
+  const afterFull = manifest.expectations.groupMirrorAfterSwitch;
+  const afterWant = afterFull && !sendsSideSessions(run.meta) ? withoutSideSessions(afterFull) : afterFull;
   if (scoped && darwin && readsScopedCcdStore(run.meta) && switched && afterWant) {
     const at = switched.ccdSwitchTMs!;
     const hit = mirrors.find((r) => r.tMs >= at && deepDiff(pick(mirrorOf(r) ?? {}, afterWant), afterWant, 0).length === 0);
