@@ -33,7 +33,10 @@
 //   • git repositories the cwds point at (a normal clone, a linked worktree,
 //     a non-GitHub remote) and an encoded `@owner@name@xxxxxx` scratch cwd;
 //   • Codex rollouts (CLI, desktop originator, an archived one) and a
-//     state_5.sqlite with a user name, an AI title and a missing row;
+//     state_5.sqlite with a user name, an AI title and a missing row; Codex
+//     Desktop's sidebar sections (.codex-global-state.json for two accounts,
+//     the database's sections, a pinned thread, a project placed in a
+//     section, threads the sidebar does not list) and a later change to them;
 //   • Claude Desktop session metadata files and a Local Storage leveldb with
 //     a stale .log and an authoritative Snappy-compressed .ldb (grouping,
 //     unread ids, a vestigial dframe-store) — or, with ccdLayout "scoped",
@@ -123,10 +126,29 @@ export interface Manifest {
     /** ccdLayout "scoped": the mirror once `ccdSwitch` is written. */
     groupMirrorAfterSwitch?: ExpectedGroupMirror;
     codexTitles: Record<string, { title: string; source: "user" | "ai" }>;
+    /** The group mirror's `codex`: Codex Desktop's sidebar sections. */
+    codexSections: ExpectedCodexSection[];
+    /** The same once `codexChange` is written. */
+    codexSectionsAfterChange: ExpectedCodexSection[];
   };
   /** ccdLayout "scoped": the write that switches Claude Desktop to its second
    *  account, to append to `file` (relative to the home) during a run. */
   ccdSwitch?: { file: string; appendBase64: string };
+  /** A change to Codex Desktop's sidebar: the new content of `file`
+   *  (relative to the home), written the way Codex writes it (a temp file
+   *  renamed over it) during a run. */
+  codexChange: { file: string; contentBase64: string };
+  /** The home holds Codex's state (a Codex home with its sidebar), so the
+   *  group mirror's `codex` is an object, not null. */
+  codexHome: boolean;
+}
+
+export interface ExpectedCodexSection {
+  id: string;
+  name: string;
+  collapsed: boolean;
+  sessionIds: string[];
+  showEmpty: boolean;
 }
 
 const MIN = 60_000;
@@ -371,6 +393,98 @@ interface CodexSessionSpec {
   day: { y: number; m: number; d: number };
 }
 
+// ── Codex Desktop's sidebar sections ───────────────────────────────────────
+
+// The pinned list's fixed id in Codex's app-server (src/codex-sections.ts).
+const CODEX_PINNED_SECTION_ID = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
+
+/**
+ * Codex Desktop's saved sidebar for two accounts and the database rows behind
+ * it. `ids` are the four rollouts' thread ids [c1 cli/repo, c2 cli/scratch,
+ * c3 desktop/repo with no database row, c4 archived/repo]. The signed-in
+ * account (named by environment-catalog-cache-v1) shows, in this order:
+ *   Review    c1, then a thread hx has no rollout for; an archived thread, a
+ *             subagent thread and c3 (no row: deleted) are left out
+ *   Pinned    the app-server's pinned thread, then an older pin it has not
+ *             taken over yet
+ *   Old work  (collapsed) the project placed in it: x1 under the repo's
+ *             root first (newest, missing from the saved order), then c2
+ *             (assigned to the project by hand, the saved order); c1 is
+ *             under the root too but Review keeps it
+ *   Empty     no threads
+ * The other account's section never shows. The change written during a run
+ * renames Review, collapses it, and moves its second thread into Empty.
+ */
+function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: string; scratch: string }): void {
+  const rng = new Prng("codex-sections");
+  const [c1, c2, c3, c4] = ids as [string, string, string, string];
+  const x = { listed: rng.uuid(), archived: rng.uuid(), subagent: rng.uuid(), underRoot: rng.uuid(), pinned: rng.uuid(), oldPin: rng.uuid() };
+  const row = (id: string, o: { archived?: number; source?: string; threadSource?: string; cwd: string; recency: number; section?: string; position?: number }): void => {
+    db.run(
+      "INSERT INTO threads (id, title, created_at, archived, source, preview, thread_source, cwd, recency_at_ms, thread_section_id, section_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [id, "A Codex thread", 1760000000, o.archived ?? 0, o.source ?? "vscode", "A Codex thread", o.threadSource ?? "user", o.cwd, o.recency, o.section ?? null, o.position ?? null],
+    );
+  };
+  db.run("INSERT INTO thread_sections (id, name) VALUES (?, 'Pinned')", [CODEX_PINNED_SECTION_ID]);
+  db.run("INSERT INTO thread_sections (id, name) VALUES ('db-review', 'Review')");
+  db.run("INSERT INTO thread_sections (id, name) VALUES ('db-empty', 'Empty')");
+  db.run("UPDATE threads SET thread_section_id = 'db-review', section_position = 1000 WHERE id = ?", [c1]);
+  row(x.listed, { cwd: dirs.scratch, recency: CONTENT_EPOCH + 9 * HOUR, section: "db-review", position: 2000 });
+  row(x.archived, { archived: 1, cwd: dirs.repo, recency: CONTENT_EPOCH + 8 * HOUR, section: "db-review", position: 3000 });
+  row(x.subagent, { source: '{"subagent":{"other":"guardian"}}', threadSource: "guardian_review", cwd: dirs.repo, recency: CONTENT_EPOCH + 10 * HOUR });
+  row(x.underRoot, { cwd: join(dirs.repo, "packages", "core"), recency: CONTENT_EPOCH + 7 * HOUR });
+  row(x.pinned, { cwd: dirs.scratch, recency: CONTENT_EPOCH + 2 * HOUR, section: CODEX_PINNED_SECTION_ID, position: 1000 });
+  row(x.oldPin, { cwd: dirs.scratch, recency: CONTENT_EPOCH + HOUR });
+  void c4; // archived, under the repo's root: never listed
+
+  const item = (id: string): string => `codex:thread:local:${id}`;
+  const sidebar = (review: { name: string; collapsed: boolean; items: string[] }, empty: string[]): Record<string, unknown> => ({
+    "environment-catalog-cache-v1": { accountId: "acct-fixture", refreshedAt: CONTENT_EPOCH },
+    "prompt-history": { entries: [rng.sentence(12), rng.sentence(9)] },
+    "local-projects": {
+      "local-repo": { id: "local-repo", name: "acme-repo", rootPaths: [dirs.repo], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
+      "local-scratch": { id: "local-scratch", name: "notes", rootPaths: [dirs.scratch], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
+    },
+    "thread-project-assignments": { [c2]: { projectKind: "local", projectId: "local-repo" } },
+    "projectless-thread-ids": [],
+    "sidebar-project-thread-orders": { "local-repo": { threadIds: [c2, x.subagent] } },
+    "pinned-thread-ids": [x.oldPin, x.pinned],
+    "app-server-migrated-pinned-thread-ids-by-host": { "local:codex-home": [x.pinned] },
+    "pinned-project-ids": [],
+    "electron-persisted-atom-state": {
+      "sidebar-custom-sections-v3": {
+        "acct-fixture": {
+          sections: [
+            { id: "sec-review", name: review.name, hostSectionIds: { local: "db-review" }, itemKeys: review.items, appearance: null },
+            { id: "sec-old", name: "Old work", hostSectionIds: {}, itemKeys: ["codex:project:local-repo"], appearance: null },
+            { id: "sec-empty", name: "Empty", hostSectionIds: { local: "db-empty" }, itemKeys: empty, appearance: null },
+          ],
+          collapsedSectionIds: review.collapsed ? ["sec-review", "sec-old"] : ["sec-old"],
+          sectionOrder: ["custom:sec-review", "agents", "pinned", "custom:sec-old", "custom:sec-empty", "threads", "chats"],
+          appServerMigratedHostIds: ["local"],
+        },
+        "acct-other": {
+          sections: [{ id: "sec-other", name: "Another account", hostSectionIds: {}, itemKeys: [item(c2)], appearance: null }],
+          collapsedSectionIds: [],
+          sectionOrder: ["custom:sec-other"],
+        },
+      },
+      "chatgpt-sidebar-state-v1": { "acct-fixture": { pinnedConversations: [], projects: [], pinnedProjects: [] } },
+      "flat-project-sidebar-preferences-v1": { chatSortMode: "updated_at", initialized: true, mode: "project", projectSortMode: "manual" },
+    },
+  });
+  const reviewItems = [item(c1), item(x.listed), item(x.archived), item(x.subagent), item(c3)];
+  write(ctx, ".codex/.codex-global-state.json", JSON.stringify(sidebar({ name: "Review", collapsed: false, items: reviewItems }, [])), -2 * HOUR);
+  const changed = sidebar({ name: "Review this week", collapsed: true, items: reviewItems.filter((k) => k !== item(x.listed)) }, [item(x.listed)]);
+  ctx.manifest.codexChange = { file: ".codex/.codex-global-state.json", contentBase64: Buffer.from(JSON.stringify(changed)).toString("base64") };
+  ctx.manifest.codexHome = true;
+  const section = (id: string, name: string, collapsed: boolean, sessionIds: string[]): ExpectedCodexSection => ({ id, name, collapsed, sessionIds, showEmpty: true });
+  const pinned = section("pinned", "Pinned", false, [x.pinned, x.oldPin]);
+  const old = section("sec-old", "Old work", true, [x.underRoot, c2]);
+  ctx.manifest.expectations.codexSections = [section("sec-review", "Review", false, [c1, x.listed]), pinned, old, section("sec-empty", "Empty", false, [])];
+  ctx.manifest.expectations.codexSectionsAfterChange = [section("sec-review", "Review this week", true, [c1]), pinned, old, section("sec-empty", "Empty", false, [x.listed])];
+}
+
 function codexRollout(spec: CodexSessionSpec): { name: string; content: string } {
   const rng = new Prng(`codex:${spec.seed}`);
   let t = CONTENT_EPOCH + spec.contentIndex * 11 * MIN;
@@ -600,7 +714,12 @@ function writeCore(ctx: Ctx, hot = false): Core {
   ];
   mkdirSync(join(home, ".codex"), { recursive: true });
   const db = new Database(join(home, ".codex", "state_5.sqlite"), { create: true });
-  db.run("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL, name TEXT, created_at INTEGER)");
+  // The columns Codex's app-server keeps that hx reads: the title and name,
+  // and for the sidebar sections whether and where a thread is listed.
+  db.run(
+    "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL, name TEXT, created_at INTEGER, archived INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'vscode', preview TEXT NOT NULL DEFAULT '', thread_source TEXT, cwd TEXT NOT NULL DEFAULT '', recency_at_ms INTEGER NOT NULL DEFAULT 0, thread_section_id TEXT, section_position INTEGER)",
+  );
+  db.run("CREATE TABLE thread_sections (id TEXT PRIMARY KEY, name TEXT NOT NULL, appearance TEXT)");
   for (const c of codexSpecs) {
     const { name, content } = codexRollout(c);
     const dayDir = `.codex/${c.archived ? "archived_sessions" : "sessions"}/${c.day.y}/${String(c.day.m).padStart(2, "0")}/${String(c.day.d).padStart(2, "0")}`;
@@ -615,10 +734,21 @@ function writeCore(ctx: Ctx, hot = false): Core {
       note: c.archived ? "codex archived rollout" : `codex ${c.originator}`,
     });
     if (c.title) {
-      db.run("INSERT INTO threads (id, title, name, created_at) VALUES (?, ?, ?, ?)", [c.id, c.title.title, c.title.name, 1760000000]);
+      db.run("INSERT INTO threads (id, title, name, created_at, archived, preview, thread_source, cwd, recency_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+        c.id,
+        c.title.title,
+        c.title.name,
+        1760000000,
+        c.archived ? 1 : 0,
+        c.title.title,
+        "user",
+        c.cwd,
+        CONTENT_EPOCH + c.contentIndex * HOUR,
+      ]);
       ctx.manifest.expectations.codexTitles[c.id] = c.title.name ? { title: c.title.name, source: "user" } : { title: c.title.title, source: "ai" };
     }
   }
+  writeCodexSidebar(ctx, db, codexSpecs.map((c) => c.id), { repo, scratch });
   db.close();
   ctx.mtimes.push({ path: join(home, ".codex", "state_5.sqlite"), offsetMs: -3 * HOUR, kind: "file" });
 
@@ -946,7 +1076,9 @@ export function generateHome(opts: GenOptions): Manifest {
       ...(ccdLayout === "flat" ? {} : { ccdLayout }),
       sessions: [],
       ignored: [],
-      expectations: { groupMirror: { groupingEnabled: false, groups: [], unreadIds: [] }, codexTitles: {} },
+      codexChange: { file: ".codex/.codex-global-state.json", contentBase64: "" },
+      codexHome: false,
+      expectations: { groupMirror: { groupingEnabled: false, groups: [], unreadIds: [] }, codexTitles: {}, codexSections: [], codexSectionsAfterChange: [] },
     },
     mtimes: [],
     ccdFiles: 0,

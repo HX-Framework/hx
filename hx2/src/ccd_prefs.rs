@@ -861,6 +861,10 @@ pub fn group_mirror_gate(mirror: &Json) -> Json {
         pairs.push(("archivedIds", mirror.get("archivedIds").cloned().unwrap_or(Json::Arr(Vec::new()))));
         pairs.push(("scope", mirror.get("scope").cloned().unwrap_or(Json::Null)));
     }
+    // Codex's sections when the mirror carries them (absent after a failed read).
+    if let Some(codex) = mirror.get("codex") {
+        pairs.push(("codex", codex.clone()));
+    }
     obj(pairs)
 }
 
