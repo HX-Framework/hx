@@ -276,10 +276,16 @@ export const SCENARIOS: Scenario[] = [
   {
     name: "codex-sections",
     description:
-      "Codex Desktop's sidebar sections ride in the group mirror as `codex`: two one-shot passes upload them with everything else; then the daemon runs 12 s, and 5 s in Codex rewrites its sidebar state the way it does, a temp file renamed over the old one (a section renamed and collapsed, a thread moved into another section). The mirror follows from the watch on the Codex home within about a second; the 20 s mirror timer never fires in the run.",
+      "Codex Desktop's sidebar sections ride in the group mirror as `codex`: two one-shot passes upload them with everything else and a transcript grows; then the daemon runs 12 s, and 5 s in Codex rewrites its sidebar state the way it does, a temp file renamed over the old one (a section renamed and collapsed, a thread moved into another section). The mirror follows from the watch on the Codex home within about a second; the 20 s mirror timer never fires in the run. (The grown transcript gives the daemon's first pass an upload, which counts as contact, so no run sends the start-up heartbeat; with nothing to upload, whether it goes out races the reply to the progress report.)",
     shape: "small",
     seed: "codex-sections",
-    steps: [once("watch1"), once("watch2"), { kind: "watch-for", name: "daemon", durationMs: 12_000, codexChange: { atMs: 5_000 } }, status("status1")],
+    steps: [
+      once("watch1"),
+      once("watch2"),
+      { kind: "grow", name: "grow", sessionIndex: 2, bytes: 3000 },
+      { kind: "watch-for", name: "daemon", durationMs: 12_000, codexChange: { atMs: 5_000 } },
+      status("status1"),
+    ],
     compare: { requests: "per-session", tsToleranceMs: 20_000 },
   },
   {
