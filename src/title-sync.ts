@@ -30,7 +30,7 @@ import type { HxConfig } from "./config.js";
 
 /** Bump to re-sweep every codex file — e.g. after teaching the reader a NEW
  *  codex client's name location, or to re-push titles wholesale.
- *  2 (77.15.2): before it, the reader could not open Codex's database while
+ *  2 (77.16.1): before it, the reader could not open Codex's database while
  *  Codex had it closed (no -wal file), so a sweep at such a start found no
  *  titles and stamped every file as having none. */
 export const TITLE_SYNC_VERSION = 2;

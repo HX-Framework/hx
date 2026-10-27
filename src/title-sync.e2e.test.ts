@@ -160,7 +160,7 @@ describe("title-sync sweep — daemon E2E (codex simulated via a real state_5.sq
   });
 
   it("sends the name of a session an earlier sweep stamped while Codex had its database closed", async () => {
-    // Before 77.15.2 the reader could not open an idle database (WAL mode, no
+    // Before 77.16.1 the reader could not open an idle database (WAL mode, no
     // -wal file), so the sweep found no name and stamped the file under v1.
     const sessionId = crypto.randomUUID();
     seedCodexDb(sessionId, "auto", "Named in Codex");
