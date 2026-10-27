@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use notify::{EventKind, RecursiveMode, Watcher};
 
-use crate::ccd::{ccd_id_key, ccd_leveldb_dir, read_ccd_recents_cached, refresh_ccd_index, CcdSessionMeta, IdKey};
+use crate::ccd::{ccd_id_key, ccd_leveldb_dir, ccd_records_in_scope, read_ccd_recents_cached, refresh_ccd_index_fresh, CcdSessionMeta, IdKey};
 use crate::ccd_leveldb::{decode_local_storage_value, is_newer_record, local_storage_key_name, read_leveldb_value, LeveldbKeyReader, LeveldbRecord, LeveldbScan};
 use crate::crypto::sha256_hex;
 use crate::fsutil::{now_ms, stat_safe};
@@ -234,11 +234,14 @@ struct SidebarView {
     status_filter: Option<JsStr>,
     /// The live scope key, hashed (sha256, first 16 hex).
     scope: Option<String>,
+    /// The live scope key itself (`<accountId>/<orgId>`): whose session files
+    /// the side sessions come from. Never uploaded.
+    scope_key: Option<String>,
     note: String,
 }
 
 fn disabled_view(layout: Option<&'static str>, status_filter: Option<JsStr>, scope: Option<String>, note: &str) -> SidebarView {
-    SidebarView { enabled: false, layout, groups: Vec::new(), status_filter, scope, note: note.to_string() }
+    SidebarView { enabled: false, layout, groups: Vec::new(), status_filter, scope, scope_key: None, note: note.to_string() }
 }
 
 fn str_eq(v: Option<&Json>, lit: &str) -> bool {
@@ -371,7 +374,7 @@ fn resolve_scoped(state: &Json) -> SidebarView {
             return disabled_view(Some("sections"), status_filter, Some(scope), "no CCD custom groups in the live account");
         }
         let note = format!("CCD sidebar: {} groups", groups.len());
-        return SidebarView { enabled: true, layout: Some("sections"), groups, status_filter, scope: Some(scope), note };
+        return SidebarView { enabled: true, layout: Some("sections"), groups, status_filter, scope: Some(scope), scope_key: Some(key.clone()), note };
     }
 
     // No sections for this scope: the scoped group list, while the app groups by it.
@@ -408,7 +411,7 @@ fn resolve_scoped(state: &Json) -> SidebarView {
         return disabled_view(Some("scoped-groups"), status_filter, Some(scope), "no CCD custom groups in the live account");
     }
     let note = format!("CCD custom grouping: {} groups", groups.len());
-    SidebarView { enabled: true, layout: Some("scoped-groups"), groups, status_filter, scope: Some(scope), note }
+    SidebarView { enabled: true, layout: Some("scoped-groups"), groups, status_filter, scope: Some(scope), scope_key: Some(key.clone()), note }
 }
 
 /// The flat layout of older builds, read exactly as the client always has.
@@ -488,7 +491,7 @@ fn resolve_flat(dframe: &Json) -> SidebarView {
         })
         .collect();
     let note = format!("CCD custom grouping: {} groups", groups.len());
-    SidebarView { enabled: true, layout: None, groups, status_filter: None, scope: None, note }
+    SidebarView { enabled: true, layout: None, groups, status_filter: None, scope: None, scope_key: None, note }
 }
 
 fn resolve_view(state: &Json) -> SidebarView {
@@ -700,6 +703,11 @@ fn cap_blob(blob: &mut Json) {
                 if let Some(v) = g.get("sortBy").map(cap_word) {
                     g.set("sortBy", v);
                 }
+                // A side session whose id or parent's id is too long is left out.
+                let fits = |x: &Json, k: &str| x.get(k).and_then(|i| i.as_str()).map(|s| s.len() <= MAX_ID).unwrap_or(false);
+                if let Some(v) = g.get("sideSessions").and_then(|v| v.as_arr()).map(|a| a.iter().filter(|x| fits(x, "id") && fits(x, "parent")).take(MAX_IDS).cloned().collect::<Vec<Json>>()) {
+                    g.set("sideSessions", Json::Arr(v));
+                }
                 g
             })
             .collect();
@@ -763,6 +771,37 @@ fn set_scoped_fields(blob: &mut Json, v: &SidebarView, archived_ids: Vec<Json>) 
 /// mirror when the app shows no custom groups. None when the store could not
 /// be read whole: every upload is the device's whole sidebar, so the caller
 /// skips the cycle rather than send one that would empty it.
+/// One group's side sessions as (id, parent) pairs, local ids: walked from
+/// `members` in member order, depth first, a session's side sessions in the
+/// order `children_of` holds them (sorted by id). A session filed in a group
+/// (`filed`) is drawn there and not walked; a session already reached is not
+/// walked again.
+fn side_sessions_of(members: &[JsStr], children_of: &HashMap<JsStr, Vec<JsStr>>, filed: &HashSet<JsStr>) -> Vec<(JsStr, JsStr)> {
+    let mut out: Vec<(JsStr, JsStr)> = Vec::new();
+    let mut reached: HashSet<JsStr> = members.iter().cloned().collect();
+    // (parent, side session) pairs, pushed in reverse so the walk takes them in order.
+    let push = |stack: &mut Vec<(JsStr, JsStr)>, parent: &JsStr| {
+        if let Some(kids) = children_of.get(parent) {
+            for k in kids.iter().rev() {
+                stack.push((parent.clone(), k.clone()));
+            }
+        }
+    };
+    for m in members {
+        let mut stack: Vec<(JsStr, JsStr)> = Vec::new();
+        push(&mut stack, m);
+        while let Some((parent, id)) = stack.pop() {
+            if reached.contains(&id) || filed.contains(&id) {
+                continue;
+            }
+            reached.insert(id.clone());
+            push(&mut stack, &id);
+            out.push((id, parent));
+        }
+    }
+    out
+}
+
 pub fn build_group_mirror(now_ms: f64) -> Option<Json> {
     let empty = empty_mirror(now_ms);
     let ls_dir = match ccd_leveldb_dir() {
@@ -770,7 +809,10 @@ pub fn build_group_mirror(now_ms: f64) -> Option<Json> {
         None => return Some(empty),
     };
     let ldb_fp = leveldb_fingerprint(&ls_dir);
-    let index_version = refresh_ccd_index(now_ms, false);
+    // `fresh`: a side session the app just started is a new session file,
+    // and the store write that wakes this build (its group's drawn row count
+    // changes) would otherwise find the index held by its TTL for up to 20 s.
+    let index_version = refresh_ccd_index_fresh(now_ms);
     {
         let c = cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = c.as_ref() {
@@ -819,10 +861,35 @@ pub fn build_group_mirror(now_ms: f64) -> Option<Json> {
             None => local_id.clone(),
         }
     };
+    // Side sessions (ccd-prefs.ts): the app draws a session spawned as a side
+    // session of another under it, in that session's group, and theirs in
+    // turn. Only the live account's session files count, and one filed in a
+    // group of its own is drawn there. Each group's side sessions are walked
+    // from its members in member order, depth first, a session's side
+    // sessions in id order (UTF-16 code units, as `Array.prototype.sort`
+    // orders them); a session already reached is not walked again.
+    let mut children_of: HashMap<JsStr, Vec<JsStr>> = HashMap::new();
+    if let (Some(_), Some(key)) = (view.layout, view.scope_key.as_ref()) {
+        for r in ccd_records_in_scope(key) {
+            if let Some(p) = r.parent_id_units() {
+                children_of.entry(p).or_default().push(r.ccd_session_id_units());
+            }
+        }
+        for kids in children_of.values_mut() {
+            kids.sort();
+        }
+    }
+    let filed: HashSet<JsStr> = view.groups.iter().flat_map(|g| g.members.iter().cloned()).collect();
+    let side_by_group: Vec<Vec<(JsStr, JsStr)>> = if children_of.is_empty() {
+        vec![Vec::new(); view.groups.len()]
+    } else {
+        view.groups.iter().map(|g| side_sessions_of(&g.members, &children_of, &filed)).collect()
+    };
     let groups: Vec<Json> = view
         .groups
         .iter()
-        .map(|g| {
+        .enumerate()
+        .map(|(i, g)| {
             let mut pairs: Vec<(&str, Json)> = vec![
                 ("id", Json::Str(g.id.clone())),
                 ("name", Json::Str(g.name.clone())),
@@ -836,25 +903,26 @@ pub fn build_group_mirror(now_ms: f64) -> Option<Json> {
                 pairs.push(("ascending", x.ascending.map(Json::Bool).unwrap_or(Json::Null)));
                 pairs.push(("shown", Json::Bool(x.shown)));
                 pairs.push(("showEmpty", Json::Bool(x.show_empty)));
+                let side = side_by_group[i].iter().map(|(id, parent)| obj(vec![("id", Json::Str(to_cli(id))), ("parent", Json::Str(to_cli(parent)))])).collect();
+                pairs.push(("sideSessions", Json::Arr(side)));
             }
             obj(pairs)
         })
         .collect();
     // The members the app has archived, which its "active" session filter
     // hides (the server has no archived flag of its own), in group order, in
-    // the id space of sessionIds.
+    // the id space of sessionIds; then the archived side sessions, in group order.
     let mut archived_ids: Vec<Json> = Vec::new();
     let mut seen_archived: HashSet<JsStr> = HashSet::new();
-    for g in &view.groups {
-        for m in &g.members {
-            let units = wtf8::from_units(m);
-            if !archived.contains(&ccd_id_key(&units)) {
-                continue;
-            }
-            let id = to_cli(m);
-            if seen_archived.insert(id.clone()) {
-                archived_ids.push(Json::Str(id));
-            }
+    let side_ids = side_by_group.iter().flat_map(|side| side.iter().map(|(id, _)| id));
+    for local in view.groups.iter().flat_map(|g| g.members.iter()).chain(side_ids) {
+        let units = wtf8::from_units(local);
+        if !archived.contains(&ccd_id_key(&units)) {
+            continue;
+        }
+        let id = to_cli(local);
+        if seen_archived.insert(id.clone()) {
+            archived_ids.push(Json::Str(id));
         }
     }
     let mut blob = obj(vec![
@@ -1158,5 +1226,29 @@ mod tests {
         assert_eq!(g.get("name").and_then(|n| n.as_str()).map(|n| n.len()), Some(400));
         assert_eq!(g.get("sessionIds").and_then(|s| s.as_arr()).map(|s| s.len()), Some(5_000));
         assert!(g.get("sortBy").map(|s| s.is_null()).unwrap_or(false));
+    }
+
+    #[test]
+    fn side_sessions_are_walked_depth_first_in_id_order() {
+        let j = |x: &str| js(x);
+        let mut children: HashMap<JsStr, Vec<JsStr>> = HashMap::new();
+        // a: s0, s1, s3, s7 (sorted); s1: s2; c: s6; s9 <-> s8 a cycle nobody reaches.
+        children.insert(j("a"), vec![j("s0"), j("s1"), j("s3"), j("s7")]);
+        children.insert(j("s1"), vec![j("s2")]);
+        children.insert(j("c"), vec![j("s6")]);
+        children.insert(j("s8"), vec![j("s9")]);
+        children.insert(j("s9"), vec![j("s8")]);
+        let filed: HashSet<JsStr> = [j("a"), j("b"), j("c"), j("s7")].into_iter().collect();
+        let pairs = |members: &[&str]| -> Vec<(String, String)> {
+            let m: Vec<JsStr> = members.iter().map(|x| js(x)).collect();
+            side_sessions_of(&m, &children, &filed).into_iter().map(|(id, p)| (lossy(&id), lossy(&p))).collect()
+        };
+        let want = |v: &[(&str, &str)]| -> Vec<(String, String)> { v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect() };
+        // s7 is filed in a group of its own; s2 comes right after its parent s1.
+        assert_eq!(pairs(&["a", "b"]), want(&[("s0", "a"), ("s1", "a"), ("s2", "s1"), ("s3", "a")]));
+        assert_eq!(pairs(&["c"]), want(&[("s6", "c")]));
+        assert_eq!(pairs(&["s7"]), want(&[]));
+        // A member that is also another member's side session is not repeated.
+        assert_eq!(pairs(&["a", "s1"]), want(&[("s0", "a"), ("s3", "a"), ("s2", "s1")]));
     }
 }
