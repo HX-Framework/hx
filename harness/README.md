@@ -298,6 +298,22 @@ count and keeps another mirror hash, so:
 | --- | --- |
 | The mirror carries Codex's sections, and follows a change to them within about a second | a run whose version predates them (hx before 77.15.0, hx2 before 78.0.2) is not held to the Codex fixture; when the reference predates them, its `/sessions/group-mirror` requests, the stored mirror, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison (the same rule as the per-account reader's), and the candidate is held to the fixture instead. A reference that sends `codex` is compared in full |
 
+### Contract taught for side sessions in the mirror (77.16.0, hx2 78.0.5)
+
+Claude Desktop draws a session spawned as a side session of another under that
+session, in its group, and the side sessions of those in turn. Each group in
+the mirror now lists them as `sideSessions` (each with its `parent`), and the
+archived ones join `archivedIds`. To know a session's parent, each record of
+the saved Claude Desktop index carries `parentId`, so `ccd-index.json` moved to
+format 2. The per-account fixture adds side sessions two levels deep, an
+archived one, one in the second account, and two spawns that are not side
+sessions (a task card, a detached lineage), so:
+
+| What a server, a person or the UI can see | Rule |
+| --- | --- |
+| Each group lists the side sessions Claude Desktop draws in it | a run that reads the per-account store but predates side sessions (hx 77.15.1 and 77.15.2, hx2 78.0.3 and 78.0.4) is held to the fixture without them; when the reference predates them, its mirror requests, the stored mirror, its `[groups]` log lines and its mirror hash leave the comparison, as above |
+| The saved index (`ccd-index.json`) | two runs that save it in different formats are not compared on it; runs in the same format are, as before |
+
 ### Goldens
 
 `harness/golden/<Linux|macOS>/<scenario>/<step>.txt` hold normalized CLI
