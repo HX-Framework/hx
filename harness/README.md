@@ -127,9 +127,10 @@ line (`waiting out a retry backoff for another <n> min (<n> consecutive
 failures`): the countdown is measured against the moment the tick ran and the
 failure count climbs with every retry a run had time for, so both follow
 timing — the reason and the hold it names are the fact. The Codex title
-sweep's version in its log line (`[retitle] v<n>:`) is masked too: hx 77.15.2
-and hx2 78.0.4 raised it to sweep once more, and a fresh home sweeps every
-file under any version, so the counts after it are the fact. Object key order is
+sweep's version is masked too, in its log line (`[retitle] v<n>:`) and in the
+`titleSyncVersion` stamp `state.json` keeps per file: hx 77.16.1 and hx2
+78.0.6 raised it to sweep once more, and a fresh home sweeps every file under
+any version, so the counts and the stamp's presence are the fact. Object key order is
 not compared either: the client adds a top-level key to `state.json` when it
 first records that kind of fact, so the order follows which session it
 ingested first.
@@ -270,7 +271,7 @@ to run outside CI or over an existing path (`harness/run/service-home.ts`).
 pages the allocator has handed back through `malloc_zone_pressure_relief`,
 the footprint does not.
 
-### Contract taught for the per-account Claude Desktop reader (77.14.0, hx2 78.0.1)
+### Contract taught for the per-account Claude Desktop reader (77.15.1, hx2 78.0.3)
 
 Claude Desktop now keeps its sidebar per account, and the drawn sections apart
 from the group list; the reader it replaced read fields current builds no
@@ -278,11 +279,16 @@ longer write. On the flat store every scenario but `ccd-accounts` uses,
 nothing changed: the flat fixture is byte-identical, and so is everything
 compared. On the per-account store a client that predates the reader uploads
 another mirror (77.11.0 latches onto the older build's leftover `frame-store`
-and uploads its stale group), so:
+and uploads its stale group). hx 77.14.0 and 77.15.0 (hx2 78.0.1 and 78.0.2)
+read the per-account store but sent each group's stored sort direction, which
+for alphabetical sorting is the opposite of the one Claude Desktop draws, and
+each group's own "show empty" flag, which Claude Desktop never reads; the
+fixture holds clients to the drawn values, so hx is held from 77.15.1 and hx2
+from 78.0.3. So:
 
 | What a server, a person or the UI can see | Rule |
 | --- | --- |
-| The mirror is the live account's drawn groups, and follows a write within about a second | a run whose version predates the reader (hx before 77.14.0, hx2 before 78.0.1) is not held to the per-account fixture; when the reference predates it, its `/sessions/group-mirror` requests, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison, and the candidate is held to the fixture instead. A reference that has the reader is compared as before |
+| The mirror is the live account's drawn groups, and follows a write within about a second | a run whose version predates the reader (hx before 77.15.1, hx2 before 78.0.3) is not held to the per-account fixture; when the reference predates it, its `/sessions/group-mirror` requests, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison, and the candidate is held to the fixture instead. A reference that has the reader is compared as before |
 
 ### Contract taught for Codex sections in the mirror (77.15.0, hx2 78.0.2)
 
