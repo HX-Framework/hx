@@ -173,39 +173,45 @@ fn cmp_cli(a: &IdKey<'_>, b: &IdKey<'_>) -> std::cmp::Ordering {
 
 // ── Records ─────────────────────────────────────────────────────────────────
 
-const HAS_CLI: u8 = 1;
-const HAS_TITLE: u8 = 2;
-const ARCHIVED: u8 = 4;
-const SOURCE_USER: u8 = 8;
-const SOURCE_AI: u8 = 16;
+const HAS_CLI: u16 = 1;
+const HAS_TITLE: u16 = 2;
+const ARCHIVED: u16 = 4;
+const SOURCE_USER: u16 = 8;
+const SOURCE_AI: u16 = 16;
 /// `ccdSessionId` is `local_` and a canonical UUID, held as its 16 bytes.
-const CCD_PACKED: u8 = 32;
+const CCD_PACKED: u16 = 32;
 /// `cliSessionId` is a canonical UUID, held as its 16 bytes.
-const CLI_PACKED: u8 = 64;
+const CLI_PACKED: u16 = 64;
+const HAS_PARENT: u16 = 128;
+/// `parentId` is `local_` and a canonical UUID, held as its 16 bytes.
+const PARENT_PACKED: u16 = 256;
 
 /// One session's metadata (`CcdSessionMeta` in ccd.ts): `ccdSessionId`,
-/// `cliSessionId` and `title` one after another in one WTF-8 buffer, each
-/// id packed to 16 bytes when it is a canonical UUID, so a record costs one
-/// small allocation for its text.
+/// `cliSessionId`, `parentId` and `title` one after another in one WTF-8
+/// buffer, each id packed to 16 bytes when it is a canonical UUID, so a
+/// record costs one small allocation for its text.
 #[derive(Debug)]
 pub struct CcdSessionMeta {
     text: Box<[u8]>,
     cli_at: u32,
+    parent_at: u32,
     title_at: u32,
-    flags: u8,
+    flags: u16,
     last_activity_at: f64,
 }
 
 impl CcdSessionMeta {
-    fn new(ccd: &[u8], cli: Option<&[u8]>, title: Option<&[u8]>, title_source: Option<&'static str>, is_archived: bool, last_activity_at: f64) -> Self {
-        let mut flags = 0u8;
+    #[allow(clippy::too_many_arguments)]
+    fn new(ccd: &[u8], cli: Option<&[u8]>, title: Option<&[u8]>, title_source: Option<&'static str>, is_archived: bool, last_activity_at: f64, parent: Option<&[u8]>) -> Self {
+        let mut flags = 0u16;
         let ccd_key = ccd_id_key(ccd);
         let cli_key = cli.map(cli_id_key);
+        let parent_key = parent.map(ccd_id_key);
         let len_of = |k: &IdKey<'_>| match k {
             IdKey::Uuid(_) => 16,
             IdKey::Text(t) => t.len(),
         };
-        let mut text = Vec::with_capacity(len_of(&ccd_key) + cli_key.as_ref().map_or(0, len_of) + title.map_or(0, |t| t.len()));
+        let mut text = Vec::with_capacity(len_of(&ccd_key) + cli_key.as_ref().map_or(0, len_of) + parent_key.as_ref().map_or(0, len_of) + title.map_or(0, |t| t.len()));
         match ccd_key {
             IdKey::Uuid(u) => {
                 text.extend_from_slice(&u);
@@ -224,6 +230,17 @@ impl CcdSessionMeta {
                 IdKey::Text(t) => text.extend_from_slice(t),
             }
         }
+        let parent_at = text.len() as u32;
+        if let Some(k) = parent_key {
+            flags |= HAS_PARENT;
+            match k {
+                IdKey::Uuid(u) => {
+                    text.extend_from_slice(&u);
+                    flags |= PARENT_PACKED;
+                }
+                IdKey::Text(t) => text.extend_from_slice(t),
+            }
+        }
         let title_at = text.len() as u32;
         if let Some(t) = title {
             text.extend_from_slice(t);
@@ -237,7 +254,7 @@ impl CcdSessionMeta {
             Some("ai") => flags |= SOURCE_AI,
             _ => {}
         }
-        CcdSessionMeta { text: text.into_boxed_slice(), cli_at, title_at, flags, last_activity_at }
+        CcdSessionMeta { text: text.into_boxed_slice(), cli_at, parent_at, title_at, flags, last_activity_at }
     }
 
     fn packed(b: &[u8]) -> Uuid {
@@ -261,8 +278,35 @@ impl CcdSessionMeta {
         if self.flags & HAS_CLI == 0 {
             return None;
         }
-        let raw = &self.text[self.cli_at as usize..self.title_at as usize];
+        let raw = &self.text[self.cli_at as usize..self.parent_at as usize];
         Some(if self.flags & CLI_PACKED != 0 { IdKey::Uuid(Self::packed(raw)) } else { IdKey::Text(raw) })
+    }
+
+    /// The key of `parentId`, without unpacking it; None for null.
+    pub fn parent_key(&self) -> Option<IdKey<'_>> {
+        if self.flags & HAS_PARENT == 0 {
+            return None;
+        }
+        let raw = &self.text[self.parent_at as usize..self.title_at as usize];
+        Some(if self.flags & PARENT_PACKED != 0 { IdKey::Uuid(Self::packed(raw)) } else { IdKey::Text(raw) })
+    }
+
+    /// `parentId`, WTF-8; None for null.
+    pub fn parent_id(&self) -> Option<Cow<'_, [u8]>> {
+        Some(match self.parent_key()? {
+            IdKey::Uuid(u) => {
+                let mut v = Vec::with_capacity(SESSION_PREFIX.len() + 36);
+                v.extend_from_slice(SESSION_PREFIX);
+                push_uuid(&mut v, &u);
+                Cow::Owned(v)
+            }
+            IdKey::Text(t) => Cow::Borrowed(t),
+        })
+    }
+
+    /// `parentId` as the client holds it, in UTF-16 code units.
+    pub fn parent_id_units(&self) -> Option<JsStr> {
+        self.parent_id().map(|p| wtf8::to_units(&p))
     }
 
     /// `if (r.cliSessionId)`: a cli id that is there and not empty.
@@ -366,7 +410,24 @@ impl CcdSessionMeta {
         out.push_str(if self.is_archived() { ",\"isArchived\":true" } else { ",\"isArchived\":false" });
         out.push_str(",\"lastActivityAt\":");
         write_num(out, self.last_activity_at);
+        out.push_str(",\"parentId\":");
+        match self.parent_id() {
+            Some(p) => wtf8::write_json(out, &p),
+            None => out.push_str("null"),
+        }
         out.push('}');
+    }
+}
+
+/// `!value` in JavaScript, for a value `JSON.parse` gives: false, null, 0
+/// and "" are falsy, and so is a key that is not there.
+fn js_truthy(v: &Option<Val>) -> bool {
+    match v {
+        None | Some(Val::Null) => false,
+        Some(Val::Bool(b)) => *b,
+        Some(Val::Num(n)) => *n != 0.0 && !n.is_nan(),
+        Some(Val::Str(s)) => !s.is_empty(),
+        Some(Val::Arr) | Some(Val::Obj) => true,
     }
 }
 
@@ -394,6 +455,10 @@ fn session_record(raw: &[u8]) -> Option<CcdSessionMeta> {
         return None;
     }
     let mut fields: [Option<Val>; 6] = Default::default();
+    // `spawnedFrom.sessionId` when a string, and `spawnedFrom.sideSession === true`.
+    let mut spawned_id: Option<Vec<u8>> = None;
+    let mut spawned_side = false;
+    let mut detached: Option<Val> = None;
     s.object(|s, key| {
         let slot = match key {
             b"sessionId" => 0,
@@ -402,6 +467,33 @@ fn session_record(raw: &[u8]) -> Option<CcdSessionMeta> {
             b"titleSource" => 3,
             b"isArchived" => 4,
             b"lastActivityAt" => 5,
+            b"spawnedFrom" => {
+                // The last `spawnedFrom` counts, as in JSON.parse; an array or
+                // any other value names no parent.
+                spawned_id = None;
+                spawned_side = false;
+                if s.peek() != Some(b'{') {
+                    return s.skip_value();
+                }
+                return s.object(|s, k| match k {
+                    b"sessionId" => {
+                        spawned_id = match s.val()? {
+                            Val::Str(b) => Some(b),
+                            _ => None,
+                        };
+                        Ok(())
+                    }
+                    b"sideSession" => {
+                        spawned_side = matches!(s.val()?, Val::Bool(true));
+                        Ok(())
+                    }
+                    _ => s.skip_value(),
+                });
+            }
+            b"lineageDetached" => {
+                detached = Some(s.val()?);
+                return Ok(());
+            }
             _ => return s.skip_value(),
         };
         fields[slot] = Some(s.val()?);
@@ -412,6 +504,11 @@ fn session_record(raw: &[u8]) -> Option<CcdSessionMeta> {
         return None;
     }
     let [sid, cli, title, source, archived, last] = fields;
+    // A side session whose lineage is not detached: the session it is drawn under.
+    let parent = match spawned_id {
+        Some(p) if spawned_side && !p.is_empty() && !js_truthy(&detached) => Some(p),
+        _ => None,
+    };
     let ccd = match sid {
         Some(Val::Str(b)) => b,
         _ => return None,
@@ -433,7 +530,7 @@ fn session_record(raw: &[u8]) -> Option<CcdSessionMeta> {
         Some(Val::Num(n)) => n,
         _ => 0.0,
     };
-    Some(CcdSessionMeta::new(&ccd, cli.as_deref(), title.as_deref(), source, matches!(archived, Some(Val::Bool(true))), last))
+    Some(CcdSessionMeta::new(&ccd, cli.as_deref(), title.as_deref(), source, matches!(archived, Some(Val::Bool(true))), last, parent.as_deref()))
 }
 
 // ── Paths ───────────────────────────────────────────────────────────────────
@@ -885,9 +982,11 @@ impl CcdIndex {
         }
     }
 
-    fn refresh(&mut self, now_ms: f64, force: bool) -> u64 {
+    /// `fresh` skips the TTL but keeps the dir-mtime gate; `force` also
+    /// re-stats every file.
+    fn refresh(&mut self, now_ms: f64, force: bool, fresh: bool) -> u64 {
         self.load_saved_index();
-        if !force && now_ms - self.last_refresh_ms < CCD_REFRESH_TTL_MS {
+        if !force && !fresh && now_ms - self.last_refresh_ms < CCD_REFRESH_TTL_MS {
             return self.version;
         }
         let full_stat = force || now_ms - self.last_full_stat_ms >= CCD_FULL_STAT_INTERVAL_MS;
@@ -900,7 +999,7 @@ impl CcdIndex {
     fn saved_text(&self, now_ms: f64) -> String {
         let mut out = String::with_capacity(self.last_save_len + self.last_save_len / 16 + 4096);
         let mut scratch: Vec<u8> = Vec::new();
-        out.push_str("{\"v\":1,\"savedAtMs\":");
+        out.push_str("{\"v\":2,\"savedAtMs\":");
         write_num(&mut out, now_ms);
         out.push_str(",\"dirs\":{");
         for (i, (id, listing)) in self.org_dirs.iter().enumerate() {
@@ -952,7 +1051,7 @@ struct SavedIndex {
     files: IndexMap<PathKey, Option<IndexedFile>>,
 }
 
-/// None where the client takes nothing from the file: not JSON, `v` not 1,
+/// None where the client takes nothing from the file: not JSON, `v` not 2 (each record's `parentId` came with format 2),
 /// or `dirs` or `files` not objects (an array passes `typeof`, and gives no
 /// entry under the store).
 fn parse_saved_index(raw: &[u8], under: &[u8], paths: &mut DirTable) -> Option<SavedIndex> {
@@ -960,12 +1059,12 @@ fn parse_saved_index(raw: &[u8], under: &[u8], paths: &mut DirTable) -> Option<S
     if s.peek() != Some(b'{') {
         return None;
     }
-    let mut v_is_one = false;
+    let mut v_ok = false;
     let mut dirs: Option<IndexMap<u32, Option<OrgDirListing>>> = None;
     let mut files: Option<IndexMap<PathKey, Option<IndexedFile>>> = None;
     s.object(|s, key| match key {
         b"v" => {
-            v_is_one = matches!(s.val()?, Val::Num(n) if n == 1.0);
+            v_ok = matches!(s.val()?, Val::Num(n) if n == 2.0);
             Ok(())
         }
         b"dirs" => {
@@ -980,7 +1079,7 @@ fn parse_saved_index(raw: &[u8], under: &[u8], paths: &mut DirTable) -> Option<S
         _ => s.skip_value(),
     })
     .ok()?;
-    if !s.at_end() || !v_is_one {
+    if !s.at_end() || !v_ok {
         return None;
     }
     Some(SavedIndex { dirs: dirs?, files: files? })
@@ -1107,7 +1206,7 @@ fn saved_record(s: &mut Scanner<'_>) -> Result<Option<CcdSessionMeta>, ()> {
     if s.peek() != Some(b'{') {
         return s.skip_value().map(|_| None);
     }
-    let mut fields: [Option<Val>; 6] = Default::default();
+    let mut fields: [Option<Val>; 7] = Default::default();
     s.object(|s, key| {
         let slot = match key {
             b"ccdSessionId" => 0,
@@ -1116,12 +1215,17 @@ fn saved_record(s: &mut Scanner<'_>) -> Result<Option<CcdSessionMeta>, ()> {
             b"titleSource" => 3,
             b"isArchived" => 4,
             b"lastActivityAt" => 5,
+            b"parentId" => 6,
             _ => return s.skip_value(),
         };
         fields[slot] = Some(s.val()?);
         Ok(())
     })?;
-    let [ccd, cli, title, source, archived, last] = fields;
+    let [ccd, cli, title, source, archived, last, parent] = fields;
+    let parent = match parent {
+        Some(Val::Str(b)) => Some(b),
+        _ => None,
+    };
     let ccd = match ccd {
         Some(Val::Str(b)) => b,
         _ => return Ok(None),
@@ -1143,27 +1247,56 @@ fn saved_record(s: &mut Scanner<'_>) -> Result<Option<CcdSessionMeta>, ()> {
         Some(Val::Num(n)) => n,
         _ => 0.0,
     };
-    Ok(Some(CcdSessionMeta::new(&ccd, cli.as_deref(), title.as_deref(), source, matches!(archived, Some(Val::Bool(true))), last)))
+    Ok(Some(CcdSessionMeta::new(&ccd, cli.as_deref(), title.as_deref(), source, matches!(archived, Some(Val::Bool(true))), last, parent.as_deref())))
 }
 
 // ── The API ─────────────────────────────────────────────────────────────────
 
 /// Bring the index up to date if it is older than the TTL (or `force`); returns its version.
+#[allow(dead_code)]
 pub fn refresh_ccd_index(now_ms: f64, force: bool) -> u64 {
-    global().refresh(now_ms, force)
+    global().refresh(now_ms, force, false)
+}
+
+/// `refreshCcdIndex(nowMs, { fresh: true })`: skip the TTL, keep the
+/// dir-mtime gate (only the directories that moved are re-listed).
+pub fn refresh_ccd_index_fresh(now_ms: f64) -> u64 {
+    global().refresh(now_ms, false, true)
+}
+
+/// `ccdRecordsInScope`: the records of one account's sessions, the files
+/// under `<store>/<accountId>/<orgId>/` for a scope key `<accountId>/<orgId>`,
+/// as of the index's last refresh. A key that is not exactly two plain path
+/// segments names no account.
+pub fn ccd_records_in_scope(scope_key: &str) -> Vec<Arc<CcdSessionMeta>> {
+    let g = global();
+    let dir = match g.dir.as_ref() {
+        Some(d) => d.clone(),
+        None => return Vec::new(),
+    };
+    let parts: Vec<&str> = scope_key.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains('\\')) {
+        return Vec::new();
+    }
+    let org = join(&join(&dir, parts[0]), parts[1]);
+    let id = match g.paths.dirs.get_index_of(org.as_bytes()) {
+        Some(i) => i as u32,
+        None => return Vec::new(),
+    };
+    g.index.iter().filter(|(k, _)| k.dir == id).filter_map(|(_, f)| f.record.clone()).collect()
 }
 
 /// Every record (archived included), at most CCD_REFRESH_TTL_MS stale.
 pub fn read_ccd_recents_cached(now_ms: f64) -> Arc<Vec<Arc<CcdSessionMeta>>> {
     let mut g = global();
-    g.refresh(now_ms, false);
+    g.refresh(now_ms, false, false);
     g.records.clone()
 }
 
 /// cliSessionId → Claude Desktop metadata, rebuilt only when the records changed.
 pub fn get_ccd_recents_by_cli_id(now_ms: f64) -> Arc<CcdByCli> {
     let mut g = global();
-    let version = g.refresh(now_ms, false);
+    let version = g.refresh(now_ms, false, false);
     if let Some((v, map)) = &g.by_cli {
         if *v == version {
             return map.clone();
@@ -1263,9 +1396,9 @@ mod tests {
     }
 
     const SAVED: &str = concat!(
-        "{\"v\":1,\"savedAtMs\":1792180673041,\"dirs\":{\"/s/acct/org\":{\"mtimeMs\":1767603780128.4883,\"files\":[\"/s/acct/org/local_b.json\",\"/s/acct/org/local_a.json\"]}},",
-        "\"files\":{\"/s/acct/org/local_a.json\":{\"size\":273,\"mtimeMs\":1767603600104.731,\"record\":{\"ccdSessionId\":\"local_a\",\"cliSessionId\":\"57be05c1\",\"title\":\"Pipeline \\\"review\\\" \\ud83d\\ude00 \\ud800\",\"titleSource\":\"user\",\"isArchived\":false,\"lastActivityAt\":1767607200000}},",
-        "\"/s/acct/org/local_b.json\":{\"size\":280,\"mtimeMs\":1767603660112.65,\"record\":{\"ccdSessionId\":\"local_b\",\"cliSessionId\":null,\"title\":null,\"titleSource\":null,\"isArchived\":true,\"lastActivityAt\":0.5}},",
+        "{\"v\":2,\"savedAtMs\":1792180673041,\"dirs\":{\"/s/acct/org\":{\"mtimeMs\":1767603780128.4883,\"files\":[\"/s/acct/org/local_b.json\",\"/s/acct/org/local_a.json\"]}},",
+        "\"files\":{\"/s/acct/org/local_a.json\":{\"size\":273,\"mtimeMs\":1767603600104.731,\"record\":{\"ccdSessionId\":\"local_a\",\"cliSessionId\":\"57be05c1\",\"title\":\"Pipeline \\\"review\\\" \\ud83d\\ude00 \\ud800\",\"titleSource\":\"user\",\"isArchived\":false,\"lastActivityAt\":1767607200000,\"parentId\":\"local_p\"}},",
+        "\"/s/acct/org/local_b.json\":{\"size\":280,\"mtimeMs\":1767603660112.65,\"record\":{\"ccdSessionId\":\"local_b\",\"cliSessionId\":null,\"title\":null,\"titleSource\":null,\"isArchived\":true,\"lastActivityAt\":0.5,\"parentId\":null}},",
         "\"/s/acct/org/local_c.json\":{\"size\":2,\"mtimeMs\":1767603720120.569,\"record\":null}}}"
     );
 
@@ -1283,14 +1416,16 @@ mod tests {
     fn loading_follows_the_client_on_odd_files() {
         let under = os_path("/s/");
         let mut paths = DirTable::default();
-        for bad in ["", "[]", "null", "{\"v\":2,\"dirs\":{},\"files\":{}}", "{\"v\":1,\"dirs\":{}}", "{\"v\":1,\"dirs\":0,\"files\":{}}", "{\"v\":1,\"dirs\":\"x\",\"files\":{}}", "{\"v\":1,\"dirs\":{},\"files\":{} ", "{\"v\":1,\"dirs\":{},\"files\":{}} x"] {
+        for bad in ["", "[]", "null", "{\"v\":1,\"dirs\":{},\"files\":{}}", "{\"v\":2,\"dirs\":{}}", "{\"v\":2,\"dirs\":0,\"files\":{}}", "{\"v\":2,\"dirs\":\"x\",\"files\":{}}", "{\"v\":2,\"dirs\":{},\"files\":{} ", "{\"v\":2,\"dirs\":{},\"files\":{}} x"] {
             assert!(!parse_saved_index(bad.as_bytes(), under.as_bytes(), &mut paths).map(|s| !s.dirs.is_empty() || !s.files.is_empty()).unwrap_or(false), "{:?}", bad);
         }
-        assert!(parse_saved_index(b"{\"v\":1,\"dirs\":{},\"files\":{} ", under.as_bytes(), &mut paths).is_none());
+        assert!(parse_saved_index(b"{\"v\":2,\"dirs\":{},\"files\":{} ", under.as_bytes(), &mut paths).is_none());
+        // Format 1, from before records carried their parent, is not loaded.
+        assert!(parse_saved_index(b"{\"v\":1,\"dirs\":{},\"files\":{}}", under.as_bytes(), &mut paths).is_none());
         // Arrays pass `typeof` and give no entries; paths outside the store
         // and entries of the wrong shape are skipped; the last of a
         // duplicated path counts, in the first one's place.
-        let text = os_path_json("{\"files\":{\"/s/a/local_1.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/elsewhere/local_2.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/s/a/local_3.json\":{\"size\":\"1\",\"mtimeMs\":2},\"/s/a/local_4.json\":{\"size\":4,\"mtimeMs\":4,\"record\":{\"ccdSessionId\":\"x\"}},\"/s/a/local_1.json\":{\"size\":9,\"mtimeMs\":9,\"record\":{\"ccdSessionId\":\"y\",\"cliSessionId\":null}}},\"dirs\":[],\"v\":1.0}");
+        let text = os_path_json("{\"files\":{\"/s/a/local_1.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/elsewhere/local_2.json\":{\"size\":1,\"mtimeMs\":2,\"record\":null},\"/s/a/local_3.json\":{\"size\":\"1\",\"mtimeMs\":2},\"/s/a/local_4.json\":{\"size\":4,\"mtimeMs\":4,\"record\":{\"ccdSessionId\":\"x\"}},\"/s/a/local_1.json\":{\"size\":9,\"mtimeMs\":9,\"record\":{\"ccdSessionId\":\"y\",\"cliSessionId\":null}}},\"dirs\":[],\"v\":2.0}");
         let saved = parse_saved_index(text.as_bytes(), under.as_bytes(), &mut paths).expect("loads");
         assert!(saved.dirs.is_empty());
         let kept: Vec<(String, f64, bool)> = saved.files.iter().filter_map(|(k, v)| v.as_ref().map(|f| (paths.path_string(k), f.size, f.record.is_some()))).collect();
@@ -1301,14 +1436,32 @@ mod tests {
     fn a_session_file_reads_as_read_session_file_reads_it() {
         assert_eq!(
             record_json("{\"sessionId\":\"local_x\",\"cliSessionId\":\"c\",\"title\":\"T\",\"titleSource\":\"ai\",\"isArchived\":true,\"lastActivityAt\":5,\"cwd\":\"/w\",\"messages\":[{\"a\":[1,2,{}]}]}").as_deref(),
-            Some("{\"ccdSessionId\":\"local_x\",\"cliSessionId\":\"c\",\"title\":\"T\",\"titleSource\":\"ai\",\"isArchived\":true,\"lastActivityAt\":5}")
+            Some("{\"ccdSessionId\":\"local_x\",\"cliSessionId\":\"c\",\"title\":\"T\",\"titleSource\":\"ai\",\"isArchived\":true,\"lastActivityAt\":5,\"parentId\":null}")
         );
         // Wrong types fall back the way the client's typeof checks do; a
         // blank title is null; the last of a duplicated key counts.
         assert_eq!(
             record_json("{\"sessionId\":\"a\",\"sessionId\":\"local_y\",\"cliSessionId\":5,\"title\":\" \\u3000 \",\"titleSource\":\"robot\",\"isArchived\":\"true\",\"lastActivityAt\":\"9\"}").as_deref(),
-            Some("{\"ccdSessionId\":\"local_y\",\"cliSessionId\":null,\"title\":null,\"titleSource\":null,\"isArchived\":false,\"lastActivityAt\":0}")
+            Some("{\"ccdSessionId\":\"local_y\",\"cliSessionId\":null,\"title\":null,\"titleSource\":null,\"isArchived\":false,\"lastActivityAt\":0,\"parentId\":null}")
         );
+        // A side session names its parent; a detached lineage, a spawn that
+        // is not a side session, or a sessionId that is not a string do not.
+        let parent = |extra: &str| -> Option<String> {
+            let j = record_json(&format!("{{\"sessionId\":\"local_s\"{}}}", extra))?;
+            let at = j.find("\"parentId\":")? + "\"parentId\":".len();
+            Some(j[at..j.len() - 1].to_string())
+        };
+        assert_eq!(parent(",\"spawnedFrom\":{\"sessionId\":\"local_p\",\"taskId\":\"t\",\"sideSession\":true}").as_deref(), Some("\"local_p\""));
+        assert_eq!(parent(",\"spawnedFrom\":{\"sessionId\":\"local_p\",\"sideSession\":true},\"lineageDetached\":true").as_deref(), Some("null"));
+        assert_eq!(parent(",\"spawnedFrom\":{\"sessionId\":\"local_p\",\"sideSession\":true},\"lineageDetached\":0").as_deref(), Some("\"local_p\""));
+        assert_eq!(parent(",\"spawnedFrom\":{\"sessionId\":\"local_p\",\"sideSession\":true},\"lineageDetached\":\"yes\"").as_deref(), Some("null"));
+        assert_eq!(parent(",\"spawnedFrom\":{\"sessionId\":\"local_p\",\"taskId\":\"t\"}").as_deref(), Some("null"));
+        assert_eq!(parent(",\"spawnedFrom\":{\"sessionId\":5,\"sideSession\":true}").as_deref(), Some("null"));
+        assert_eq!(parent(",\"spawnedFrom\":{\"sessionId\":\"\",\"sideSession\":true}").as_deref(), Some("null"));
+        assert_eq!(parent(",\"spawnedFrom\":[{\"sessionId\":\"local_p\",\"sideSession\":true}]").as_deref(), Some("null"));
+        // The last of a duplicated key counts, inside spawnedFrom and around it.
+        assert_eq!(parent(",\"spawnedFrom\":{\"sessionId\":\"local_p\",\"sideSession\":true,\"sideSession\":false}").as_deref(), Some("null"));
+        assert_eq!(parent(",\"spawnedFrom\":{\"sessionId\":\"local_p\",\"sideSession\":true},\"spawnedFrom\":null").as_deref(), Some("null"));
         assert_eq!(record_json("{\"cliSessionId\":\"c\"}"), None);
         assert_eq!(record_json("[{\"sessionId\":\"x\"}]"), None);
         assert_eq!(record_json("{\"sessionId\":\"x\"} trailing"), None);
@@ -1335,21 +1488,28 @@ mod tests {
         // a wrong length, a lone surrogate — stays as its text.
         let others = ["0F1E2D3C-4B5A-6978-8A9B-0C1D2E3F4A5B", "{0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b}", "0f1e2d3c4b5a69788a9b0c1d2e3f4a5b", "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5", "0f1e2d3c-4b5a-6978-8a9b_0c1d2e3f4a5b", ""];
         let ccd = format!("local_{}", canon);
-        let r = CcdSessionMeta::new(ccd.as_bytes(), Some(canon.as_bytes()), Some(b"T"), Some("ai"), false, 1.0);
+        let r = CcdSessionMeta::new(ccd.as_bytes(), Some(canon.as_bytes()), Some(b"T"), Some("ai"), false, 1.0, None);
         assert!(matches!(r.ccd_key(), IdKey::Uuid(_)) && matches!(r.cli_key(), Some(IdKey::Uuid(_))));
         assert_eq!(&*r.ccd_session_id(), ccd.as_bytes());
         assert_eq!(r.cli_session_id().as_deref(), Some(canon.as_bytes()));
         assert_eq!(r.text.len(), 16 + 16 + 1);
         for o in others {
             let ccd_o = format!("local_{}", o);
-            let r = CcdSessionMeta::new(ccd_o.as_bytes(), Some(o.as_bytes()), None, None, false, 0.0);
+            let r = CcdSessionMeta::new(ccd_o.as_bytes(), Some(o.as_bytes()), None, None, false, 0.0, None);
             assert!(matches!(r.ccd_key(), IdKey::Text(_)) && matches!(r.cli_key(), Some(IdKey::Text(_))), "{}", o);
             assert_eq!(&*r.ccd_session_id(), ccd_o.as_bytes());
             assert_eq!(r.cli_session_id().as_deref(), Some(o.as_bytes()));
         }
         let lone = crate::wtf8::from_units(&[0x6C, 0xD800]);
-        let r = CcdSessionMeta::new(&lone, None, None, None, false, 0.0);
+        let r = CcdSessionMeta::new(&lone, None, None, None, false, 0.0, None);
         assert_eq!(&*r.ccd_session_id(), lone.as_slice());
+        // A parent id packs as the session id does, between the cli id and the title.
+        let r = CcdSessionMeta::new(ccd.as_bytes(), Some(b"c"), Some(b"T"), None, false, 0.0, Some(ccd.as_bytes()));
+        assert!(matches!(r.parent_key(), Some(IdKey::Uuid(_))));
+        assert_eq!(r.parent_id().as_deref(), Some(ccd.as_bytes()));
+        assert_eq!((r.cli_session_id().as_deref(), r.title()), (Some(&b"c"[..]), Some(&b"T"[..])));
+        let r = CcdSessionMeta::new(b"local_x", None, None, None, false, 0.0, Some(b"local_p"));
+        assert_eq!(r.parent_id().as_deref(), Some(&b"local_p"[..]));
         // File names.
         let mut paths = DirTable::default();
         for name in [format!("local_{}.json", canon), format!("local_{}.json", others[0]), "local_x.json".to_string(), "notes.txt".to_string()] {
@@ -1372,7 +1532,7 @@ mod tests {
 
     #[test]
     fn by_cli_keeps_the_last_record_per_id() {
-        let r = |ccd: &str, cli: Option<&str>| Arc::new(CcdSessionMeta::new(ccd.as_bytes(), cli.map(|c| c.as_bytes()), None, None, false, 0.0));
+        let r = |ccd: &str, cli: Option<&str>| Arc::new(CcdSessionMeta::new(ccd.as_bytes(), cli.map(|c| c.as_bytes()), None, None, false, 0.0, None));
         let records = vec![r("local_1", Some("b")), r("local_2", Some("a")), r("local_3", Some("b")), r("local_4", Some("")), r("local_5", None)];
         let m = CcdByCli::build(&records);
         assert_eq!(m.get("b").map(|x| x.ccd_session_id().to_vec()), Some(b"local_3".to_vec()));
