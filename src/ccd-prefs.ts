@@ -228,12 +228,26 @@ interface ViewGroup {
   sectionName: unknown;
   collapsed: boolean;
   members: string[];
-  /** The scoped layouts only: the section's sort, whether it is switched on,
-   *  and whether CCD shows it with nothing left to show. */
+  /** The scoped layouts only: the sort and the direction the rows are drawn
+   *  in, whether the section is drawn, and whether CCD draws it with nothing
+   *  left to show. */
   sortBy?: string | null;
   ascending?: boolean | null;
   shown?: boolean;
   showEmpty?: boolean;
+}
+
+/** The sorts CCD's section normalizer keeps; any other value reads as "recency". */
+const CCD_SORTS = new Set(["recency", "alpha", "created"]);
+
+/** A manual section's sort as CCD draws it. CCD's normalizer reads a sort it
+ *  does not know as "recency" and a missing direction as false, and for
+ *  "alpha" it draws the opposite of the stored direction: false is A to Z.
+ *  The blob carries the direction the rows are drawn in. */
+function drawnSort(s: Obj): { sortBy: string; ascending: boolean } {
+  const sortBy = typeof s.sortBy === "string" && CCD_SORTS.has(s.sortBy) ? s.sortBy : "recency";
+  const stored = s.ascending === true;
+  return { sortBy, ascending: sortBy === "alpha" ? !stored : stored };
 }
 
 interface SidebarView {
@@ -307,6 +321,11 @@ function resolveScoped(state: DframeState): SidebarView {
       }
     });
     manual.sort((a, b) => (a.order !== b.order ? (a.order < b.order ? -1 : 1) : a.i - b.i));
+    // "Show empty groups" is one setting, kept on the Sessions section; a
+    // manual section's own `show.emptyGroups` is never read. Only the
+    // Routines section can be switched off, so every manual section is drawn.
+    const sessionsSection = sections.find((s): s is Obj => isObj(s) && s.kind === "sessions");
+    const showEmpty = !!sessionsSection && isObj(sessionsSection.show) && sessionsSection.show.emptyGroups === true;
     const groups: ViewGroup[] = [];
     const seen = new Set<string>();
     for (const { s } of manual) {
@@ -321,10 +340,9 @@ function resolveScoped(state: DframeState): SidebarView {
         sectionName: null,
         collapsed: s.collapsed === true,
         members: Array.isArray(s.members) ? memberIds(s.members as unknown[]) : scopedMembers(g1, id),
-        sortBy: typeof s.sortBy === "string" ? s.sortBy : null,
-        ascending: typeof s.ascending === "boolean" ? s.ascending : null,
-        shown: s.shown !== false,
-        showEmpty: isObj(s.show) && s.show.emptyGroups === true,
+        ...drawnSort(s),
+        shown: true,
+        showEmpty,
       });
     }
     if (groups.length === 0) {

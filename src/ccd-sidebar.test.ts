@@ -123,12 +123,14 @@ describe("CCD mirror: current builds (drawn sections per account)", () => {
     assert.equal(blob.layout, "sections");
     assert.equal(blob.scope, hash16(A));
     assert.equal(blob.statusFilter, "active");
+    // One is stored alpha + ascending, which CCD draws Z to A. Two's stored
+    // `shown: false` is not read: CCD draws every group's section.
     assert.deepEqual(
       blob.groups.map((g) => [g.name, g.collapsed, g.shown, g.sortBy, g.ascending, g.sessionIds]),
       [
         ["Three", false, true, "created", false, []],
-        ["One", true, true, "alpha", true, ["cli-a", "cli-b"]],
-        ["Two", false, false, "created", false, ["cli-c"]],
+        ["One", true, true, "alpha", false, ["cli-a", "cli-b"]],
+        ["Two", false, true, "created", false, ["cli-c"]],
       ],
     );
     assert.deepEqual(blob.unreadIds, ["cli-a", "local_e"]);
@@ -151,12 +153,50 @@ describe("CCD mirror: current builds (drawn sections per account)", () => {
     const one = st.state.codeSidebarByScope[A]!.sections.find((s) => s.id === "g1")!;
     one.name = "N".repeat(450);
     one.members = Array.from({ length: 5_003 }, (_, i) => `code:local_m${i}`);
-    one.sortBy = "s".repeat(41);
+    (st.state as Record<string, unknown>).recentsStatusFilter = "f".repeat(41);
     writeFileSync(join(ldb, "000005.ldb"), buildLdbEntries([{ key: DFRAME, seq: 10, value: json(st) }]));
-    const g = (await buildGroupMirror((nowMs += 1000))).groups.find((x) => x.id === "g1")!;
+    const blob = await buildGroupMirror((nowMs += 1000));
+    const g = blob.groups.find((x) => x.id === "g1")!;
     assert.equal(g.name.length, 400);
     assert.equal(g.sessionIds.length, 5_000);
-    assert.equal(g.sortBy, null);
+    assert.equal(blob.statusFilter, null);
+  });
+
+  it("sends the sort CCD draws: alpha inverts the stored direction, a missing direction is false, an unknown sort is recency", async () => {
+    setup();
+    const st = scopedState(A) as { state: { codeSidebarByScope: Record<string, { sections: Array<Record<string, unknown>> }> } };
+    const sections = st.state.codeSidebarByScope[A]!.sections;
+    Object.assign(sections.find((s) => s.id === "g1")!, { sortBy: "alpha", ascending: false });
+    const two = sections.find((s) => s.id === "g2")!;
+    two.sortBy = "manual";
+    delete two.ascending;
+    const three = sections.find((s) => s.id === "g3")!;
+    three.sortBy = "alpha";
+    delete three.ascending;
+    writeFileSync(join(ldb, "000005.ldb"), buildLdbEntries([{ key: DFRAME, seq: 10, value: json(st) }]));
+    const blob = await buildGroupMirror((nowMs += 1000));
+    assert.deepEqual(
+      blob.groups.map((g) => [g.name, g.sortBy, g.ascending]),
+      [
+        ["Three", "alpha", true],
+        ["One", "alpha", true],
+        ["Two", "recency", false],
+      ],
+    );
+  });
+
+  it("takes 'show empty groups' from the Sessions section, for every group", async () => {
+    setup();
+    const st = scopedState(A) as { state: { codeSidebarByScope: Record<string, { sections: Array<Record<string, unknown>> }> } };
+    const sections = st.state.codeSidebarByScope[A]!.sections;
+    sections.find((s) => s.id === "sessions")!.show = { metadata: false, emptyGroups: true, sideChats: false };
+    writeFileSync(join(ldb, "000005.ldb"), buildLdbEntries([{ key: DFRAME, seq: 10, value: json(st) }]));
+    assert.deepEqual((await buildGroupMirror((nowMs += 1000))).groups.map((g) => g.showEmpty), [true, true, true]);
+
+    sections.find((s) => s.id === "sessions")!.show = { metadata: false, emptyGroups: false, sideChats: false };
+    for (const s of sections) if (s.kind === "manual") s.show = { metadata: false, emptyGroups: true, sideChats: false };
+    writeFileSync(join(ldb, "000006.ldb"), buildLdbEntries([{ key: DFRAME, seq: 20, value: json(st) }]));
+    assert.deepEqual((await buildGroupMirror((nowMs += 1000))).groups.map((g) => g.showEmpty), [false, false, false], "a group's own flag is never read");
   });
 
   it("follows an account switch written to the log", async () => {
