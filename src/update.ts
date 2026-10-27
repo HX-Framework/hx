@@ -118,8 +118,23 @@ export function isRemoteNewer(local: string, remote: string | null): boolean {
   return compareStableSemver(r, l) > 0;
 }
 
+/**
+ * Is `execPath` a JavaScript runtime rather than a built hx binary? `hx update`
+ * replaces the file this process runs from. A built hx is that file; run from a
+ * source checkout (`bun src/cli.ts`, or node for tsx runs), process.execPath is
+ * the bun or node runtime, and replacing it puts an hx binary in the runtime's
+ * place (a harness run from source once did that to ~/.bun/bin/bun).
+ */
+export function isRuntimeExecutable(execPath: string): boolean {
+  const name = (execPath.includes("\\") ? winPath.basename(execPath) : basename(execPath)).toLowerCase().replace(/\.exe$/, "");
+  return name === "bun" || name === "node" || name.startsWith("bun-") || name.startsWith("node-");
+}
+
 export async function runUpdate(opts: UpdateOpts): Promise<UpdateResult> {
   const binPath = opts.binPath ?? process.execPath;
+  if (opts.binPath === undefined && isRuntimeExecutable(binPath)) {
+    throw new Error(`hx runs from source here (under ${binPath}); \`hx update\` replaces a built hx binary only`);
+  }
   const log = opts.log ?? noop;
   const onProgress = opts.onProgress ?? noopProgress;
   const downloadBase = `${opts.gatewayBaseUrl.replace(/\/+$/, "")}/download`;

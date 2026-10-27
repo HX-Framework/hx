@@ -6,7 +6,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import type { DaemonOps } from "./daemon.js";
-import { isRemoteNewer, runUpdate, secureFetch } from "./update.js";
+import { isRemoteNewer, isRuntimeExecutable, runUpdate, secureFetch } from "./update.js";
+
+describe("hx update from a source checkout", () => {
+  it("names the bun and node runtimes, never a built hx", () => {
+    for (const p of ["/Users/me/.bun/bin/bun", "/Users/me/.bun/bin/bun-1.3.14-from-hx", "/usr/local/bin/node", "C:\\Users\\me\\.bun\\bin\\bun.exe", "C:\\Program Files\\nodejs\\node.exe"]) {
+      assert.equal(isRuntimeExecutable(p), true, p);
+    }
+    for (const p of ["/Users/me/.let/bin/hx", "/tmp/hx-darwin-arm64", "C:\\Users\\me\\.let\\bin\\hx.exe", "/opt/bundle/hx"]) {
+      assert.equal(isRuntimeExecutable(p), false, p);
+    }
+  });
+
+  it("refuses to replace the runtime it runs under, before any download", async () => {
+    // bun test runs under the bun runtime, so process.execPath is bun here.
+    await assert.rejects(runUpdate({ gatewayBaseUrl: "https://gw.example" }), /runs from source/);
+  });
+});
 
 test("newer remote semver triggers update", () => {
   expect(isRemoteNewer("76.0.0", "76.0.1")).toBe(true);
