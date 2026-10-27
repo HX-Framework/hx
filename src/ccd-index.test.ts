@@ -182,7 +182,7 @@ describe("CCD session index saved across restarts", () => {
     assert.equal(await saveCcdIndexIfChanged(T0), true, "the first build is saved");
     assert.equal(await saveCcdIndexIfChanged(T0 + 1), false, "unchanged since: not saved again");
     const saved = JSON.parse(readFileSync(join(root, "ccd-index.json"), "utf8")) as { v: number; files: Record<string, unknown>; dirs: Record<string, unknown> };
-    assert.equal(saved.v, 1);
+    assert.equal(saved.v, 2);
     assert.equal(Object.keys(saved.files).length, 2);
     assert.equal(Object.keys(saved.dirs).length, 1);
 
@@ -235,11 +235,29 @@ describe("CCD session index saved across restarts", () => {
     restart();
     writeFileSync(
       join(root, "ccd-index.json"),
-      JSON.stringify({ v: 1, savedAtMs: 1, dirs: { "/elsewhere/acct/org": { mtimeMs: 1, files: ["/elsewhere/acct/org/local_z.json"] } }, files: { "/elsewhere/acct/org/local_z.json": { size: 1, mtimeMs: 1, record: { ccdSessionId: "local_z", cliSessionId: "cli-z", title: "Z", titleSource: "ai", isArchived: false, lastActivityAt: 0 } } } }),
+      JSON.stringify({ v: 2, savedAtMs: 1, dirs: { "/elsewhere/acct/org": { mtimeMs: 1, files: ["/elsewhere/acct/org/local_z.json"] } }, files: { "/elsewhere/acct/org/local_z.json": { size: 1, mtimeMs: 1, record: { ccdSessionId: "local_z", cliSessionId: "cli-z", title: "Z", titleSource: "ai", isArchived: false, lastActivityAt: 0, parentId: null } } } }),
     );
     const map2 = await getCcdRecentsByCliId(T0);
     assert.equal(map2.has("cli-z"), false, "foreign entries dropped");
     assert.deepEqual([...map2.keys()].sort(), ["cli-a", "cli-b"]);
+  });
+
+  it("ignores a save in the format before records carried their parent, and rebuilds", async () => {
+    setup();
+    setCcdIndexPathForTests(join(root, "ccd-index.json"));
+    await refreshCcdIndex(T0);
+    await saveCcdIndexIfChanged(T0, { force: true });
+    const file = join(root, "ccd-index.json");
+    const saved = JSON.parse(readFileSync(file, "utf8")) as { v: number; files: Record<string, { record: Record<string, unknown> | null }> };
+    // The same save as a build before parentId wrote it, with a title the
+    // store does not have: loading it would serve that title.
+    saved.v = 1;
+    for (const f of Object.values(saved.files)) if (f.record) { delete f.record.parentId; f.record.title = "from the old save"; }
+    writeFileSync(file, JSON.stringify(saved));
+    restart();
+    const map = await getCcdRecentsByCliId(T0 + 1000);
+    assert.equal(map.get("cli-a")?.title, "A", "read from the store, not the old save");
+    assert.equal(map.get("cli-a")?.parentId, null);
   });
 
   it("writes nothing where Claude Desktop does not ship", async () => {
