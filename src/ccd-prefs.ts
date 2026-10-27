@@ -44,8 +44,8 @@ import {
   readLeveldbValue,
   type LeveldbRecord,
 } from "./ccd-leveldb.js";
-import { ccdAppDir, readCcdRecentsCached, refreshCcdIndex } from "./ccd.js";
-import type { HxCcdGroupMirrorBlob, HxCcdGroup } from "./mirror-types.js";
+import { ccdAppDir, ccdRecordsInScope, readCcdRecentsCached, refreshCcdIndex } from "./ccd.js";
+import type { HxCcdGroupMirrorBlob, HxCcdGroup, HxCcdSideSession } from "./mirror-types.js";
 
 const CCD_ROOT = ccdAppDir();
 let LS_DIR = CCD_ROOT === null ? null : path.join(CCD_ROOT, "Local Storage", "leveldb");
@@ -258,6 +258,9 @@ interface SidebarView {
   statusFilter: string | null;
   /** The live scope key, hashed (sha256, first 16 hex). */
   scope: string | null;
+  /** The live scope key itself (`<accountId>/<orgId>`): whose session files
+   *  the side sessions come from. Never uploaded. */
+  scopeKey: string | null;
   note: string;
 }
 
@@ -303,7 +306,7 @@ function resolveScoped(state: DframeState): SidebarView {
   const statusFilter = typeof state.recentsStatusFilter === "string" ? state.recentsStatusFilter : null;
   const scopeKey = typeof state.lastSidebarScopeKey === "string" && state.lastSidebarScopeKey !== "" ? state.lastSidebarScopeKey : null;
   if (scopeKey === null) {
-    return { enabled: false, layout: "sections", groups: [], statusFilter, scope: null, note: "no live CCD sidebar scope" };
+    return { enabled: false, layout: "sections", groups: [], statusFilter, scope: null, scopeKey: null, note: "no live CCD sidebar scope" };
   }
   const scope = createHash("sha256").update(scopeKey).digest("hex").slice(0, 16);
   const g1 = ownObj(state.customGroupsByScope, scopeKey);
@@ -346,9 +349,9 @@ function resolveScoped(state: DframeState): SidebarView {
       });
     }
     if (groups.length === 0) {
-      return { enabled: false, layout: "sections", groups: [], statusFilter, scope, note: "no CCD custom groups in the live account" };
+      return { enabled: false, layout: "sections", groups: [], statusFilter, scope, scopeKey, note: "no CCD custom groups in the live account" };
     }
-    return { enabled: true, layout: "sections", groups, statusFilter, scope, note: `CCD sidebar: ${groups.length} groups` };
+    return { enabled: true, layout: "sections", groups, statusFilter, scope, scopeKey, note: `CCD sidebar: ${groups.length} groups` };
   }
 
   // No sections for this scope: the scoped group list, while CCD groups by it.
@@ -376,16 +379,16 @@ function resolveScoped(state: DframeState): SidebarView {
     }
   }
   if (groups.length === 0) {
-    return { enabled: false, layout: "scoped-groups", groups: [], statusFilter, scope, note: "no CCD custom groups in the live account" };
+    return { enabled: false, layout: "scoped-groups", groups: [], statusFilter, scope, scopeKey, note: "no CCD custom groups in the live account" };
   }
-  return { enabled: true, layout: "scoped-groups", groups, statusFilter, scope, note: `CCD custom grouping: ${groups.length} groups` };
+  return { enabled: true, layout: "scoped-groups", groups, statusFilter, scope, scopeKey, note: `CCD custom grouping: ${groups.length} groups` };
 }
 
 /** The flat layout of older builds, read exactly as the client always has. */
 function resolveFlat(dframe: DframeState): SidebarView {
   const enabled = dframe.groupByByMode?.code === "custom";
   if (!enabled || !Array.isArray(dframe.customGroups) || dframe.customGroups.length === 0) {
-    return { enabled: false, layout: null, groups: [], statusFilter: null, scope: null, note: DISABLED_NOTE };
+    return { enabled: false, layout: null, groups: [], statusFilter: null, scope: null, scopeKey: null, note: DISABLED_NOTE };
   }
 
   const collapsed = new Set(Array.isArray(dframe.collapsedGroups) ? dframe.collapsedGroups : []);
@@ -417,7 +420,7 @@ function resolveFlat(dframe: DframeState): SidebarView {
       collapsed: collapsed.has(g.id),
       members: byGroup.get(g.id) ?? [],
     }));
-  return { enabled: true, layout: null, groups, statusFilter: null, scope: null, note: `CCD custom grouping: ${groups.length} groups` };
+  return { enabled: true, layout: null, groups, statusFilter: null, scope: null, scopeKey: null, note: `CCD custom grouping: ${groups.length} groups` };
 }
 
 function resolveView(state: DframeState): SidebarView {
@@ -527,8 +530,9 @@ async function readStore(dir: string): Promise<{ view: SidebarView | null; unrea
 // The gateway refuses a whole upload with one value over its limits (the
 // group-mirror schema), so the blob is cut to them here: groups past the 500th
 // and ids past the 5,000th of a list are left out, as is an id longer than 200
-// characters; a name, subtitle, section name or note is cut to its length; a
-// sort or session filter longer than 40 characters is not one, and is null.
+// characters (a side session whose id or parent's id is longer is left out);
+// a name, subtitle, section name or note is cut to its length; a sort or
+// session filter longer than 40 characters is not one, and is null.
 const MAX_GROUPS = 500;
 const MAX_IDS = 5_000;
 const MAX_ID = 200;
@@ -554,6 +558,7 @@ function capBlob(blob: HxCcdGroupMirrorBlob): HxCcdGroupMirrorBlob {
       .map((g) => {
         const c: HxCcdGroup = { ...g, name: capText(g.name, 400) as string, subtitle: capText(g.subtitle, 400) as string | null, sectionName: capText(g.sectionName, 200) as string | null, sessionIds: capIds(g.sessionIds) };
         if ("sortBy" in g) c.sortBy = capWord(g.sortBy);
+        if (g.sideSessions) c.sideSessions = g.sideSessions.filter((x) => x.id.length <= MAX_ID && x.parent.length <= MAX_ID).slice(0, MAX_IDS);
         return c;
       }),
     unreadIds: capIds(blob.unreadIds),
@@ -607,7 +612,10 @@ async function buildGroupMirrorNow(nowMs: number): Promise<HxCcdGroupMirrorBlob>
   let ldbFp: string | null = null;
   let indexVersion = -1;
   try {
-    [ldbFp, indexVersion] = await Promise.all([leveldbFingerprint(), refreshCcdIndex(nowMs)]);
+    // `fresh`: a side session CCD just started is a new session file, and the
+    // store write that wakes this build (its group's drawn row count changes)
+    // would otherwise find the index held by its TTL for up to 20 s.
+    [ldbFp, indexVersion] = await Promise.all([leveldbFingerprint(), refreshCcdIndex(nowMs, { fresh: true })]);
     if (mirrorCache && mirrorCache.ldbFp === ldbFp && mirrorCache.indexVersion === indexVersion) {
       return { ...mirrorCache.blob, syncedAtMs: nowMs };
     }
@@ -657,6 +665,48 @@ async function buildGroupMirrorNow(nowMs: number): Promise<HxCcdGroupMirrorBlob>
   }
   const toCli = (localId: string): string => cliByCcd.get(localId) ?? localId;
 
+  // Side sessions: CCD draws a session spawned as a side session of another
+  // under it, in that session's group, and the side sessions of those in turn.
+  // Only the live account's session files count, and one filed in a group of
+  // its own is drawn there. Each group's side sessions are walked from its
+  // members in member order, depth first, a session's side sessions in id
+  // order; a session already reached (a cycle, a repeat) is not walked again.
+  const childrenOf = new Map<string, string[]>();
+  if (view.layout !== null && view.scopeKey !== null) {
+    for (const r of ccdRecordsInScope(view.scopeKey)) {
+      if (r.parentId === null) continue;
+      const kids = childrenOf.get(r.parentId);
+      if (kids) kids.push(r.ccdSessionId);
+      else childrenOf.set(r.parentId, [r.ccdSessionId]);
+    }
+    for (const kids of childrenOf.values()) kids.sort();
+  }
+  const filed = new Set(view.groups.flatMap((g) => g.members));
+  const sideSessionsOf = (members: string[]): Array<{ id: string; parent: string }> => {
+    const out: Array<{ id: string; parent: string }> = [];
+    const reached = new Set(members);
+    for (const m of members) {
+      // A stack of (parent, side session) pairs, pushed in reverse so the walk
+      // takes them in id order.
+      const stack: Array<[string, string]> = [];
+      const push = (parent: string): void => {
+        const kids = childrenOf.get(parent) ?? [];
+        for (let i = kids.length - 1; i >= 0; i--) stack.push([parent, kids[i]!]);
+      };
+      push(m);
+      for (let top = stack.pop(); top !== undefined; top = stack.pop()) {
+        const [parent, id] = top;
+        if (reached.has(id) || filed.has(id)) continue;
+        reached.add(id);
+        out.push({ id, parent });
+        push(id);
+      }
+    }
+    return out;
+  };
+  const sideByGroup = new Map<string, Array<{ id: string; parent: string }>>();
+  if (childrenOf.size > 0) for (const g of view.groups) sideByGroup.set(g.id, sideSessionsOf(g.members));
+
   const groups: HxCcdGroup[] = view.groups.map((g) => {
     const out: HxCcdGroup = {
       id: g.id,
@@ -671,24 +721,25 @@ async function buildGroupMirrorNow(nowMs: number): Promise<HxCcdGroupMirrorBlob>
       out.ascending = g.ascending ?? null;
       out.shown = g.shown ?? true;
       out.showEmpty = g.showEmpty ?? false;
+      out.sideSessions = (sideByGroup.get(g.id) ?? []).map((x): HxCcdSideSession => ({ id: toCli(x.id), parent: toCli(x.parent) }));
     }
     return out;
   });
 
   // The members CCD has archived, which its "active" session filter hides
   // (the server has no archived flag of its own), in group order, in the id
-  // space of sessionIds.
+  // space of sessionIds; then the archived side sessions, in group order.
   const archivedIds: string[] = [];
   const seenArchived = new Set<string>();
-  for (const g of view.groups) {
-    for (const m of g.members) {
-      if (!archived.has(m)) continue;
-      const id = toCli(m);
-      if (seenArchived.has(id)) continue;
-      seenArchived.add(id);
-      archivedIds.push(id);
-    }
-  }
+  const addArchived = (localId: string): void => {
+    if (!archived.has(localId)) return;
+    const id = toCli(localId);
+    if (seenArchived.has(id)) return;
+    seenArchived.add(id);
+    archivedIds.push(id);
+  };
+  for (const g of view.groups) for (const m of g.members) addArchived(m);
+  for (const g of view.groups) for (const x of sideByGroup.get(g.id) ?? []) addArchived(x.id);
 
   const blob = capBlob(
     scoped(

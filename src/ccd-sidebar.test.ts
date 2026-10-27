@@ -136,7 +136,7 @@ describe("CCD mirror: current builds (drawn sections per account)", () => {
     assert.deepEqual(blob.unreadIds, ["cli-a", "local_e"]);
     assert.deepEqual(blob.archivedIds, ["cli-b"], "the archived member, which CCD's active filter hides");
     assert.ok(!blob.groups.some((g) => g.name === "Second account"), "another account's group never reaches the mirror");
-    assert.deepEqual(Object.keys(blob.groups[0]!), ["id", "name", "subtitle", "sectionName", "collapsed", "sessionIds", "sortBy", "ascending", "shown", "showEmpty"]);
+    assert.deepEqual(Object.keys(blob.groups[0]!), ["id", "name", "subtitle", "sectionName", "collapsed", "sessionIds", "sortBy", "ascending", "shown", "showEmpty", "sideSessions"]);
     assert.deepEqual(Object.keys(blob), ["groupingEnabled", "groups", "unreadIds", "note", "syncedAtMs", "layout", "statusFilter", "archivedIds", "scope"]);
   });
 
@@ -228,6 +228,52 @@ describe("CCD mirror: current builds (drawn sections per account)", () => {
     const blob = await buildGroupMirror((nowMs += 1000));
     assert.equal(blob.groupingEnabled, false);
     assert.equal(blob.scope, null);
+  });
+});
+
+describe("CCD mirror: side sessions", () => {
+  /** A CCD session file in an account's folder. */
+  const session = (scope: string, id: string, extra: Record<string, unknown> = {}): void => {
+    const dir = join(root, "claude-code-sessions", ...scope.split("/"));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `local_${id}.json`), JSON.stringify({ sessionId: `local_${id}`, title: id, titleSource: "user", isArchived: false, lastActivityAt: 1, ...extra }));
+  };
+  const side = (parent: string): Record<string, unknown> => ({ spawnedFrom: { sessionId: `local_${parent}`, taskId: "task_1", title: "t", sideSession: true, name: "n" } });
+
+  it("lists each group's side sessions under their parents, from the live account's files only", async () => {
+    setup();
+    session(A, "s1", { cliSessionId: "cli-s1", ...side("a") });
+    session(A, "s0", { cliSessionId: "cli-s0", ...side("a") });
+    session(A, "s2", side("s1")); // no cli id yet: keeps its local id
+    session(A, "s3", { cliSessionId: "cli-s3", ...side("a"), isArchived: true });
+    session(A, "s4", { cliSessionId: "cli-s4", spawnedFrom: { sessionId: "local_a", taskId: "task_2", title: "a card" } }); // not a side session
+    session(A, "s5", { cliSessionId: "cli-s5", ...side("a"), lineageDetached: true });
+    session(A, "s6", { cliSessionId: "cli-s6", ...side("c") });
+    session(A, "s7", { cliSessionId: "cli-s7", ...side("a") }); // filed in Three below
+    session(B, "s8", { cliSessionId: "cli-s8", ...side("a") }); // another account's file
+    const st = scopedState(A) as { state: { codeSidebarByScope: Record<string, { sections: Array<Record<string, unknown>> }> } };
+    st.state.codeSidebarByScope[A]!.sections.find((s) => s.id === "g3")!.members = ["code:local_s7"];
+    writeFileSync(join(ldb, "000005.ldb"), buildLdbEntries([{ key: DFRAME, seq: 10, value: json(st) }]));
+    const blob = await buildGroupMirror((nowMs += 1000));
+    const byName = new Map(blob.groups.map((g) => [g.name, g.sideSessions]));
+    assert.deepEqual(byName.get("One"), [
+      { id: "cli-s0", parent: "cli-a" },
+      { id: "cli-s1", parent: "cli-a" },
+      { id: "local_s2", parent: "cli-s1" },
+      { id: "cli-s3", parent: "cli-a" },
+    ]);
+    assert.deepEqual(byName.get("Two"), [{ id: "cli-s6", parent: "cli-c" }]);
+    assert.deepEqual(byName.get("Three"), [], "s7 is filed in Three itself and has no side sessions");
+    assert.deepEqual(blob.archivedIds, ["cli-b", "cli-s3"], "archived members first, then archived side sessions");
+  });
+
+  it("takes the side sessions from the new account after a switch", async () => {
+    setup();
+    session(A, "s1", { cliSessionId: "cli-s1", ...side("a") });
+    session(B, "s8", { cliSessionId: "cli-s8", ...side("d") });
+    writeFileSync(join(ldb, "000005.ldb"), buildLdbEntries([{ key: DFRAME, seq: 10, value: json(scopedState(B)) }]));
+    const blob = await buildGroupMirror((nowMs += 1000));
+    assert.deepEqual(blob.groups.map((g) => [g.name, g.sideSessions]), [["Second account", [{ id: "cli-s8", parent: "cli-d" }]]]);
   });
 });
 
