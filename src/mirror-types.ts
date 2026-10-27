@@ -29,6 +29,21 @@ export interface HxCcdGroup {
    *  group when no session it would show is left (archived ones are hidden
    *  by statusFilter). */
   showEmpty?: boolean;
+  /** The scoped layouts only. The sessions CCD draws in this group under one
+   *  of its members: side sessions of a member, and theirs in turn, each with
+   *  the session it was spawned from (`parent`, a member or another entry
+   *  here). A side session filed in a group of its own is drawn there and is
+   *  not listed. Parents come before their side sessions; the order is CCD's
+   *  session ids, never activity, so activity never changes the blob. Ids are
+   *  in the id space of `sessionIds`; archived ones are in the blob's
+   *  `archivedIds`. */
+  sideSessions?: HxCcdSideSession[];
+}
+
+/** One side session in a group, and the session it was spawned from. */
+export interface HxCcdSideSession {
+  id: string;
+  parent: string;
 }
 
 export interface HxCcdGroupMirrorBlob {
@@ -45,9 +60,9 @@ export interface HxCcdGroupMirrorBlob {
   /** CCD's session filter for its sidebar ("active" hides archived sessions),
    *  or null. Present with `layout`. */
   statusFilter?: string | null;
-  /** The group members CCD has archived, in the id space of `sessionIds` (the
-   *  server has no archived flag of its own, so this is what `statusFilter`
-   *  hides). Present with `layout`. */
+  /** The group members and side sessions CCD has archived, in the id space of
+   *  `sessionIds` (the server has no archived flag of its own, so this is what
+   *  `statusFilter` hides). Present with `layout`. */
   archivedIds?: string[];
   /** The live CCD account, as the first 16 hex of sha256 of its scope key;
    *  changes when CCD switches accounts. Present with `layout`; null when CCD

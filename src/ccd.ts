@@ -92,6 +92,10 @@ export interface CcdSessionMeta {
   titleSource: "user" | "ai" | null;
   isArchived: boolean;
   lastActivityAt: number;
+  /** The session CCD draws this one under, in that session's sidebar group:
+   *  `spawnedFrom.sessionId` of a side session (`spawnedFrom.sideSession`)
+   *  whose lineage is not detached. Null for every other session. */
+  parentId: string | null;
 }
 
 interface IndexedFile {
@@ -150,6 +154,20 @@ export function ccdIndexVersion(): number {
   return version;
 }
 
+/** The records of one account's sessions — the files under
+ *  `<store>/<accountId>/<orgId>/`, for a scope key `<accountId>/<orgId>` —
+ *  from the index as of its last refresh. A key that is not exactly two plain
+ *  path segments names no account. */
+export function ccdRecordsInScope(scopeKey: string): CcdSessionMeta[] {
+  if (CCD_DIR === null) return [];
+  const parts = scopeKey.split("/");
+  if (parts.length !== 2 || parts.some((p) => p === "" || p === "." || p === ".." || p.includes("\\"))) return [];
+  const under = `${path.join(CCD_DIR, parts[0]!, parts[1]!)}${path.sep}`;
+  const out: CcdSessionMeta[] = [];
+  for (const [p, e] of index) if (e.record && p.startsWith(under)) out.push(e.record);
+  return out;
+}
+
 function isSessionFile(name: string): boolean {
   return name.startsWith("local_") && name.endsWith(".json");
 }
@@ -203,6 +221,7 @@ async function readSessionFile(filePath: string): Promise<CcdSessionMeta | null>
   if (!d || typeof d !== "object") return null;
   if (typeof d.sessionId !== "string") return null;
   const titleSourceRaw = typeof d.titleSource === "string" ? d.titleSource : null;
+  const spawned = d.spawnedFrom && typeof d.spawnedFrom === "object" ? (d.spawnedFrom as Record<string, unknown>) : null;
   return {
     ccdSessionId: d.sessionId,
     cliSessionId: typeof d.cliSessionId === "string" ? d.cliSessionId : null,
@@ -210,6 +229,10 @@ async function readSessionFile(filePath: string): Promise<CcdSessionMeta | null>
     titleSource: titleSourceRaw === "user" || titleSourceRaw === "ai" ? titleSourceRaw : null,
     isArchived: d.isArchived === true,
     lastActivityAt: typeof d.lastActivityAt === "number" ? d.lastActivityAt : 0,
+    parentId:
+      spawned && spawned.sideSession === true && typeof spawned.sessionId === "string" && spawned.sessionId !== "" && !d.lineageDetached
+        ? spawned.sessionId
+        : null,
   };
 }
 
@@ -304,18 +327,21 @@ async function refreshNow(nowMs: number, fullStat: boolean): Promise<void> {
 }
 
 /**
- * Bring the index up to date if it is older than the TTL (or `force`), and
- * return its version. Single-flight: concurrent callers share one refresh.
- * The first call builds the whole index — one bounded read of every file.
+ * Bring the index up to date if it is older than the TTL (or `fresh`, or
+ * `force`), and return its version. `fresh` skips the TTL but keeps the
+ * dir-mtime gate, so only the directories that moved are re-listed; `force`
+ * also re-stats every file. Single-flight: concurrent callers share one
+ * refresh. The first call builds the whole index — one bounded read of every
+ * file.
  */
 export async function refreshCcdIndex(
   nowMs: number,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; fresh?: boolean } = {},
 ): Promise<number> {
   // The saved index is loaded before the first refresh of the process, so
   // that refresh stats where it would otherwise have read.
   await loadSavedIndex();
-  if (!opts.force && nowMs - lastRefreshAtMs < CCD_REFRESH_TTL_MS) return version;
+  if (!opts.force && !opts.fresh && nowMs - lastRefreshAtMs < CCD_REFRESH_TTL_MS) return version;
   if (refreshInFlight) {
     await refreshInFlight;
     return version;
@@ -373,7 +399,9 @@ export async function getCcdRecentsByCliId(
 // unreadable or unversioned one is ignored and rebuilt.
 
 export const CCD_INDEX_SAVE_INTERVAL_MS = 10 * 60_000;
-const CCD_INDEX_FORMAT = 1;
+/** 2: each record carries `parentId`. A save in an older format is ignored and
+ *  the index rebuilt once, since its records would say no session has a parent. */
+const CCD_INDEX_FORMAT = 2;
 const CCD_INDEX_FILE = path.join(HX_DIR, "ccd-index.json");
 
 interface SavedCcdIndex {

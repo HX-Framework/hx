@@ -86,10 +86,11 @@ export interface ExpectedGroupMirror {
     ascending?: boolean | null;
     shown?: boolean;
     showEmpty?: boolean;
+    sideSessions?: Array<{ id: string; parent: string }>;
   }>;
   unreadIds: string[];
   /** The scoped layouts: which one, CCD's session filter, the archived
-   *  members, the hashed account. */
+   *  members and side sessions, the hashed account. */
   layout?: string;
   statusFilter?: string | null;
   archivedIds?: string[];
@@ -849,6 +850,41 @@ function writeScopedCcdStore(
       -(80 + idx) * MIN,
     );
   }
+  // Side sessions, which CCD draws under the session they were spawned from,
+  // in its group: two under Alpha's member (one with a side session of its
+  // own), an archived one under Gamma's, one under the second account's group,
+  // and two spawned from Alpha's member that are not side sessions (a task
+  // card, a detached lineage). A generator of their own keeps every id above.
+  const rs = new Prng(`${ctx.manifest.seed}:ccd-side`);
+  const side = (parent: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({ spawnedFrom: { sessionId: parent, taskId: `task_${rs.alnum(8)}`, title: "Side task", sideSession: true, name: "side" }, ...extra });
+  const s1 = `local_${rs.uuid()}`;
+  const s1Cli = rs.uuid();
+  const s2 = `local_${rs.uuid()}`;
+  const s3 = `local_${rs.uuid()}`;
+  const s3Cli = rs.uuid();
+  const s4 = `local_${rs.uuid()}`;
+  const s5 = `local_${rs.uuid()}`;
+  const s6 = `local_${rs.uuid()}`;
+  const s6Cli = rs.uuid();
+  const sb = `local_${rs.uuid()}`;
+  const sbCli = rs.uuid();
+  const sideFiles: Array<[string, string, Record<string, unknown>]> = [
+    [A, s1, { cliSessionId: s1Cli, ...side(ids.repoCli) }],
+    [A, s2, side(s1)],
+    [A, s3, { cliSessionId: s3Cli, ...side(ids.repoDesktop), isArchived: true }],
+    [A, s4, { spawnedFrom: { sessionId: ids.repoCli, taskId: "task_card", title: "A card" } }],
+    [A, s5, side(ids.repoCli, { lineageDetached: true })],
+    [A, s6, { cliSessionId: s6Cli, ...side(ids.repoCli) }],
+    [B, sb, { cliSessionId: sbCli, ...side(b1) }],
+  ];
+  sideFiles.forEach(([scope, localId, extra], i) => {
+    write(
+      ctx,
+      `${f.ccdRoot}/claude-code-sessions/${scope}/${localId}.json`,
+      JSON.stringify({ sessionId: localId, title: `Side session ${i}`, titleSource: "user", isArchived: false, lastActivityAt: CONTENT_EPOCH + i * HOUR, cwd: f.repo, ...extra }),
+      -(60 + i) * MIN,
+    );
+  });
   const code = (id: string): string => `code:${id}`;
   const show = { metadata: false, emptyGroups: false, sideChats: false };
   const builtin = (id: string, order: number, extra: Record<string, unknown> = {}): Record<string, unknown> => ({ id, kind: id, v: 2, name: "", order, sortBy: "recency", ascending: false, show, collapsed: false, shown: true, groupBy: "none", ...extra });
@@ -946,24 +982,29 @@ function writeScopedCcdStore(
   };
 
   const hash16 = (s: string): string => createHash("sha256").update(s).digest("hex").slice(0, 16);
-  const group = (id: string, name: string, collapsed: boolean, sessionIds: string[], sortBy: string, ascending: boolean, showEmpty: boolean) => ({ id, name, subtitle: null, sectionName: null, collapsed, sessionIds, sortBy, ascending, shown: true, showEmpty });
+  const group = (id: string, name: string, collapsed: boolean, sessionIds: string[], sortBy: string, ascending: boolean, showEmpty: boolean, sideSessions: Array<{ id: string; parent: string }> = []) => ({ id, name, subtitle: null, sectionName: null, collapsed, sessionIds, sortBy, ascending, shown: true, showEmpty, sideSessions });
+  // Alpha's member has two side sessions, taken in id order, and s1 has one
+  // of its own: depth first, it comes right after s1.
+  const s1Tree = [{ id: s1Cli, parent: f.repoCli }, { id: s2, parent: s1Cli }];
+  const s6Entry = { id: s6Cli, parent: f.repoCli };
+  const alphaSide = s1 < s6 ? [...s1Tree, s6Entry] : [s6Entry, ...s1Tree];
   const unreadIds = [f.repoCli, f.unknownCli];
   ctx.manifest.expectations.groupMirror = {
     groupingEnabled: true,
     groups: [
-      group("cg-gamma", "Gamma", false, [f.repoDesktop], "alpha", true, false),
-      group("cg-alpha", "Alpha", true, [f.repoCli], "created", false, false),
+      group("cg-gamma", "Gamma", false, [f.repoDesktop], "alpha", true, false, [{ id: s3Cli, parent: f.repoDesktop }]),
+      group("cg-alpha", "Alpha", true, [f.repoCli], "created", false, false, alphaSide),
       group("cg-beta", "Beta", false, [f.unknownCli, f.archivedCli, ids.noCli], "created", false, false),
     ],
     unreadIds,
     layout: "sections",
     statusFilter: "active",
-    archivedIds: [f.archivedCli],
+    archivedIds: [f.archivedCli, s3Cli],
     scope: hash16(A),
   };
   ctx.manifest.expectations.groupMirrorAfterSwitch = {
     groupingEnabled: true,
-    groups: [group("cg-old", "Old Project", false, [b1Cli, b2], "recency", false, true)],
+    groups: [group("cg-old", "Old Project", false, [b1Cli, b2], "recency", false, true, [{ id: sbCli, parent: b1Cli }])],
     unreadIds,
     layout: "sections",
     statusFilter: "active",
