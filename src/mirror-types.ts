@@ -59,11 +59,15 @@ export interface HxCcdGroupMirrorBlob {
   codex?: HxCodexSidebarBlob | null;
 }
 
-/** One Codex Desktop sidebar section, in the group shape the mirror carries. */
+/** One Codex Desktop sidebar group, in the group shape the mirror carries. */
 export interface HxCodexSection {
-  /** Codex's own section id (a UUID), or "pinned" for Codex's built-in Pinned list. */
+  /** Codex's own section id (a UUID); "pinned" for the pinned threads,
+   *  "recents" for Recents, `project:<project id>` for a project row. */
   id: string;
   name: string;
+  /** Only on a project row: the built-in section it sits in, "Projects" or
+   *  "Pinned". Absent on every other group. */
+  sectionName?: string;
   collapsed: boolean;
   /** Codex thread ids in Codex's order. A thread id is the rollout's
    *  session_meta id, which is the sessionId hx uploads the session under. */

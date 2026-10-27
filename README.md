@@ -241,10 +241,14 @@ shows the same groups. It uploads group names, their order, whether each is
 collapsed, and which session ids sit in each, never message content:
 
 - Claude Code Desktop's groups, read from its Local Storage leveldb;
-- Codex Desktop's sidebar sections (`src/codex-sections.ts`), read from
-  `~/.codex/.codex-global-state.json` (the signed-in account's sections) and
-  `~/.codex/state_<N>.sqlite` (which threads Codex lists, and its Pinned
-  list). Both files are opened read-only.
+- Codex Desktop's sidebar (`src/codex-sections.ts`), read from
+  `~/.codex/.codex-global-state.json` (the signed-in account's sections,
+  projects and sidebar settings) and `~/.codex/state_<N>.sqlite` (which
+  threads Codex lists, its Pinned list, each thread's folder and recency).
+  Both files are opened read-only. Below the sections hx sends what Codex
+  draws there in its default project mode: a row per project with its
+  threads (a thread belongs to the project whose root is its folder, as
+  Codex decides it), and Recents, the threads with no project.
 
 Both go up in one upload (`POST /sessions/group-mirror`, Codex's as its
 `codex` field), on start, within about a second of a change to either app's

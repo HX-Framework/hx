@@ -19,13 +19,16 @@
 // the database is read for what only it holds:
 //   • which threads the sidebar lists at all (see `visible` below);
 //   • Codex's built-in Pinned list (the section with the fixed id below);
-//   • each thread's cwd and recency, to expand a project placed in a section;
+//   • each thread's cwd and recency, to file it under its project;
 //   • the sections themselves when the JSON file has none to offer (a Codex
 //     that keeps them only in the app-server).
 //
-// Codex also groups the threads OUTSIDE the sections by project. It derives
-// that in the renderer from workspace roots and git origins; hx does not
-// reproduce it, and those sessions keep the server's by-repo grouping.
+// Below the custom sections Codex draws its built-in ones: Pinned, then (in
+// its default "project" mode) Projects, a row per local project with its
+// threads, and Recents, the threads with no project. They are mirrored too,
+// as Codex's code (ChatGPT.app 26.924) builds them; see "Projects" below. A
+// project row's group id is `project:<project id>`, and its `sectionName`
+// names the built-in section it sits in ("Projects" or "Pinned").
 //
 // A thread id is the rollout's session_meta id, which is the sessionId hx
 // uploads the session under, so a section's members need no mapping.
@@ -64,7 +67,8 @@ interface DbThread {
   /** Listed in Codex's sidebar: not archived, with a preview (a thread with
    *  no user message has none), started from the CLI or the desktop app
    *  (Codex's thread list leaves subagent, guardian and exec threads out),
-   *  and not an ambient suggestion. */
+   *  not spawned by another thread, and neither an ambient suggestion nor a
+   *  thread ChatGPT hides. */
   visible: boolean;
   cwd: string | null;
   recencyMs: number;
@@ -97,6 +101,12 @@ export function readCodexStateDb(dbPath: string): CodexDbRead {
         `SELECT id, ${col("archived", "0")} AS archived, ${col("source", "'cli'")} AS source, ${cols.has("preview") ? "preview <> ''" : "1"} AS previewed, ${col("thread_source", "NULL")} AS threadSource, ${col("cwd", "NULL")} AS cwd, ${recency} AS recency FROM threads`,
       )
       .all() as Array<{ id: unknown; archived: unknown; source: unknown; previewed: unknown; threadSource: unknown; cwd: unknown; recency: unknown }>;
+    // Codex lists top-level threads only.
+    const spawned = new Set(
+      tables.has("thread_spawn_edges")
+        ? (db.query("SELECT child_thread_id AS id FROM thread_spawn_edges").all() as Array<{ id: unknown }>).map((r) => r.id)
+        : [],
+    );
     for (const r of rows) {
       if (typeof r.id !== "string") continue;
       out.threads.set(r.id, {
@@ -104,7 +114,9 @@ export function readCodexStateDb(dbPath: string): CodexDbRead {
           Number(r.archived) === 0 &&
           Number(r.previewed) !== 0 &&
           (r.source === "cli" || r.source === "vscode") &&
-          r.threadSource !== "ambient_suggestions",
+          r.threadSource !== "ambient_suggestions" &&
+          r.threadSource !== "chatgpt_hidden" &&
+          !spawned.has(r.id),
         cwd: typeof r.cwd === "string" ? r.cwd : null,
         recencyMs: typeof r.recency === "number" && Number.isFinite(r.recency) ? r.recency : 0,
       });
@@ -159,134 +171,318 @@ function pickAccount(gs: Obj, atoms: Obj, entries: Obj): string | null | "unknow
   return all.length === 1 ? all[0]! : "unknown";
 }
 
-// ── Projects placed in a section ────────────────────────────────────────────
+// ── Projects ────────────────────────────────────────────────────────────────
 
-function normDir(p: string): string {
-  return p.replace(/\\/g, "/").replace(/\/+$/, "");
+// Codex's projects are the entries of `local-projects`, which its main process
+// hands to the sidebar unchanged, minus the single-root ones kept under a
+// `.chatgpt-projects` folder and the ones backed by a ChatGPT project (the
+// sidebar shows those as ChatGPT projects). A project's label is its trimmed
+// name, or its id.
+interface LocalProject {
+  id: string;
+  label: string;
+  roots: string[];
+  createdAt: number;
 }
 
-// A project item stands for the threads Codex files under that project: a
-// thread assigned to a project (thread-project-assignments) belongs to it; a
-// thread marked projectless belongs to none; any other thread belongs to the
-// local project whose root holds its cwd, the deepest root winning. Codex
-// also matches by git origin, which hx does not look at.
-function projectOf(
-  tid: string,
-  cwd: string | null,
-  assignments: unknown,
-  projectless: Set<string>,
-  roots: Array<{ id: string; root: string }>,
-): string | null {
-  const a = isObj(assignments) ? assignments[tid] : undefined;
-  if (isObj(a) && typeof a.projectId === "string") return a.projectId;
-  if (projectless.has(tid) || !cwd) return null;
-  const dir = normDir(cwd);
-  let best: { id: string; len: number } | null = null;
-  for (const r of roots) {
-    if ((dir === r.root || dir.startsWith(`${r.root}/`)) && (!best || r.root.length > best.len)) {
-      best = { id: r.id, len: r.root.length };
-    }
-  }
-  return best?.id ?? null;
-}
-
-function localProjectRoots(gs: Obj): Array<{ id: string; root: string }> {
-  const out: Array<{ id: string; root: string }> = [];
+function localProjects(gs: Obj): LocalProject[] {
+  const out: LocalProject[] = [];
   const projects = gs["local-projects"];
   if (!isObj(projects)) return out;
   for (const [key, p] of Object.entries(projects)) {
-    if (!isObj(p)) continue;
-    const id = typeof p.id === "string" ? p.id : key;
-    for (const root of strings(p.rootPaths)) {
-      const r = normDir(root);
-      if (r) out.push({ id, root: r });
-    }
+    if (!isObj(p) || p.chatGptBacking) continue;
+    const id = typeof p.id === "string" && p.id ? p.id : key;
+    const roots = strings(p.rootPaths);
+    if (roots.length === 1 && path.posix.basename(path.posix.dirname(roots[0]!.replace(/\\/g, "/"))) === ".chatgpt-projects") continue;
+    const name = typeof p.name === "string" ? p.name.trim() : "";
+    out.push({ id, label: name || id, roots, createdAt: typeof p.createdAt === "number" ? p.createdAt : 0 });
   }
   return out;
 }
 
-// Every project's threads, worked out once per read. Codex builds a
-// project's list from the threads its sidebar lists, so with a database the
-// candidates are its threads; without one, the assigned threads.
-function indexProjects(gs: Obj, db: CodexDbRead | null): Map<string, string[]> {
-  const roots = localProjectRoots(gs);
-  const assignments = gs["thread-project-assignments"];
-  const projectless = new Set(strings(gs["projectless-thread-ids"]));
-  const candidates = db ? [...db.threads.keys()] : isObj(assignments) ? Object.keys(assignments) : [];
-  const byProject = new Map<string, string[]>();
-  for (const tid of candidates) {
-    const pid = projectOf(tid, db?.threads.get(tid)?.cwd ?? null, assignments, projectless, roots);
-    if (pid === null) continue;
-    const list = byProject.get(pid);
-    if (list) list.push(tid);
-    else byProject.set(pid, [tid]);
+// Codex compares paths with `\` turned into `/` and lowercased, and gives a
+// thread the project whose root EQUALS its cwd: a thread in a subfolder of a
+// root is not that project's.
+function pathKey(p: string): string {
+  return p.replace(/\\/g, "/").toLowerCase();
+}
+
+// When two projects share a root, Codex keeps the single-root one, then the
+// one whose first root it is, then the older, then the larger id.
+function beats(a: LocalProject, b: LocalProject, key: string): boolean {
+  const single = (p: LocalProject): number => (p.roots.length === 1 ? 1 : 0);
+  if (single(a) !== single(b)) return single(a) > single(b);
+  const first = (p: LocalProject): number => (pathKey(p.roots[0] ?? "") === key ? 1 : 0);
+  if (first(a) !== first(b)) return first(a) > first(b);
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt;
+  return a.id > b.id;
+}
+
+// A thread Codex started in a dated folder under ~/Documents/Codex has no project.
+const PROJECTLESS_DIR =
+  /^(.*(?:^|[\\/])Documents[\\/]+Codex)[\\/]+(?:\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9-]*|\d{4}-\d{2}-\d{2}[\\/]+[a-z0-9][a-z0-9-]*)[\\/]*$/;
+// A worktree Codex made for a thread. Codex resolves its project through git;
+// it saves the root it found in thread-workspace-root-hints, which hx reads.
+const CODEX_WORKTREES = /^(.*\/(?:\.codex|\.codex-workspaces(?:\/instances\/[^/]+)?|OpenAI\/Codex\/workspaces(?:\/instances\/[^/]+)?)\/worktrees)(?:\/|$)/;
+
+function inCodexWorktree(cwd: string, codexHome: string): boolean {
+  const dir = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
+  const roots: string[] = [];
+  if (codexHome) roots.push(`${codexHome.replace(/\\/g, "/").replace(/\/+$/, "")}/worktrees`);
+  const m = CODEX_WORKTREES.exec(dir);
+  if (m) roots.push(m[1]!);
+  return roots.some((r) => dir === r || dir.startsWith(`${r}/`));
+}
+
+interface ProjectIndex {
+  list: LocalProject[];
+  byId: Map<string, LocalProject>;
+  byRoot: Map<string, LocalProject>;
+}
+
+function indexProjects(gs: Obj): ProjectIndex {
+  const list = localProjects(gs);
+  const byRoot = new Map<string, LocalProject>();
+  for (const p of list) {
+    for (const root of p.roots) {
+      const key = pathKey(root);
+      const held = byRoot.get(key);
+      if (!held || beats(p, held, key)) byRoot.set(key, p);
+    }
   }
-  return byProject;
+  return { list, byId: new Map(list.map((p) => [p.id, p])), byRoot };
 }
 
-interface Ctx {
-  gs: Obj;
-  atoms: Obj;
-  db: CodexDbRead | null;
-  projects: Map<string, string[]> | null;
+// The project Codex files a thread under, the first rule that applies:
+//   1. an assignment to a local project that exists;
+//   2. no project for an assignment that came from a ChatGPT project, an empty
+//      cwd, a thread marked projectless or one in a dated ~/Documents/Codex folder;
+//   3. for a Codex worktree that is not itself a root, the root Codex saved;
+//   4. the project whose root equals the cwd; else none.
+// A thread assigned to a project that no longer exists, with no root to fall
+// back on, is hidden everywhere (undefined).
+interface ResolveCtx {
+  projects: ProjectIndex;
+  assignments: Obj;
+  projectless: Set<string>;
+  hints: Obj;
+  codexHome: string;
 }
 
-// The project's threads in the order Codex lists them: with the manual sort
-// (Codex's default for projects) the threads missing from the saved order
-// come first, newest first, then the saved order; otherwise newest first.
-function projectThreads(pid: string, ctx: Ctx): string[] {
-  ctx.projects ??= indexProjects(ctx.gs, ctx.db);
-  const members = ctx.projects.get(pid) ?? [];
-  const recency = (tid: string): number => ctx.db?.threads.get(tid)?.recencyMs ?? 0;
-  const newestFirst = (a: string, b: string): number => recency(b) - recency(a) || (a < b ? 1 : a > b ? -1 : 0);
-  const prefs = ctx.atoms["flat-project-sidebar-preferences-v1"];
-  const sortMode = ctx.atoms["codex-sidebar-sort-mode-v1"] ?? (isObj(prefs) ? prefs.projectSortMode : undefined) ?? "manual";
-  const orders = ctx.gs["sidebar-project-thread-orders"];
-  const saved = sortMode === "manual" && isObj(orders) && isObj(orders[pid]) ? strings(orders[pid].threadIds) : [];
-  const memberSet = new Set(members);
-  const savedMembers: string[] = [];
-  for (const tid of saved) if (memberSet.has(tid) && !savedMembers.includes(tid)) savedMembers.push(tid);
-  const savedSet = new Set(savedMembers);
-  return [...members.filter((tid) => !savedSet.has(tid)).sort(newestFirst), ...savedMembers];
+function resolveProject(tid: string, cwd: string | null, ctx: ResolveCtx): string | null | undefined {
+  const { projects } = ctx;
+  const a = ctx.assignments[tid];
+  const assigned = isObj(a) && a.projectKind === "local" && typeof a.projectId === "string" ? a : null;
+  if (assigned) {
+    if (projects.byId.has(assigned.projectId as string)) return assigned.projectId as string;
+    if (assigned.projectOrigin === "chatgpt") return null;
+  }
+  let pid: string | null = null;
+  if (cwd && cwd.split(/[\\/]+/).some(Boolean) && !ctx.projectless.has(tid) && !PROJECTLESS_DIR.test(cwd.trim())) {
+    let dir = cwd;
+    if (inCodexWorktree(cwd, ctx.codexHome) && !projects.byRoot.has(pathKey(cwd))) {
+      const hint = ctx.hints[tid];
+      if (typeof hint === "string" && projects.byRoot.has(pathKey(hint))) dir = hint;
+    }
+    pid = projects.byRoot.get(pathKey(dir))?.id ?? null;
+  }
+  return pid === null && assigned ? undefined : pid;
+}
+
+// ── Sidebar preferences ─────────────────────────────────────────────────────
+
+interface SidebarPrefs {
+  /** "project": the threads outside the sections are listed by project
+   *  (Projects) and again in Recents; "list": Recents only. */
+  mode: "project" | "list";
+  projectSort: "updated_at" | "manual";
+  chatSort: "updated_at" | "manual";
+  showProjectsInRecents: boolean;
+  chatsFirst: boolean;
+}
+
+// flat-project-sidebar-preferences-v1, read as Codex reads it: a `manual` (or
+// `created_at`) sort counts only with manualSortVersion 1 and is otherwise
+// `updated_at`; codex-sidebar-sort-mode-v1, when set, overrides both sorts
+// (its `manual` reading as `updated_at` too); before the preferences were
+// initialized, a legacy organize mode decides. `connection` and `team` modes
+// show what `project` shows for a device without remote connections.
+function sidebarPrefs(gs: Obj, atoms: Obj): SidebarPrefs {
+  const prefs = atoms["flat-project-sidebar-preferences-v1"];
+  const p: Obj = isObj(prefs) ? prefs : {};
+  let mode = typeof p.mode === "string" ? p.mode : "project";
+  if (p.initialized !== true) {
+    const legacy = atoms["sidebar-organize-mode-v1"];
+    if (legacy === "recent") mode = atoms["sidebar-keep-projects-in-recent-v1"] === false ? "list" : "project";
+    else if (typeof legacy === "string") mode = legacy;
+  }
+  const v1 = p.manualSortVersion === 1;
+  const sortOf = (m: unknown): "updated_at" | "manual" => (m === "manual" && v1 ? "manual" : "updated_at");
+  const overridden = typeof atoms["codex-sidebar-sort-mode-v1"] === "string";
+  const setting = (k: string): unknown => (Object.hasOwn(atoms, k) ? atoms[k] : gs[k]);
+  return {
+    mode: mode === "list" ? "list" : "project",
+    projectSort: overridden ? "updated_at" : sortOf(p.projectSortMode),
+    chatSort: overridden ? "updated_at" : sortOf(p.chatSortMode),
+    showProjectsInRecents: setting("sidebar-show-projects-in-recents") !== false,
+    chatsFirst: setting("projectless-sidebar-chats-first-v1") === true,
+  };
 }
 
 // ── Assembly ────────────────────────────────────────────────────────────────
 
-// Codex's Pinned list: the app-server's pinned section, then any thread pinned
-// by an older Codex that the app-server has not taken over yet, then the
-// threads of each pinned project.
-function pinnedThreads(ctx: Ctx): string[] {
-  const out = [...(ctx.db?.members.get(CODEX_PINNED_SECTION_ID) ?? [])];
-  const migratedByHost = ctx.gs["app-server-migrated-pinned-thread-ids-by-host"];
-  const migrated = new Set<string>(isObj(migratedByHost) ? Object.values(migratedByHost).flatMap(strings) : []);
-  for (const tid of strings(ctx.gs["pinned-thread-ids"])) {
-    if (!migrated.has(tid) && !out.includes(tid)) out.push(tid);
-  }
-  for (const pid of strings(ctx.gs["pinned-project-ids"])) out.push(...projectThreads(pid, ctx));
-  return out;
+/** `ids` without repeats, in their order. */
+function dedupe(ids: string[]): string[] {
+  return [...new Set(ids)];
+}
+
+// `saved` applied to `ids` the way Codex applies a saved order: the ids it
+// does not name first, in their order, then the ones it names, in its order.
+function savedOrderLast(ids: string[], saved: string[]): string[] {
+  const present = new Set(ids);
+  const named = dedupe(saved).filter((id) => present.has(id));
+  const namedSet = new Set(named);
+  return [...ids.filter((id) => !namedSet.has(id)), ...named];
 }
 
 /**
- * Codex's sections from the parsed global state (null when the file is
- * absent) and the database read (null when there is no database). Pure: the
- * tests and the harness expectations call it directly.
+ * Codex's sidebar from the parsed global state (null when the file is
+ * absent) and the database read (null when there is no database), as groups
+ * in the order Codex draws them. Pure: the tests and the harness expectations
+ * call it directly. `codexHome` places Codex's own worktrees.
+ *
+ * Every group is one the sidebar draws: the custom sections; Pinned (pinned
+ * threads, then each pinned project as a row of its own, `sectionName`
+ * "Pinned"); in project mode one row per project (`sectionName` "Projects"),
+ * empty ones too; and Recents. Codex lists a project's threads in Recents as
+ * well, and the mirror shows a session once, so Recents carries the threads
+ * no project row holds.
  */
 export function assembleCodexSections(
   gs: Obj | null,
   db: CodexDbRead | null,
+  codexHome = "",
 ): { groups: HxCodexSection[]; source: "saved" | "database" | "none" } {
   const atoms = gs && isObj(gs["electron-persisted-atom-state"]) ? gs["electron-persisted-atom-state"] : {};
   const entries = atoms["sidebar-custom-sections-v3"];
   const account = gs && isObj(entries) ? pickAccount(gs, atoms, entries) : "unknown";
   const entry = account !== null && account !== "unknown" && isObj(entries) ? entries[account] : undefined;
-  const ctx: Ctx = { gs: gs ?? {}, atoms, db, projects: null };
+  const state = gs ?? {};
+  const prefs = sidebarPrefs(state, atoms);
+  const projects = indexProjects(state);
+  const objectAt = (k: string): Obj => (isObj(state[k]) ? (state[k] as Obj) : {});
+  const resolveCtx: ResolveCtx = {
+    projects,
+    assignments: objectAt("thread-project-assignments"),
+    projectless: new Set(strings(state["projectless-thread-ids"])),
+    hints: objectAt("thread-workspace-root-hints"),
+    codexHome,
+  };
+
+  // Each listed thread's project, worked out once per read.
+  const projectOf = new Map<string, string | null | undefined>();
+  const byProject = new Map<string, string[]>();
+  if (db) {
+    for (const [tid, t] of db.threads) {
+      const pid = resolveProject(tid, t.cwd, resolveCtx);
+      projectOf.set(tid, pid);
+      if (!t.visible || !pid) continue;
+      const list = byProject.get(pid);
+      if (list) list.push(tid);
+      else byProject.set(pid, [tid]);
+    }
+  } else if (gs) {
+    // No database: a project holds the threads assigned to it.
+    const assignments = gs["thread-project-assignments"];
+    for (const [tid, a] of Object.entries(isObj(assignments) ? assignments : {})) {
+      if (!isObj(a) || a.projectKind !== "local" || typeof a.projectId !== "string" || !projects.byId.has(a.projectId)) continue;
+      const list = byProject.get(a.projectId);
+      if (list) list.push(tid);
+      else byProject.set(a.projectId, [tid]);
+    }
+  }
+  // With a database, a thread it does not list (deleted), does not show or
+  // hides for good is left out; without one, every named thread is kept.
+  const hidden = (tid: string): boolean => db !== null && (db.threads.get(tid)?.visible !== true || projectOf.get(tid) === undefined);
+  const recency = (tid: string): number => db?.threads.get(tid)?.recencyMs ?? 0;
+  const newestFirst = (a: string, b: string): number => recency(b) - recency(a) || (a < b ? 1 : a > b ? -1 : 0);
+
+  // The custom sections: the signed-in account's saved ones; with no saved
+  // sidebar to go by, the app-server's, oldest first.
+  type Section = { id: string; name: string; collapsed: boolean; itemKeys: string[] };
+  let sections: Section[] = [];
+  let source: "saved" | "database" | "none" = "none";
+  if (isObj(entry) && Array.isArray(entry.sections)) {
+    const collapsed = new Set(strings(entry.collapsedSectionIds));
+    sections = entry.sections
+      .filter((s): s is Obj => isObj(s) && typeof s.id === "string" && s.id !== "" && typeof s.name === "string" && s.name.trim() !== "")
+      .map((s) => ({ id: s.id as string, name: s.name as string, collapsed: collapsed.has(s.id as string), itemKeys: strings(s.itemKeys) }));
+    source = "saved";
+  } else if (account === "unknown" && db && db.sections.length > 0) {
+    sections = db.sections.map((s) => ({
+      id: s.id,
+      name: s.name,
+      collapsed: false,
+      itemKeys: (db.members.get(s.id) ?? []).map((tid) => `${THREAD_ITEM}${tid}`),
+    }));
+    source = "database";
+  }
+  const sectionThreads = new Set<string>();
+  const sectionProjects = new Set<string>();
+  for (const s of sections) {
+    for (const key of s.itemKeys) {
+      if (key.startsWith(THREAD_ITEM)) sectionThreads.add(key.slice(THREAD_ITEM.length));
+      else if (key.startsWith(PROJECT_ITEM)) sectionProjects.add(key.slice(PROJECT_ITEM.length));
+    }
+  }
+
+  // Pinned: the app-server's pinned section, then any thread pinned by an
+  // older Codex that the app-server has not taken over yet; and the pinned
+  // projects that exist.
+  const pinnedThreads: string[] = [...(db?.members.get(CODEX_PINNED_SECTION_ID) ?? [])];
+  const migratedByHost = state["app-server-migrated-pinned-thread-ids-by-host"];
+  const migrated = new Set<string>(isObj(migratedByHost) ? Object.values(migratedByHost).flatMap(strings) : []);
+  for (const tid of strings(state["pinned-thread-ids"])) {
+    if (!migrated.has(tid) && !pinnedThreads.includes(tid)) pinnedThreads.push(tid);
+  }
+  const pinnedSet = new Set(pinnedThreads.filter((tid) => !hidden(tid)));
+  const pinnedProjects = dedupe(strings(state["pinned-project-ids"])).filter((pid) => projects.byId.has(pid));
+  const pinnedProjectSet = new Set(pinnedProjects);
+
+  // A project's threads in the order Codex lists them: newest first, or with
+  // the manual sort the saved order first and the rest newest first after it.
+  // A pinned thread or one a section names on its own shows there instead.
+  const orders = state["sidebar-project-thread-orders"];
+  const projectThreads = (pid: string): string[] => {
+    const members = (byProject.get(pid) ?? []).filter((tid) => !pinnedSet.has(tid) && !sectionThreads.has(tid)).sort(newestFirst);
+    if (prefs.projectSort !== "manual") return members;
+    const saved = isObj(orders) && isObj(orders[pid]) ? strings(orders[pid].threadIds) : [];
+    const present = new Set(members);
+    const named = dedupe(saved).filter((tid) => present.has(tid));
+    const namedSet = new Set(named);
+    return [...named, ...members.filter((tid) => !namedSet.has(tid))];
+  };
+
+  const collapsedAtom = atoms["sidebar-collapsed-sections-v1"];
+  const collapsedSections: Obj = isObj(collapsedAtom) ? collapsedAtom : {};
+  const rowCollapsed = (pid: string): boolean => atoms[`sidebar-project-expanded-v1-codex:${pid}`] === false;
+
+  // The rows of Projects: every project that is neither pinned nor placed in a
+  // section, those missing from project-order first, then project-order, with
+  // unified-sidebar-project-order-v1 applied the same way on top.
+  const rows = (() => {
+    const ids = projects.list.map((p) => p.id);
+    let out = savedOrderLast(ids, strings(state["project-order"])).filter((pid) => !pinnedProjectSet.has(pid) && !sectionProjects.has(pid));
+    const unified = strings(atoms["unified-sidebar-project-order-v1"]).map((k) => (k.startsWith(PROJECT_ITEM) ? k.slice(PROJECT_ITEM.length) : k));
+    out = savedOrderLast(out, unified);
+    return gs && db && prefs.mode === "project" ? out : [];
+  })();
+  const rowThreads = new Map(rows.map((pid) => [pid, projectThreads(pid)]));
+  const inRows = new Set([...rowThreads.values()].flat());
 
   const groups: HxCodexSection[] = [];
   const claimed = new Set<string>();
-  // With a database, a thread it does not list (deleted) or does not show is
-  // left out; without one, every named thread is kept.
-  const hidden = (tid: string): boolean => db !== null && db.threads.get(tid)?.visible !== true;
-  // A thread shows once: the first section in sidebar order keeps it.
+  // A thread shows once: the first group in sidebar order keeps it.
   const take = (ids: string[]): string[] => {
     const out: string[] = [];
     for (const tid of ids) {
@@ -296,57 +492,75 @@ export function assembleCodexSections(
     }
     return out;
   };
-  const pinned = (): void => {
-    const ids = take(pinnedThreads(ctx));
-    if (ids.length > 0) groups.push({ id: "pinned", name: "Pinned", collapsed: false, sessionIds: ids, showEmpty: true });
+  const projectRow = (pid: string, sectionName: string, sectionCollapsed: boolean): HxCodexSection => ({
+    id: `project:${pid}`,
+    name: projects.byId.get(pid)!.label,
+    sectionName,
+    collapsed: sectionCollapsed || rowCollapsed(pid),
+    sessionIds: take(rowThreads.get(pid) ?? projectThreads(pid)),
+    showEmpty: true,
+  });
+
+  const emit = {
+    pinned: (): void => {
+      const ids = take(pinnedThreads);
+      const closed = collapsedSections.pinned === true;
+      if (ids.length > 0) groups.push({ id: "pinned", name: "Pinned", collapsed: closed, sessionIds: ids, showEmpty: true });
+      if (gs) for (const pid of pinnedProjects) groups.push(projectRow(pid, "Pinned", closed));
+    },
+    section: (s: Section): void => {
+      const ids: string[] = [];
+      for (const key of s.itemKeys) {
+        if (key.startsWith(THREAD_ITEM)) {
+          const tid = key.slice(THREAD_ITEM.length);
+          if (!pinnedSet.has(tid)) ids.push(tid);
+        } else if (key.startsWith(PROJECT_ITEM)) ids.push(...projectThreads(key.slice(PROJECT_ITEM.length)));
+      }
+      groups.push({ id: s.id, name: s.name, collapsed: s.collapsed, sessionIds: take(ids), showEmpty: true });
+    },
+    projects: (): void => {
+      for (const pid of rows) groups.push(projectRow(pid, "Projects", collapsedSections.threads === true));
+    },
+    recents: (): void => {
+      if (!gs || !db) return;
+      const ids = [...db.threads.keys()].filter((tid) => {
+        if (hidden(tid) || pinnedSet.has(tid) || sectionThreads.has(tid) || inRows.has(tid)) return false;
+        const pid = projectOf.get(tid);
+        return !pid || (!pinnedProjectSet.has(pid) && !sectionProjects.has(pid) && (prefs.mode === "list" || prefs.showProjectsInRecents));
+      });
+      ids.sort(newestFirst);
+      const ordered =
+        prefs.chatSort === "manual"
+          ? savedOrderLast(ids, strings(atoms["unified-sidebar-chat-order-v1"]).map((k) => (k.startsWith(THREAD_ITEM) ? k.slice(THREAD_ITEM.length) : k)))
+          : ids;
+      groups.push({ id: "recents", name: "Recents", collapsed: collapsedSections.chats === true, sessionIds: take(ordered), showEmpty: true });
+    },
   };
 
-  if (isObj(entry) && Array.isArray(entry.sections)) {
-    const sections = entry.sections.filter(
-      (s): s is Obj => isObj(s) && typeof s.id === "string" && s.id !== "" && typeof s.name === "string" && s.name.trim() !== "",
-    );
-    const byId = new Map(sections.map((s) => [s.id as string, s]));
-    const collapsed = new Set(strings(entry.collapsedSectionIds));
-    const order = strings(entry.sectionOrder);
-    const emitted = new Set<string>();
-    const section = (s: Obj): void => {
-      const id = s.id as string;
-      if (emitted.has(id)) return;
-      emitted.add(id);
-      const ids: string[] = [];
-      for (const key of strings(s.itemKeys)) {
-        if (key.startsWith(THREAD_ITEM)) ids.push(key.slice(THREAD_ITEM.length));
-        else if (key.startsWith(PROJECT_ITEM)) ids.push(...projectThreads(key.slice(PROJECT_ITEM.length), ctx));
-      }
-      groups.push({ id, name: s.name as string, collapsed: collapsed.has(id), sessionIds: take(ids), showEmpty: true });
-    };
-    // Codex puts Pinned first when the saved order does not place it.
-    let pinnedDone = !order.includes("pinned");
-    if (pinnedDone) pinned();
-    for (const key of order) {
-      if (key === "pinned" && !pinnedDone) {
-        pinnedDone = true;
-        pinned();
-      } else if (key.startsWith("custom:")) {
-        const s = byId.get(key.slice("custom:".length));
-        if (s) section(s);
-      }
-    }
-    for (const s of sections) section(s);
-    return { groups, source: "saved" };
+  // Codex's section order: Pinned and Agents first when the saved order does
+  // not place them, then the saved order, then the custom sections it misses,
+  // then the built-in sections it misses.
+  const byId = new Map(sections.map((s) => [s.id, s]));
+  const saved = isObj(entry) ? strings(entry.sectionOrder) : [];
+  const order: string[] = [];
+  const place = (key: string): void => {
+    if (!order.includes(key)) order.push(key);
+  };
+  if (!saved.includes("pinned")) place("pinned");
+  if (!saved.includes("agents")) place("agents");
+  for (const key of saved) {
+    if (key === "pinned" || key === "agents" || key === "threads" || key === "chats" || (key.startsWith("custom:") && byId.has(key.slice("custom:".length)))) place(key);
   }
+  for (const s of sections) place(`custom:${s.id}`);
+  for (const key of prefs.chatsFirst ? ["chats", "threads"] : ["threads", "chats"]) place(key);
 
-  if (account === "unknown" && db && db.sections.length > 0) {
-    // No saved sidebar to go by: the app-server's sections, oldest first.
-    pinned();
-    for (const s of db.sections) {
-      groups.push({ id: s.id, name: s.name, collapsed: false, sessionIds: take(db.members.get(s.id) ?? []), showEmpty: true });
-    }
-    return { groups, source: "database" };
+  for (const key of order) {
+    if (key === "pinned") emit.pinned();
+    else if (key === "threads") emit.projects();
+    else if (key === "chats") emit.recents();
+    else if (key.startsWith("custom:")) emit.section(byId.get(key.slice("custom:".length))!);
   }
-
-  pinned();
-  return { groups, source: "none" };
+  return { groups, source };
 }
 
 // ── Reading a Codex home, cached on the files' stats ─────────────────────────
@@ -367,22 +581,37 @@ const KEPT_KEYS = [
   "environment-catalog-cache-v1",
   "thread-project-assignments",
   "projectless-thread-ids",
+  "thread-workspace-root-hints",
   "local-projects",
+  "project-order",
   "sidebar-project-thread-orders",
   "pinned-thread-ids",
   "pinned-project-ids",
   "app-server-migrated-pinned-thread-ids-by-host",
+  // Settings Codex may keep beside its atoms.
+  "sidebar-show-projects-in-recents",
+  "projectless-sidebar-chats-first-v1",
 ];
 const KEPT_ATOMS = [
   "sidebar-custom-sections-v3",
   "chatgpt-sidebar-state-v1",
   "flat-project-sidebar-preferences-v1",
   "codex-sidebar-sort-mode-v1",
+  "sidebar-organize-mode-v1",
+  "sidebar-keep-projects-in-recent-v1",
+  "sidebar-show-projects-in-recents",
+  "projectless-sidebar-chats-first-v1",
+  "sidebar-collapsed-sections-v1",
+  "unified-sidebar-project-order-v1",
+  "unified-sidebar-chat-order-v1",
 ];
+// One atom per project row: `sidebar-project-expanded-v1-codex:<project id>`.
+const KEPT_ATOM_PREFIX = "sidebar-project-expanded-v1-";
 
-function keep(from: Obj, keys: string[]): Obj {
+function keep(from: Obj, keys: string[], prefix?: string): Obj {
   const out: Obj = {};
   for (const k of keys) if (Object.hasOwn(from, k)) out[k] = from[k];
+  if (prefix) for (const k of Object.keys(from)) if (k.startsWith(prefix)) out[k] = from[k];
   return out;
 }
 
@@ -395,7 +624,7 @@ function readGlobalState(p: string): Obj | null {
   if (!isObj(parsed)) throw new Error("not a JSON object");
   const out = keep(parsed, KEPT_KEYS);
   const atoms = parsed["electron-persisted-atom-state"];
-  if (isObj(atoms)) out["electron-persisted-atom-state"] = keep(atoms, KEPT_ATOMS);
+  if (isObj(atoms)) out["electron-persisted-atom-state"] = keep(atoms, KEPT_ATOMS, KEPT_ATOM_PREFIX);
   return out;
 }
 
@@ -437,7 +666,7 @@ export function readCodexHomeSections(codexHome: string): { groups: HxCodexSecti
     cache.delete(codexHome);
     return null;
   }
-  const { groups } = assembleCodexSections(gs, db);
+  const { groups } = assembleCodexSections(gs, db, codexHome);
   cache.set(codexHome, { gsFp, gs, dbFp, db, groups });
   return { groups, present };
 }
