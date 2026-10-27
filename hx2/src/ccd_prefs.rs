@@ -183,14 +183,33 @@ fn strip_code_prefix(s: &[u16]) -> JsStr {
 
 // ── The sidebar view: what the mirror needs from the state ──────────────────
 
-/// The scoped layouts' fields of a group: the section's sort, whether it is
-/// switched on, and whether Claude Desktop shows it with nothing left to show.
+/// The scoped layouts' fields of a group: the sort and the direction the rows
+/// are drawn in, whether the section is drawn, and whether Claude Desktop
+/// draws it with nothing left to show.
 #[derive(Clone)]
 struct GroupExtra {
     sort_by: Option<JsStr>,
     ascending: Option<bool>,
     shown: bool,
     show_empty: bool,
+}
+
+/// The sorts Claude Desktop's section normalizer keeps; any other value reads
+/// as "recency".
+const CCD_SORTS: [&str; 3] = ["recency", "alpha", "created"];
+
+/// A manual section's sort as Claude Desktop draws it. Its normalizer reads a
+/// sort it does not know as "recency" and a missing direction as false, and
+/// for "alpha" it draws the opposite of the stored direction: false is A to Z.
+/// The blob carries the direction the rows are drawn in.
+fn drawn_sort(s: &Json) -> (JsStr, bool) {
+    let sort_by: JsStr = match s.get("sortBy").and_then(|v| v.as_str()) {
+        Some(v) if CCD_SORTS.iter().any(|k| eq_str(v, k)) => v.to_vec(),
+        _ => js("recency"),
+    };
+    let stored = s.get("ascending").and_then(|v| v.as_bool()) == Some(true);
+    let ascending = if eq_str(&sort_by, "alpha") { !stored } else { stored };
+    (sort_by, ascending)
 }
 
 /// A group as Claude Desktop's state describes it, members still its ids.
@@ -315,6 +334,17 @@ fn resolve_scoped(state: &Json) -> SidebarView {
                 a.0.cmp(&b.0)
             }
         });
+        // "Show empty groups" is one setting, kept on the Sessions section; a
+        // manual section's own `show.emptyGroups` is never read. Only the
+        // Routines section can be switched off, so every manual section is drawn.
+        let show_empty = sections
+            .iter()
+            .find(|s| s.as_obj().is_some() && str_eq(s.get("kind"), "sessions"))
+            .and_then(|s| s.get("show"))
+            .and_then(|v| v.as_obj())
+            .and_then(|o| o.get("emptyGroups"))
+            .and_then(|v| v.as_bool())
+            == Some(true);
         let mut groups: Vec<ViewGroup> = Vec::new();
         let mut seen: HashSet<JsStr> = HashSet::new();
         for (_, _, s, id) in manual {
@@ -326,6 +356,7 @@ fn resolve_scoped(state: &Json) -> SidebarView {
                 Some(list) => member_ids(list),
                 None => scoped_members(g1, id),
             };
+            let (sort_by, ascending) = drawn_sort(s);
             groups.push(ViewGroup {
                 id: id.to_vec(),
                 name: trimmed_name(s.get("name")).or_else(|| v1.and_then(|g| trimmed_name(g.get("name")))).unwrap_or_else(|| js("Group")),
@@ -333,12 +364,7 @@ fn resolve_scoped(state: &Json) -> SidebarView {
                 section_name: Json::Null,
                 collapsed: s.get("collapsed").and_then(|v| v.as_bool()) == Some(true),
                 members,
-                extra: Some(GroupExtra {
-                    sort_by: s.get("sortBy").and_then(|v| v.as_str()).map(|v| v.to_vec()),
-                    ascending: s.get("ascending").and_then(|v| v.as_bool()),
-                    shown: s.get("shown").and_then(|v| v.as_bool()) != Some(false),
-                    show_empty: s.get("show").and_then(|v| v.as_obj()).and_then(|o| o.get("emptyGroups")).and_then(|v| v.as_bool()) == Some(true),
-                }),
+                extra: Some(GroupExtra { sort_by: Some(sort_by), ascending: Some(ascending), shown: true, show_empty }),
             });
         }
         if groups.is_empty() {
@@ -1022,12 +1048,44 @@ mod tests {
         let one = &v.groups[1];
         assert!(one.collapsed);
         assert_eq!(members(one), vec!["local_a", "local_b"]);
+        // Stored alpha + ascending, which the sidebar draws Z to A; One's own
+        // `show.emptyGroups` and Two's stored `shown: false` are not read.
         let x = one.extra.as_ref().unwrap();
         assert_eq!(x.sort_by.as_ref().map(|s| lossy(s)).as_deref(), Some("alpha"));
-        assert_eq!(x.ascending, Some(true));
-        assert!(x.shown && x.show_empty);
-        assert!(!v.groups[2].extra.as_ref().unwrap().shown);
+        assert_eq!(x.ascending, Some(false));
+        assert!(x.shown && !x.show_empty);
+        assert!(v.groups[2].extra.as_ref().unwrap().shown);
         assert_eq!(members(&v.groups[2]), vec!["local_c"]);
+    }
+
+    #[test]
+    fn the_sort_is_the_one_the_sidebar_draws() {
+        // alpha inverts the stored direction, a missing direction is false, and
+        // a sort the normalizer does not know is "recency".
+        let text = SCOPED
+            .replace(r#""sortBy": "alpha", "ascending": true"#, r#""sortBy": "alpha", "ascending": false"#)
+            .replace(r#""shown": false, "sortBy": "created", "ascending": false"#, r#""sortBy": "manual""#)
+            .replace(r#""name": " ", "order": 2, "members": []"#, r#""name": " ", "order": 2, "members": [], "sortBy": "alpha""#);
+        let sorts: Vec<(String, Option<bool>)> = view(&text)
+            .groups
+            .iter()
+            .map(|g| {
+                let x = g.extra.as_ref().unwrap();
+                (x.sort_by.as_ref().map(|s| lossy(s)).unwrap_or_default(), x.ascending)
+            })
+            .collect();
+        assert_eq!(sorts, vec![("alpha".to_string(), Some(true)), ("alpha".to_string(), Some(true)), ("recency".to_string(), Some(false))]);
+    }
+
+    #[test]
+    fn show_empty_groups_is_the_sessions_sections_setting() {
+        let on = SCOPED.replace(
+            r#"{"id": "sessions", "kind": "sessions", "name": "", "order": 5}"#,
+            r#"{"id": "sessions", "kind": "sessions", "name": "", "order": 5, "show": {"emptyGroups": true}}"#,
+        );
+        assert!(view(&on).groups.iter().all(|g| g.extra.as_ref().unwrap().show_empty));
+        // One's own `show.emptyGroups: true` is never read.
+        assert!(view(SCOPED).groups.iter().all(|g| !g.extra.as_ref().unwrap().show_empty));
     }
 
     #[test]
