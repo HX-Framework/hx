@@ -79,7 +79,12 @@ function stateWith(entry: unknown, extra: Record<string, unknown> = {}, atoms: R
 
 const item = (n: number): string => `codex:thread:local:${T(n)}`;
 
-type Group = { id: string; name: string; collapsed: boolean; sessionIds: string[] };
+type Group = { id: string; name: string; sectionName?: string; collapsed: boolean; sessionIds: string[] };
+
+/** The custom sections and Pinned, without the Projects rows and Recents. */
+function sectionsOnly(groups: Group[]): Group[] {
+  return groups.filter((g) => g.id !== "recents" && !g.id.startsWith("project:"));
+}
 
 /** The sections, without the `showEmpty` every one of them carries. */
 function plain(groups: Array<Group & { showEmpty: boolean }> | undefined): Group[] | undefined {
@@ -116,9 +121,12 @@ describe("Codex sections from the saved sidebar", () => {
         sectionOrder: ["custom:b", "agents", "pinned", "custom:a", "threads", "chats"],
       }),
     );
+    // A section the saved order misses comes after the saved order, so after
+    // Recents when the saved order names it.
     assert.deepEqual(read().groups, [
       { id: "b", name: "Beta", collapsed: true, sessionIds: [T(3)] },
       { id: "a", name: "Alpha", collapsed: false, sessionIds: [T(2), T(1)] },
+      { id: "recents", name: "Recents", collapsed: false, sessionIds: [] },
       { id: "c", name: "Not in the order", collapsed: false, sessionIds: [T(4)] },
     ]);
   });
@@ -138,7 +146,7 @@ describe("Codex sections from the saved sidebar", () => {
         sectionOrder: ["custom:a", "custom:b", "custom:e"],
       }),
     );
-    assert.deepEqual(read().groups, [
+    assert.deepEqual(sectionsOnly(read().groups), [
       { id: "a", name: "A", collapsed: false, sessionIds: [T(1)] },
       { id: "b", name: "B", collapsed: false, sessionIds: [] },
       { id: "e", name: "Empty", collapsed: false, sessionIds: [] },
@@ -180,7 +188,7 @@ describe("which account", () => {
       "environment-catalog-cache-v1": { accountId: "acct-new" },
       "electron-persisted-atom-state": { "sidebar-custom-sections-v3": { "acct-old": entry } },
     });
-    assert.deepEqual(read().groups, []);
+    assert.deepEqual(sectionsOnly(read().groups), []);
   });
 
   it("falls back to the one key of chatgpt-sidebar-state-v1, then to the only entry", () => {
@@ -191,10 +199,10 @@ describe("which account", () => {
         "chatgpt-sidebar-state-v1": { mine: {} },
       },
     });
-    assert.deepEqual(read().groups.map((g) => g.name), ["Mine"]);
+    assert.deepEqual(sectionsOnly(read().groups).map((g) => g.name), ["Mine"]);
     resetCodexSectionsCacheForTests();
     writeState({ "electron-persisted-atom-state": { "sidebar-custom-sections-v3": { solo: entry } } });
-    assert.deepEqual(read().groups.map((g) => g.name), ["Mine"]);
+    assert.deepEqual(sectionsOnly(read().groups).map((g) => g.name), ["Mine"]);
   });
 
   it("with several accounts and nothing naming one, uses the app-server's sections, oldest first", () => {
@@ -211,7 +219,7 @@ describe("which account", () => {
       ],
     );
     writeState({ "electron-persisted-atom-state": { "sidebar-custom-sections-v3": { one: entry, two: entry } } });
-    assert.deepEqual(plain(buildCodexSections([home])?.groups), [
+    assert.deepEqual(sectionsOnly(plain(buildCodexSections([home])?.groups)!), [
       { id: "s1", name: "First", collapsed: false, sessionIds: [] },
       { id: "s2", name: "Second", collapsed: false, sessionIds: [T(2), T(1)] },
     ]);
@@ -224,14 +232,14 @@ describe("which account", () => {
 });
 
 describe("Pinned", () => {
-  it("is the app-server's pinned list by position, then unmigrated legacy pins, then pinned projects; placed where the order puts it", () => {
+  it("is the app-server's pinned list by position, then unmigrated legacy pins, then each pinned project as a row; placed where the order puts it", () => {
     makeDb([
       { id: T(1), section: CODEX_PINNED_SECTION_ID, position: 2 },
       { id: T(2), section: CODEX_PINNED_SECTION_ID, position: 1 },
       { id: T(3), section: CODEX_PINNED_SECTION_ID, position: 3, archived: 1 },
       { id: T(4) },
       { id: T(5) },
-      { id: T(6), cwd: "/work/pinned-project/src", recency: 5 },
+      { id: T(6), cwd: "/work/pinned-project", recency: 5 },
     ]);
     writeState(
       stateWith(
@@ -246,33 +254,35 @@ describe("Pinned", () => {
     );
     assert.deepEqual(read().groups, [
       { id: "a", name: "A", collapsed: false, sessionIds: [T(5)] },
-      { id: "pinned", name: "Pinned", collapsed: false, sessionIds: [T(2), T(1), T(4), T(6)] },
+      { id: "pinned", name: "Pinned", collapsed: false, sessionIds: [T(2), T(1), T(4)] },
+      { id: "project:p1", name: "pinned-project", sectionName: "Pinned", collapsed: false, sessionIds: [T(6)] },
+      { id: "recents", name: "Recents", collapsed: false, sessionIds: [] },
     ]);
   });
 
   it("comes first when the saved order does not place it, and is left out when empty", () => {
     makeDb([{ id: T(1), section: CODEX_PINNED_SECTION_ID, position: 1 }, { id: T(2) }]);
     writeState(stateWith({ sections: [{ id: "a", name: "A", itemKeys: [item(2)] }], collapsedSectionIds: [], sectionOrder: ["custom:a"] }));
-    assert.deepEqual(read().groups.map((g) => g.id), ["pinned", "a"]);
+    assert.deepEqual(sectionsOnly(read().groups).map((g) => g.id), ["pinned", "a"]);
     resetCodexSectionsCacheForTests();
     makeDb([{ id: T(2) }], [], "state_6.sqlite");
-    assert.deepEqual(read().groups.map((g) => g.id), ["a"]);
+    assert.deepEqual(sectionsOnly(read().groups).map((g) => g.id), ["a"]);
   });
 });
 
 describe("a project placed in a section", () => {
   const projects = {
     "local-projects": {
-      lf: { id: "lf", name: "acme", rootPaths: ["/work/acme/"] },
+      lf: { id: "lf", name: "acme", rootPaths: ["/work/acme"] },
       wt: { id: "wt", name: "a worktree", rootPaths: ["/work/acme/.claude/worktrees/wt"] },
     },
   };
 
-  it("brings assigned threads and threads under the project's root (deepest root wins), not projectless ones", () => {
+  it("brings assigned threads and threads whose cwd is its root, never a subfolder's or a projectless one's", () => {
     makeDb([
       { id: T(1), cwd: "/elsewhere", recency: 10 }, // assigned to lf
       { id: T(2), cwd: "/work/acme", recency: 30 },
-      { id: T(3), cwd: "/work/acme/apps/x", recency: 20 },
+      { id: T(3), cwd: "/work/acme/apps/x", recency: 20 }, // a subfolder: no project
       { id: T(4), cwd: "/work/acme/.claude/worktrees/wt", recency: 40 }, // the worktree's own project
       { id: T(5), cwd: "/work/acme", recency: 50 }, // projectless
       { id: T(6), cwd: "/work/acme", recency: 60 }, // assigned to wt
@@ -288,10 +298,14 @@ describe("a project placed in a section", () => {
         },
       ),
     );
-    assert.deepEqual(read().groups[0]!.sessionIds, [T(2), T(3), T(1)]);
+    assert.deepEqual(read().groups, [
+      { id: "old", name: "OLD", collapsed: false, sessionIds: [T(2), T(1)] },
+      { id: "project:wt", name: "a worktree", sectionName: "Projects", collapsed: false, sessionIds: [T(6), T(4)] },
+      { id: "recents", name: "Recents", collapsed: false, sessionIds: [T(7), T(5), T(3)] },
+    ]);
   });
 
-  it("orders threads missing from the saved order first, newest first, then the saved order; newest first when not sorted by hand", () => {
+  it("orders threads newest first, or with the manual sort (version 1) the saved order first and the rest newest first", () => {
     const rows = [
       { id: T(1), cwd: "/work/acme", recency: 10 },
       { id: T(2), cwd: "/work/acme", recency: 20 },
@@ -301,11 +315,155 @@ describe("a project placed in a section", () => {
     makeDb(rows);
     const entry = { sections: [{ id: "old", name: "OLD", itemKeys: ["codex:project:lf"] }], collapsedSectionIds: [], sectionOrder: [] };
     const extra = { ...projects, "sidebar-project-thread-orders": { lf: { threadIds: [T(1), "gone", T(3), T(1)] } } };
-    writeState(stateWith(entry, extra, { "flat-project-sidebar-preferences-v1": { projectSortMode: "manual" } }));
-    assert.deepEqual(read().groups[0]!.sessionIds, [T(4), T(2), T(1), T(3)]);
-    resetCodexSectionsCacheForTests();
-    writeState(stateWith(entry, extra, { "flat-project-sidebar-preferences-v1": { projectSortMode: "updated_at" } }));
-    assert.deepEqual(read().groups[0]!.sessionIds, [T(4), T(3), T(2), T(1)]);
+    const old = (prefs: unknown): string[] => {
+      resetCodexSectionsCacheForTests();
+      writeState(stateWith(entry, extra, { "flat-project-sidebar-preferences-v1": prefs }));
+      return read().groups.find((g) => g.id === "old")!.sessionIds;
+    };
+    // Codex reads a manual sort without manualSortVersion 1 as updated_at.
+    assert.deepEqual(old({ projectSortMode: "manual" }), [T(4), T(3), T(2), T(1)]);
+    assert.deepEqual(old({ projectSortMode: "manual", manualSortVersion: 1 }), [T(1), T(3), T(4), T(2)]);
+    assert.deepEqual(old({ projectSortMode: "updated_at" }), [T(4), T(3), T(2), T(1)]);
+  });
+});
+
+describe("Projects and Recents", () => {
+  const local = (id: string, root: string, extra: Record<string, unknown> = {}) => ({ id, name: `  ${id.toUpperCase()}  `, rootPaths: [root], ...extra });
+
+  it("draws a row per project, project-order after the projects it misses, empty rows too, collapsed by its atom; Recents holds the rest", () => {
+    makeDb([
+      { id: T(1), cwd: "/w/one", recency: 10 },
+      { id: T(2), cwd: "/w/two", recency: 20 },
+      { id: T(3), cwd: "/w/one/sub", recency: 30 },
+      { id: T(4), cwd: `${process.env.HOME ?? "/Users/x"}/Documents/Codex/2026-10-01-a-chat`, recency: 40 },
+      { id: T(5), recency: 50 },
+    ]);
+    writeState(
+      stateWith(
+        { sections: [], collapsedSectionIds: [], sectionOrder: [] },
+        { "local-projects": { p1: local("p1", "/w/one"), p2: local("p2", "/w/two"), p3: local("p3", "/w/three") }, "project-order": ["p3", "p1", "gone"] },
+        { "sidebar-project-expanded-v1-codex:p1": false, "sidebar-project-expanded-v1-codex:p2": true },
+      ),
+    );
+    assert.deepEqual(read().groups, [
+      { id: "project:p2", name: "P2", sectionName: "Projects", collapsed: false, sessionIds: [T(2)] },
+      { id: "project:p3", name: "P3", sectionName: "Projects", collapsed: false, sessionIds: [] },
+      { id: "project:p1", name: "P1", sectionName: "Projects", collapsed: true, sessionIds: [T(1)] },
+      { id: "recents", name: "Recents", collapsed: false, sessionIds: [T(5), T(4), T(3)] },
+    ]);
+  });
+
+  it("files a Codex worktree under the root Codex saved for it, hides a thread assigned to a gone project, and leaves a ChatGPT one projectless", () => {
+    makeDb([
+      { id: T(1), cwd: join(home, "worktrees", "a1b2", "acme"), recency: 10 },
+      { id: T(2), cwd: "/w/nowhere", recency: 20 },
+      { id: T(3), cwd: "/w/nowhere", recency: 30 },
+      { id: T(4), cwd: "/W/One", recency: 40 }, // case and separators do not matter
+    ]);
+    writeState(
+      stateWith(
+        { sections: [], collapsedSectionIds: [], sectionOrder: [] },
+        {
+          "local-projects": { p1: local("p1", "/w/one") },
+          "thread-workspace-root-hints": { [T(1)]: "/w/one" },
+          "thread-project-assignments": {
+            [T(2)]: { projectKind: "local", projectId: "gone" },
+            [T(3)]: { projectKind: "local", projectId: "gone", projectOrigin: "chatgpt" },
+          },
+        },
+      ),
+    );
+    assert.deepEqual(read().groups, [
+      { id: "project:p1", name: "P1", sectionName: "Projects", collapsed: false, sessionIds: [T(4), T(1)] },
+      { id: "recents", name: "Recents", collapsed: false, sessionIds: [T(3)] },
+    ]);
+  });
+
+  it("leaves the pinned and the section-placed projects out of Projects, and their threads out of Recents", () => {
+    makeDb([
+      { id: T(1), cwd: "/w/one", recency: 10 },
+      { id: T(2), cwd: "/w/two", recency: 20 },
+      { id: T(3), cwd: "/w/three", recency: 30 },
+      { id: T(4), cwd: "/w/three", recency: 40 },
+    ]);
+    writeState(
+      stateWith(
+        { sections: [{ id: "s", name: "S", itemKeys: ["codex:project:p2", item(4)] }], collapsedSectionIds: [], sectionOrder: ["custom:s"] },
+        {
+          "local-projects": { p1: local("p1", "/w/one"), p2: local("p2", "/w/two"), p3: local("p3", "/w/three") },
+          "pinned-project-ids": ["p1", "missing"],
+        },
+        { "sidebar-collapsed-sections-v1": { pinned: false, threads: true, chats: true } },
+      ),
+    );
+    assert.deepEqual(read().groups, [
+      { id: "project:p1", name: "P1", sectionName: "Pinned", collapsed: false, sessionIds: [T(1)] },
+      { id: "s", name: "S", collapsed: false, sessionIds: [T(2), T(4)] },
+      { id: "project:p3", name: "P3", sectionName: "Projects", collapsed: true, sessionIds: [T(3)] },
+      { id: "recents", name: "Recents", collapsed: true, sessionIds: [] },
+    ]);
+  });
+
+  it("in list mode draws no Projects, and Recents holds every thread but the pinned and the section ones", () => {
+    makeDb([
+      { id: T(1), cwd: "/w/one", recency: 10 },
+      { id: T(2), recency: 20 },
+    ]);
+    writeState(
+      stateWith(
+        { sections: [], collapsedSectionIds: [], sectionOrder: [] },
+        { "local-projects": { p1: local("p1", "/w/one") } },
+        { "flat-project-sidebar-preferences-v1": { mode: "list", initialized: true } },
+      ),
+    );
+    assert.deepEqual(read().groups, [{ id: "recents", name: "Recents", collapsed: false, sessionIds: [T(2), T(1)] }]);
+  });
+
+  it("puts Recents first when Codex is set to, keeping the rows' threads in the rows", () => {
+    makeDb([
+      { id: T(1), cwd: "/w/one", recency: 10 },
+      { id: T(2), recency: 20 },
+    ]);
+    writeState(
+      stateWith(
+        { sections: [], collapsedSectionIds: [], sectionOrder: [] },
+        { "local-projects": { p1: local("p1", "/w/one") } },
+        { "projectless-sidebar-chats-first-v1": true },
+      ),
+    );
+    assert.deepEqual(read().groups.map((g) => [g.id, g.sessionIds]), [
+      ["recents", [T(2)]],
+      ["project:p1", [T(1)]],
+    ]);
+  });
+
+  it("orders Recents by its saved order when sorted by hand (version 1): the threads it misses first", () => {
+    makeDb([1, 2, 3].map((n) => ({ id: T(n), recency: n * 10 })));
+    writeState(
+      stateWith(
+        { sections: [], collapsedSectionIds: [], sectionOrder: [] },
+        {},
+        {
+          "flat-project-sidebar-preferences-v1": { chatSortMode: "manual", manualSortVersion: 1, initialized: true },
+          "unified-sidebar-chat-order-v1": [item(1), item(2)],
+        },
+      ),
+    );
+    assert.deepEqual(read().groups[0]!.sessionIds, [T(3), T(1), T(2)]);
+  });
+
+  it("does not list a thread ChatGPT hides or one spawned by another thread", () => {
+    const p = makeDb([
+      { id: T(1), recency: 10 },
+      { id: T(2), recency: 20, threadSource: "chatgpt_hidden" },
+      { id: T(3), recency: 30 },
+    ]);
+    const db = new Database(p);
+    db.run("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL)");
+    db.run("INSERT INTO thread_spawn_edges VALUES (?, ?, 'done')", [T(1), T(3)]);
+    db.close();
+    writeState(stateWith({ sections: [], collapsedSectionIds: [], sectionOrder: [] }));
+    assert.deepEqual(read().groups, [{ id: "recents", name: "Recents", collapsed: false, sessionIds: [T(1)] }]);
   });
 });
 
