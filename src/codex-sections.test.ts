@@ -9,7 +9,6 @@ import {
   buildCodexSections,
   CODEX_GLOBAL_STATE,
   CODEX_PINNED_SECTION_ID,
-  immutableDbUri,
   isCodexSidebarFile,
   readCodexStateDb,
   resetCodexSectionsCacheForTests,
@@ -347,11 +346,6 @@ describe("reading", () => {
     assert.equal(buildCodexSections([home])?.groups[0], first?.groups[0]);
     writeState(stateWith({ sections: [{ id: "a", name: "Renamed in Codex", itemKeys: [item(1)] }], collapsedSectionIds: [], sectionOrder: [] }));
     assert.equal(buildCodexSections([home])?.groups[0]?.name, "Renamed in Codex");
-  });
-
-  it("builds a SQLite URI that survives special characters and Windows drives", () => {
-    assert.equal(immutableDbUri("/a b/c%d?e#f.sqlite"), "file:/a b/c%25d%3fe%23f.sqlite?immutable=1");
-    assert.equal(immutableDbUri("C:\\Users\\x\\.codex\\state_5.sqlite"), "file:/C:/Users/x/.codex/state_5.sqlite?immutable=1");
   });
 
   it("older schemas without the newer columns still read", () => {

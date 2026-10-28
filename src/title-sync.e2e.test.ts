@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { runTitleSyncSweep } from "./title-sync.js";
+import { runTitleSyncSweep, TITLE_SYNC_VERSION } from "./title-sync.js";
 import { getFileState, resetStateCache, setStateDirForTests, upsertFileState } from "./state.js";
 import { resetCodexTitleCacheForTests } from "./codex-titles.js";
 import type { FileState } from "./state.js";
@@ -122,7 +122,7 @@ describe("title-sync sweep — daemon E2E (codex simulated via a real state_5.sq
     });
     assert.equal(summary.queued, 1);
     // Stamped so a second start is a no-op.
-    assert.equal((await getFileState(rollout, "main"))?.titleSyncVersion, 1);
+    assert.equal((await getFileState(rollout, "main"))?.titleSyncVersion, TITLE_SYNC_VERSION);
   });
 
   it("falls back to the auto title (source 'ai') when there is no rename", async () => {
@@ -159,6 +159,27 @@ describe("title-sync sweep — daemon E2E (codex simulated via a real state_5.sq
     assert.equal(summary.skipped, 1);
   });
 
+  it("sends the name of a session an earlier sweep stamped while Codex had its database closed", async () => {
+    // Before 77.16.1 the reader could not open an idle database (WAL mode, no
+    // -wal file), so the sweep found no name and stamped the file under v1.
+    const sessionId = crypto.randomUUID();
+    seedCodexDb(sessionId, "auto", "Named in Codex");
+    const p = join(codexHome, "state_5.sqlite");
+    const db = new Database(p);
+    db.exec("PRAGMA journal_mode = WAL");
+    db.close();
+    for (const f of [`${p}-wal`, `${p}-shm`]) if (existsSync(f)) unlinkSync(f);
+    const rollout = seedRollout(sessionId);
+    await upsertFileState({ ...uploaded(rollout, sessionId, { letai: 42 }), titleSyncVersion: 1 }, "main");
+
+    const { seen } = captureRetitle();
+    await runTitleSyncSweep(cfg, "main", log);
+
+    assert.equal(seen.length, 1, "the stamped file is swept again");
+    assert.deepEqual(seen[0]!.items[0], { family: "codex-cli", sessionId, title: "Named in Codex", titleSource: "user", destinations: [null] });
+    assert.equal((await getFileState(rollout, "main"))?.titleSyncVersion, TITLE_SYNC_VERSION);
+  });
+
   it("stamps but does not POST a session codex has no name for; skips a file with no upload state", async () => {
     // (a) uploaded, but codex has neither name nor title → stamped, not sent.
     const noName = crypto.randomUUID();
@@ -175,6 +196,6 @@ describe("title-sync sweep — daemon E2E (codex simulated via a real state_5.sq
 
     assert.equal(seen.length, 0, "nothing POSTed");
     assert.equal(summary.noTitle, 1);
-    assert.equal((await getFileState(rNoName, "main"))?.titleSyncVersion, 1);
+    assert.equal((await getFileState(rNoName, "main"))?.titleSyncVersion, TITLE_SYNC_VERSION);
   });
 });

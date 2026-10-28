@@ -91,6 +91,10 @@ export function normalizeText(input: string, ctx: NormalizeContext): string {
   // and its failure count climbs with every retry the run had time for:
   // both follow timing. The reason — and the hold it names — is the fact.
   s = s.replace(/waiting out a retry backoff for another \d+ min \(\d+ consecutive failures/g, "waiting out a retry backoff for another <n> min (<n> consecutive failures");
+  // The Codex title sweep names its own version (2 from hx 77.16.1 and hx2
+  // 78.0.6, which re-sweep once). A fresh home sweeps every file under either,
+  // so the counts after it are the fact.
+  s = s.replace(/\[retitle\] v\d+:/g, "[retitle] v<n>:");
   // Daemon pids, launch tokens, session tokens, sha prefixes.
   s = s.replace(/\bpid \d+/g, "pid <n>");
   s = s.replace(/#k=[A-Za-z0-9_-]+/g, "#k=<token>");
@@ -151,6 +155,9 @@ export function normalizeJson(value: unknown, ctx: NormalizeContext, opts: JsonO
       if (TOKEN_KEYS.has(k) && typeof v === "string") out[nk] = "<token>";
       else if (MEASURE_KEYS.has(k) && typeof v === "number") out[nk] = "<measured>";
       else if (k === "quality" && typeof v === "string") out[nk] = "<quality>";
+      // The Codex title sweep stamps each file with its own version (see the
+      // `[retitle] v<n>:` line above): that the file was swept is the fact.
+      else if (k === "titleSyncVersion" && typeof v === "number") out[nk] = "<sweep version>";
       else out[nk] = normalizeJson(v, ctx, opts);
     }
     return out;

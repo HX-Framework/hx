@@ -37,10 +37,9 @@
 // set of sections, and a partial read would move every section it missed to
 // "past" on the server.
 
-import { constants, Database } from "bun:sqlite";
 import { existsSync, readFileSync, statSync, watch, type FSWatcher } from "node:fs";
 import path from "node:path";
-import { codexStateDbPath } from "./codex-titles.js";
+import { codexStateDbPath, openCodexStateDb } from "./codex-titles.js";
 import type { HxCodexSection, HxCodexSidebarBlob } from "./mirror-types.js";
 
 export const CODEX_GLOBAL_STATE = ".codex-global-state.json";
@@ -79,29 +78,10 @@ export interface CodexDbRead {
   members: Map<string, string[]>;
 }
 
-/** A SQLite URI that opens `p` read-only and ignores any WAL. */
-export function immutableDbUri(p: string): string {
-  let u = p.replace(/\\/g, "/");
-  if (/^[A-Za-z]:\//.test(u)) u = `/${u}`;
-  u = u.replace(/%/g, "%25").replace(/\?/g, "%3f").replace(/#/g, "%23");
-  return `file:${u}?immutable=1`;
-}
-
-// Codex's app-server closes the database when it has nothing to do, and the
-// last close checkpoints the WAL and deletes the -wal and -shm files. A
-// read-only connection cannot open a WAL database in that state (SQLite
-// answers "unable to open database file"), so with no -wal file the database
-// is opened immutable: everything is in the main file then. With a -wal file
-// the ordinary read-only open also sees the writes not yet checkpointed.
-function openStateDb(dbPath: string): Database {
-  if (existsSync(`${dbPath}-wal`)) return new Database(dbPath, { readonly: true });
-  return new Database(immutableDbUri(dbPath), constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI);
-}
-
 /** Everything the sections need from the database. Throws when it cannot be read. */
 export function readCodexStateDb(dbPath: string): CodexDbRead {
   const out: CodexDbRead = { threads: new Map(), sections: [], members: new Map() };
-  const db = openStateDb(dbPath);
+  const db = openCodexStateDb(dbPath);
   try {
     const tables = new Set(
       (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: unknown }>).map((r) => r.name),
