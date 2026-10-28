@@ -147,6 +147,7 @@ export interface Manifest {
 export interface ExpectedCodexSection {
   id: string;
   name: string;
+  sectionName?: string;
   collapsed: boolean;
   sessionIds: string[];
   showEmpty: boolean;
@@ -408,11 +409,20 @@ const CODEX_PINNED_SECTION_ID = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
  *             subagent thread and c3 (no row: deleted) are left out
  *   Pinned    the app-server's pinned thread, then an older pin it has not
  *             taken over yet
- *   Old work  (collapsed) the project placed in it: x1 under the repo's
- *             root first (newest, missing from the saved order), then c2
- *             (assigned to the project by hand, the saved order); c1 is
- *             under the root too but Review keeps it
+ *   Old work  (collapsed) the project placed in it, newest first (a manual
+ *             sort without manualSortVersion 1 reads as updated_at): a
+ *             thread in a Codex worktree that Codex filed under the repo
+ *             (thread-workspace-root-hints), then c2 (assigned by hand); c1's
+ *             cwd is the repo's root too, but Review keeps it
  *   Empty     no threads
+ *   Projects  a row per project neither pinned nor placed in a section, in
+ *             project-order: tools (collapsed by its row atom) with its one
+ *             thread, then notes, drawn empty (its threads are pinned, in a
+ *             section, filed under the repo, hidden or spawned)
+ *   Recents   the rest, newest first: a thread in a subfolder of the repo
+ *             (Codex matches a cwd to a root by equality only) and one in a
+ *             dated ~/Documents/Codex folder; a thread assigned to a project
+ *             that is gone shows nowhere
  * The other account's section never shows. The change written during a run
  * renames Review, collapses it, and moves its second thread into Empty.
  */
@@ -420,6 +430,10 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
   const rng = new Prng("codex-sections");
   const [c1, c2, c3, c4] = ids as [string, string, string, string];
   const x = { listed: rng.uuid(), archived: rng.uuid(), subagent: rng.uuid(), underRoot: rng.uuid(), pinned: rng.uuid(), oldPin: rng.uuid() };
+  // A generator of its own, so the threads above keep their ids.
+  const rng2 = new Prng("codex-projects");
+  const y = { worktree: rng2.uuid(), dated: rng2.uuid(), hidden: rng2.uuid(), spawned: rng2.uuid(), orphan: rng2.uuid(), tools: rng2.uuid() };
+  const toolsRoot = join(ctx.home, "work", "tools");
   const row = (id: string, o: { archived?: number; source?: string; threadSource?: string; cwd: string; recency: number; section?: string; position?: number }): void => {
     db.run(
       "INSERT INTO threads (id, title, created_at, archived, source, preview, thread_source, cwd, recency_at_ms, thread_section_id, section_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -436,6 +450,14 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
   row(x.underRoot, { cwd: join(dirs.repo, "packages", "core"), recency: CONTENT_EPOCH + 7 * HOUR });
   row(x.pinned, { cwd: dirs.scratch, recency: CONTENT_EPOCH + 2 * HOUR, section: CODEX_PINNED_SECTION_ID, position: 1000 });
   row(x.oldPin, { cwd: dirs.scratch, recency: CONTENT_EPOCH + HOUR });
+  row(y.worktree, { cwd: join(ctx.home, ".codex", "worktrees", "k3f9", "acme-repo"), recency: CONTENT_EPOCH + 6 * HOUR });
+  row(y.dated, { cwd: join(ctx.home, "Documents", "Codex", "2026-10-12-sketch"), recency: CONTENT_EPOCH + 5 * HOUR });
+  row(y.hidden, { threadSource: "chatgpt_hidden", cwd: dirs.scratch, recency: CONTENT_EPOCH + 4 * HOUR });
+  row(y.spawned, { cwd: dirs.scratch, recency: CONTENT_EPOCH + 3 * HOUR });
+  row(y.orphan, { cwd: join(dirs.scratch, "orphan"), recency: CONTENT_EPOCH + 4.5 * HOUR });
+  row(y.tools, { cwd: toolsRoot, recency: CONTENT_EPOCH + 2.5 * HOUR });
+  db.run("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL)");
+  db.run("INSERT INTO thread_spawn_edges VALUES (?, ?, 'completed')", [c1, y.spawned]);
   void c4; // archived, under the repo's root: never listed
 
   const item = (id: string): string => `codex:thread:local:${id}`;
@@ -445,8 +467,11 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
     "local-projects": {
       "local-repo": { id: "local-repo", name: "acme-repo", rootPaths: [dirs.repo], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
       "local-scratch": { id: "local-scratch", name: "notes", rootPaths: [dirs.scratch], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
+      "local-tools": { id: "local-tools", name: " tools ", rootPaths: [toolsRoot], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
     },
-    "thread-project-assignments": { [c2]: { projectKind: "local", projectId: "local-repo" } },
+    "project-order": ["local-tools", "local-scratch"],
+    "thread-project-assignments": { [c2]: { projectKind: "local", projectId: "local-repo" }, [y.orphan]: { projectKind: "local", projectId: "local-gone" } },
+    "thread-workspace-root-hints": { [y.worktree]: dirs.repo },
     "projectless-thread-ids": [],
     "sidebar-project-thread-orders": { "local-repo": { threadIds: [c2, x.subagent] } },
     "pinned-thread-ids": [x.oldPin, x.pinned],
@@ -472,6 +497,8 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
       },
       "chatgpt-sidebar-state-v1": { "acct-fixture": { pinnedConversations: [], projects: [], pinnedProjects: [] } },
       "flat-project-sidebar-preferences-v1": { chatSortMode: "updated_at", initialized: true, mode: "project", projectSortMode: "manual" },
+      "sidebar-project-expanded-v1-codex:local-tools": false,
+      "sidebar-collapsed-sections-v1": { chats: false, pinned: false, threads: false },
     },
   });
   const reviewItems = [item(c1), item(x.listed), item(x.archived), item(x.subagent), item(c3)];
@@ -480,10 +507,12 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
   ctx.manifest.codexChange = { file: ".codex/.codex-global-state.json", contentBase64: Buffer.from(JSON.stringify(changed)).toString("base64") };
   ctx.manifest.codexHome = true;
   const section = (id: string, name: string, collapsed: boolean, sessionIds: string[]): ExpectedCodexSection => ({ id, name, collapsed, sessionIds, showEmpty: true });
+  const projectRow = (pid: string, name: string, collapsed: boolean, sessionIds: string[]): ExpectedCodexSection => ({ id: `project:${pid}`, name, sectionName: "Projects", collapsed, sessionIds, showEmpty: true });
   const pinned = section("pinned", "Pinned", false, [x.pinned, x.oldPin]);
-  const old = section("sec-old", "Old work", true, [x.underRoot, c2]);
-  ctx.manifest.expectations.codexSections = [section("sec-review", "Review", false, [c1, x.listed]), pinned, old, section("sec-empty", "Empty", false, [])];
-  ctx.manifest.expectations.codexSectionsAfterChange = [section("sec-review", "Review this week", true, [c1]), pinned, old, section("sec-empty", "Empty", false, [x.listed])];
+  const old = section("sec-old", "Old work", true, [y.worktree, c2]);
+  const below = [projectRow("local-tools", "tools", true, [y.tools]), projectRow("local-scratch", "notes", false, []), section("recents", "Recents", false, [x.underRoot, y.dated])];
+  ctx.manifest.expectations.codexSections = [section("sec-review", "Review", false, [c1, x.listed]), pinned, old, section("sec-empty", "Empty", false, []), ...below];
+  ctx.manifest.expectations.codexSectionsAfterChange = [section("sec-review", "Review this week", true, [c1]), pinned, old, section("sec-empty", "Empty", false, [x.listed]), ...below];
 }
 
 function codexRollout(spec: CodexSessionSpec): { name: string; content: string } {

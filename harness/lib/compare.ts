@@ -238,16 +238,29 @@ const GROUP_MIRROR_LINE = /\[groups\] (synced \d+ CCD group\(s\)(, \d+ Codex sec
 
 /** The first versions that send Codex Desktop's sections in the group mirror. */
 const CODEX_SECTIONS: Record<BinaryName, [number, number, number]> = { hx: [77, 15, 0], hx2: [78, 0, 2] };
+/** The first versions that send the rest of Codex's sidebar too (its project
+ *  rows and Recents) and match a thread to a project as Codex does. */
+const CODEX_PROJECTS: Record<BinaryName, [number, number, number]> = { hx: [77, 16, 2], hx2: [78, 0, 7] };
+
+/** Is this run's binary at least `since[name]`? A version that cannot be read is. */
+function atLeast(meta: Pick<RunMeta, "name" | "version">, since: Record<BinaryName, [number, number, number]>): boolean {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
+  if (!m) return true;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const s = since[meta.name] ?? since.hx;
+  for (let i = 0; i < 3; i++) if (v[i] !== s[i]) return v[i]! > s[i]!;
+  return true;
+}
 
 /** Does this run's binary send Codex Desktop's sections in the group mirror
  *  (`codex`)? A version that cannot be read is held to it. */
 export function sendsCodexSections(meta: Pick<RunMeta, "name" | "version">): boolean {
-  const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
-  if (!m) return true;
-  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
-  const since = CODEX_SECTIONS[meta.name] ?? CODEX_SECTIONS.hx;
-  for (let i = 0; i < 3; i++) if (v[i] !== since[i]) return v[i]! > since[i]!;
-  return true;
+  return atLeast(meta, CODEX_SECTIONS);
+}
+
+/** Does it send Codex's whole sidebar, project rows and Recents included? */
+export function drawsCodexProjects(meta: Pick<RunMeta, "name" | "version">): boolean {
+  return atLeast(meta, CODEX_PROJECTS);
 }
 
 /** The first versions that send each group's side sessions (`sideSessions`). */
@@ -290,19 +303,21 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   // (fixtureExpectationChecks), so for such a reference those three facts
   // leave the comparison; for a reference that reads the store they stay.
   //
-  // Codex Desktop's sections ride in the same upload (77.15 / hx2 78.0.2): a
-  // reference that sends no `codex` uploads another body, logs another
-  // [groups] line, keeps another hash and makes no upload when only Codex
-  // changed, so the same three facts leave the comparison against it. So do
-  // a group's side sessions (77.16.0 / hx2 78.0.5) on the per-account store.
+  // Codex Desktop's sidebar rides in the same upload (sections since 77.15 /
+  // hx2 78.0.2; project rows and Recents since 77.16.2 / hx2 78.0.7): a
+  // reference that sends no `codex`, or an older one, uploads another body,
+  // logs another [groups] line, keeps another hash and makes another upload
+  // when only Codex changed, so the same three facts leave the comparison.
+  // So do a group's side sessions (77.16.0 / hx2 78.0.5) on the per-account
+  // store.
   const scopedExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !readsScopedCcdStore(ref.meta);
-  const codexExempt = !sendsCodexSections(ref.meta);
+  const codexExempt = !drawsCodexProjects(ref.meta);
   const sideExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !sendsSideSessions(ref.meta);
   const mirrorExempt = scopedExempt || codexExempt || sideExempt;
   if (mirrorExempt) {
     const why = [
       ...(scopedExempt ? ["the per-account Claude Desktop mirror (hx 77.15.1, hx2 78.0.3)"] : []),
-      ...(codexExempt ? ["Codex Desktop's sections in the mirror"] : []),
+      ...(codexExempt ? ["Codex Desktop's whole sidebar in the mirror (hx 77.16.2, hx2 78.0.7)"] : []),
       ...(sideExempt ? ["side sessions in the mirror (hx 77.16.0, hx2 78.0.5)"] : []),
     ].join(" and ");
     checks.push({
@@ -821,7 +836,9 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   // Codex does, the changed sections must follow within 3 s: the watch on the
   // Codex home, not the 20 s mirror timer, which never fires in the run. A
   // client before 77.15 (hx2 before 78.0.2) sends no `codex` and is not held
-  // to it.
+  // to it, nor is one before 77.16.2 (hx2 78.0.7), whose `codex` has no
+  // project rows or Recents and files a thread under a project by its folder
+  // rather than as Codex does.
   const codexOf = (r: RecordedRequest | undefined): unknown => {
     const m = mirrorOf(r);
     return m && "codex" in m ? m.codex : undefined;
@@ -829,6 +846,8 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   const withCodex = mirrors.filter((r) => codexOf(r) !== undefined);
   if (!sendsCodexSections(run.meta)) {
     checks.push({ name: "fixture: codex sections in the group mirror", ok: true, details: `${run.meta.name} ${run.meta.version} predates Codex sections in the mirror: not held to them` });
+  } else if (!drawsCodexProjects(run.meta)) {
+    checks.push({ name: "fixture: codex sections in the group mirror", ok: true, details: `${run.meta.name} ${run.meta.version} predates Codex's project rows and Recents in the mirror: not held to the fixture` });
   } else if (withCodex.length === 0) {
     checks.push({ name: "fixture: codex sections in the group mirror", ok: false, details: "no successful group mirror upload carried `codex`" });
   } else {
@@ -837,7 +856,7 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
       check(
         "fixture: codex sections in the group mirror",
         deepDiff(codexOf(withCodex[0]), want, 0),
-        want ? `${want.groups.length} sections, ${want.groups.reduce((n, g) => n + g.sessionIds.length, 0)} threads, from the saved sidebar` : "no Codex home: null",
+        want ? `${want.groups.length} groups, ${want.groups.reduce((n, g) => n + g.sessionIds.length, 0)} threads, from the saved sidebar` : "no Codex home: null",
       ),
     );
     const changed = run.meta.steps.find((s) => s.codexChangeTMs !== undefined);
