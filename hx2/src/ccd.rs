@@ -894,7 +894,11 @@ impl CcdIndex {
         // before the file pass (the client deletes them as it goes; nothing
         // between the two passes reads the index).
         let mut gone: HashSet<PathKey> = HashSet::new();
+        // A store can hold tens of thousands of files, read under the index
+        // lock every upload waits on; each directory and file beats, as hx's
+        // awaited reads let its event loop beat (watchdog.rs).
         for d in &dirs {
+            crate::watchdog::beat();
             let id = self.paths.intern(d.as_bytes());
             seen.insert(id);
             match stat_safe(Path::new(d)) {
@@ -947,6 +951,7 @@ impl CcdIndex {
         }
         let mut missing: HashSet<PathKey> = HashSet::new();
         for p in to_stat {
+            crate::watchdog::beat();
             let full = self.paths.path_string(&p);
             match stat_safe(Path::new(&full)) {
                 Some(s) if !s.is_dir => {
