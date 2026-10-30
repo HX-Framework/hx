@@ -39,7 +39,14 @@ long-running `hx watch` killed with SIGKILL, or a long-running `hx watch` left
 to run for a fixed time (a transcript may grow while it runs) and then
 stopped with SIGTERM. The reference runs first, then the candidate, both
 against the same home path (transcript contents embed their cwd, so the
-stored bytes must match byte for byte).
+stored bytes must match byte for byte). HOME isolates everything a binary
+touches except launchd, which keeps one domain per user whatever HOME says:
+on a Mac, a step that starts, restarts or stops the service (`update`,
+`start`, `restart`, `stop`, `uninstall`, `connect` without `--no-start`)
+would replace the Mac's own `ai.let.hx-vision` job with the fixture's. So the
+driver refuses such a scenario on macOS outside GitHub Actions
+(`serviceSteps` in `run/run-scenario.ts`); on 2026-10-28 a local `baseline`
+run left a Mac's daemon down for two days.
 
 ### Fixture shapes
 

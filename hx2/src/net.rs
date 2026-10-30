@@ -397,6 +397,38 @@ impl Write for Conn {
     }
 }
 
+/// The connection as `exchange` drives it: every block sent or received
+/// renews the watchdog's network wait, so an upload or a download that keeps
+/// moving is never read as a freeze, however long it takes.
+struct Watched<'a> {
+    conn: &'a mut Conn,
+    wait: &'a crate::watchdog::NetworkWait,
+}
+
+impl Read for Watched<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.conn.read(buf)?;
+        if n > 0 {
+            self.wait.progress();
+        }
+        Ok(n)
+    }
+}
+
+impl Write for Watched<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.conn.write(buf)?;
+        if n > 0 {
+            self.wait.progress();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.conn.flush()
+    }
+}
+
 /// Idle keep-alive connections by origin — what Bun's fetch keeps between
 /// requests, so a pass over thousands of sessions reuses a handful of
 /// connections instead of opening four per session. (A fresh connection per
@@ -583,13 +615,17 @@ fn send_once(
     }
     head.push_str("\r\n");
 
+    // From the name lookup to the last byte of the response this thread is
+    // blocked, which the freeze watchdog reads as waiting while the exchange
+    // moves (watchdog::network_wait).
+    let wait = crate::watchdog::network_wait(timeout_ms);
     let mut pooled = take_idle(&key);
     loop {
         let (mut stream, reused) = match pooled.take() {
             Some(s) => (s, true),
             None => (connect()?, false),
         };
-        match exchange(&mut stream, &head, body, method, deadline, label, timeout_ms, progress) {
+        match exchange(&mut stream, &head, body, method, deadline, label, timeout_ms, &wait, progress) {
             Ok((resp, keep)) => {
                 if keep {
                     put_idle(&key, stream);
@@ -619,10 +655,12 @@ fn exchange(
     deadline: Duration,
     label: &str,
     timeout_ms: u64,
+    wait: &crate::watchdog::NetworkWait,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<(Response, bool), (NetError, bool)> {
     let _ = stream.tcp().set_read_timeout(Some(deadline));
     let _ = stream.tcp().set_write_timeout(Some(deadline));
+    let mut stream = Watched { conn: stream, wait };
     let io = |e: std::io::Error, started: bool| (map_io(e, label, timeout_ms), started);
     stream.write_all(head.as_bytes()).map_err(|e| io(e, false))?;
     if let Some(b) = body {
