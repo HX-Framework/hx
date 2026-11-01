@@ -7,10 +7,24 @@
 //! so the service manager starts a fresh daemon. The resident size is read
 //! from /proc on Linux; on other platforms only the freeze check runs in this
 //! build.
+//!
+//! What counts as a beat. hx beats from a one-second timer on its event loop,
+//! and that loop keeps running while hx awaits a timer, a file read or a
+//! fetch, so only code that never yields stops it. Here a thread blocks in
+//! that same work instead, so the work beats for itself: the crash-loop
+//! backoff once a second, the Claude Desktop index once per file, and a
+//! network call holds a `NetworkWait` for as long as it blocks. Without that,
+//! hx2 read every such wait of a minute as a freeze. On 2026-10-24 a Mac's
+//! daemon was killed three times in ten minutes, each time after it asked the
+//! gateway for a session's route and before it asked for the upload URL, the
+//! stretch in which it refreshes the Claude Desktop index. From then on each
+//! start served a backoff of one minute or more, the backoff itself tripped
+//! the freeze limit, and that kill was the next abnormal exit. The daemon
+//! uploaded nothing for days.
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +37,65 @@ pub const FREEZE_SECONDS_MIN: f64 = 10.0;
 pub const MEMORY_CEILING_MB_DEFAULT: f64 = 1536.0;
 pub const MEMORY_CEILING_MB_MIN: f64 = 512.0;
 const CHECK_MS: u64 = 250;
+/// How long past its own deadline a network call still counts as waiting.
+const NETWORK_WAIT_GRACE_MS: u64 = 15_000;
+
+/// Beats from any thread, added to the `Watchdog`'s own counter.
+static PROCESS_BEAT: AtomicU64 = AtomicU64::new(0);
+/// Threads blocked in a network call right now.
+static NETWORK_WAITS: AtomicUsize = AtomicUsize::new(0);
+/// The latest moment (ms since the epoch) a blocked network call may still be
+/// waiting: the last block it sent or received, plus its timeout, plus
+/// NETWORK_WAIT_GRACE_MS. It only moves forward.
+static NETWORK_WAIT_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// One beat from the calling thread, for work that runs long on purpose.
+pub fn beat() {
+    PROCESS_BEAT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Held for as long as a thread is blocked in a network call; see `network_wait`.
+#[must_use = "the wait lasts as long as the guard is held"]
+pub struct NetworkWait {
+    timeout_ms: u64,
+}
+
+/// The calling thread is about to block in a network call in which no single
+/// wait outlasts `timeout_ms` (its socket timeouts). Until the guard drops,
+/// the watchdog reads the process as waiting, not frozen, as long as the call
+/// has sent or received something within its timeout plus
+/// NETWORK_WAIT_GRACE_MS. A long upload that keeps moving never trips the
+/// freeze limit; a call stuck past its own deadline still does.
+pub fn network_wait(timeout_ms: u64) -> NetworkWait {
+    NETWORK_WAITS.fetch_add(1, Ordering::SeqCst);
+    let wait = NetworkWait { timeout_ms };
+    wait.progress();
+    wait
+}
+
+impl NetworkWait {
+    /// A block was sent or received: the wait starts over.
+    pub fn progress(&self) {
+        let until = now_ms() as u64 + self.timeout_ms + NETWORK_WAIT_GRACE_MS;
+        NETWORK_WAIT_UNTIL_MS.fetch_max(until, Ordering::SeqCst);
+        beat();
+    }
+}
+
+impl Drop for NetworkWait {
+    fn drop(&mut self) {
+        NETWORK_WAITS.fetch_sub(1, Ordering::SeqCst);
+        beat();
+    }
+}
+
+fn network_waiting(now: u64) -> bool {
+    NETWORK_WAITS.load(Ordering::SeqCst) > 0 && now < NETWORK_WAIT_UNTIL_MS.load(Ordering::SeqCst)
+}
+
+fn total_beats(own: &AtomicU64) -> u64 {
+    own.load(Ordering::Relaxed).wrapping_add(PROCESS_BEAT.load(Ordering::Relaxed))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct WatchdogLimits {
@@ -110,15 +183,15 @@ pub fn start_watchdog_thread(limits: WatchdogLimits, log_path: PathBuf, marker: 
     std::thread::Builder::new()
         .name("hx-watchdog".to_string())
         .spawn(move || {
-            let mut last_beat = beat.load(Ordering::Relaxed);
+            let mut last_beat = total_beats(&beat);
             let mut stale_checks: u64 = 0;
             loop {
                 std::thread::sleep(Duration::from_millis(CHECK_MS));
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
-                let b = beat.load(Ordering::Relaxed);
-                if b != last_beat {
+                let b = total_beats(&beat);
+                if b != last_beat || network_waiting(now_ms() as u64) {
                     last_beat = b;
                     stale_checks = 0;
                 } else {
@@ -162,4 +235,27 @@ pub fn start_watchdog_thread(limits: WatchdogLimits, log_path: PathBuf, marker: 
         })
         .ok();
     wd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_network_wait_counts_as_waiting_until_its_timeout_and_grace_pass() {
+        let wait = network_wait(1_000);
+        let now = now_ms() as u64;
+        assert!(network_waiting(now));
+        // Long past the deadline and the grace, the same wait reads as a freeze.
+        assert!(!network_waiting(now + 1_000 + NETWORK_WAIT_GRACE_MS + 3_600_000));
+        drop(wait);
+    }
+
+    #[test]
+    fn a_beat_from_any_thread_moves_the_count_the_watchdog_reads() {
+        let own = AtomicU64::new(0);
+        let before = total_beats(&own);
+        std::thread::spawn(beat).join().unwrap();
+        assert_ne!(total_beats(&own), before);
+    }
 }

@@ -198,7 +198,19 @@ fn cmd_watch(name: &str, args: &[String]) {
         ctx.log(&line);
     }
     if run.delay_ms > 0.0 {
-        std::thread::sleep(std::time::Duration::from_millis(run.delay_ms as u64));
+        // hx waits on a timer, and its event loop beats all the while. This
+        // thread sleeps instead, so it beats once a second: a silent backoff of
+        // a minute or more trips the freeze limit, and that kill is the next
+        // abnormal exit, so the backoff would never end (watchdog.rs).
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(run.delay_ms as u64);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= end {
+                break;
+            }
+            std::thread::sleep((end - now).min(std::time::Duration::from_secs(1)));
+            watchdog::beat();
+        }
     }
     // Reload the watchdog limits from settings every 30 s while the loop runs.
     let wd_limits = Arc::new(wd);

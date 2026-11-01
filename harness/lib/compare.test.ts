@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { compareRuns, loadRun, readsScopedCcdStore } from "./compare.js";
+import { compareRuns, loadRun, readsScopedCcdStore, sendsSideSessions, withoutSideSessions } from "./compare.js";
 import type { RunMeta, Scenario } from "./types.js";
 
 // Both runs of a scenario generate their homes from one fixture clock
@@ -104,14 +104,35 @@ describe("compareRuns with one fixture clock for both runs", () => {
 });
 
 describe("readsScopedCcdStore", () => {
-  it("holds hx from 77.14.0 and hx2 from 78.0.1 to the per-account Claude Desktop store", () => {
+  it("holds hx from 77.15.1 and hx2 from 78.0.3 to the per-account Claude Desktop fixture", () => {
     expect(readsScopedCcdStore({ name: "hx", version: "77.11.0" })).toBe(false);
     expect(readsScopedCcdStore({ name: "hx", version: "77.13.9" })).toBe(false);
-    expect(readsScopedCcdStore({ name: "hx", version: "77.14.0" })).toBe(true);
+    expect(readsScopedCcdStore({ name: "hx", version: "77.14.0" })).toBe(false);
+    expect(readsScopedCcdStore({ name: "hx", version: "77.15.0" })).toBe(false);
+    expect(readsScopedCcdStore({ name: "hx", version: "77.15.1" })).toBe(true);
     expect(readsScopedCcdStore({ name: "hx", version: "78.0.0" })).toBe(true);
     expect(readsScopedCcdStore({ name: "hx2", version: "78.0.0" })).toBe(false);
-    expect(readsScopedCcdStore({ name: "hx2", version: "78.0.1" })).toBe(true);
+    expect(readsScopedCcdStore({ name: "hx2", version: "78.0.2" })).toBe(false);
+    expect(readsScopedCcdStore({ name: "hx2", version: "78.0.3" })).toBe(true);
     expect(readsScopedCcdStore({ name: "hx2", version: "79.0.0" })).toBe(true);
     expect(readsScopedCcdStore({ name: "hx", version: "dev" })).toBe(true);
+  });
+});
+
+describe("side sessions in the fixture", () => {
+  it("holds hx from 77.16.0 and hx2 from 78.0.5 to each group's side sessions", () => {
+    expect(sendsSideSessions({ name: "hx", version: "77.15.1" })).toBe(false);
+    expect(sendsSideSessions({ name: "hx", version: "77.16.0" })).toBe(true);
+    expect(sendsSideSessions({ name: "hx2", version: "78.0.3" })).toBe(false);
+    expect(sendsSideSessions({ name: "hx2", version: "78.0.4" })).toBe(false);
+    expect(sendsSideSessions({ name: "hx2", version: "78.0.5" })).toBe(true);
+    expect(sendsSideSessions({ name: "hx", version: "dev" })).toBe(true);
+  });
+
+  it("drops a group's side sessions, and the archived ones from archivedIds, for an older client", () => {
+    const g = { id: "g", name: "G", subtitle: null, sectionName: null, collapsed: false, sessionIds: ["m", "x"], sideSessions: [{ id: "s", parent: "m" }] };
+    const older = withoutSideSessions({ groupingEnabled: true, groups: [g], unreadIds: [], archivedIds: ["x", "s"] });
+    expect(older.groups[0]).toEqual({ id: "g", name: "G", subtitle: null, sectionName: null, collapsed: false, sessionIds: ["m", "x"] });
+    expect(older.archivedIds).toEqual(["x"]);
   });
 });

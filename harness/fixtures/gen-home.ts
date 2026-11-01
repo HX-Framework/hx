@@ -102,10 +102,11 @@ export interface ExpectedGroupMirror {
     ascending?: boolean | null;
     shown?: boolean;
     showEmpty?: boolean;
+    sideSessions?: Array<{ id: string; parent: string }>;
   }>;
   unreadIds: string[];
   /** The scoped layouts: which one, CCD's session filter, the archived
-   *  members, the hashed account. */
+   *  members and side sessions, the hashed account. */
   layout?: string;
   statusFilter?: string | null;
   archivedIds?: string[];
@@ -146,6 +147,7 @@ export interface Manifest {
 export interface ExpectedCodexSection {
   id: string;
   name: string;
+  sectionName?: string;
   collapsed: boolean;
   sessionIds: string[];
   showEmpty: boolean;
@@ -407,11 +409,20 @@ const CODEX_PINNED_SECTION_ID = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
  *             subagent thread and c3 (no row: deleted) are left out
  *   Pinned    the app-server's pinned thread, then an older pin it has not
  *             taken over yet
- *   Old work  (collapsed) the project placed in it: x1 under the repo's
- *             root first (newest, missing from the saved order), then c2
- *             (assigned to the project by hand, the saved order); c1 is
- *             under the root too but Review keeps it
+ *   Old work  (collapsed) the project placed in it, newest first (a manual
+ *             sort without manualSortVersion 1 reads as updated_at): a
+ *             thread in a Codex worktree that Codex filed under the repo
+ *             (thread-workspace-root-hints), then c2 (assigned by hand); c1's
+ *             cwd is the repo's root too, but Review keeps it
  *   Empty     no threads
+ *   Projects  a row per project neither pinned nor placed in a section, in
+ *             project-order: tools (collapsed by its row atom) with its one
+ *             thread, then notes, drawn empty (its threads are pinned, in a
+ *             section, filed under the repo, hidden or spawned)
+ *   Recents   the rest, newest first: a thread in a subfolder of the repo
+ *             (Codex matches a cwd to a root by equality only) and one in a
+ *             dated ~/Documents/Codex folder; a thread assigned to a project
+ *             that is gone shows nowhere
  * The other account's section never shows. The change written during a run
  * renames Review, collapses it, and moves its second thread into Empty.
  */
@@ -419,6 +430,10 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
   const rng = new Prng("codex-sections");
   const [c1, c2, c3, c4] = ids as [string, string, string, string];
   const x = { listed: rng.uuid(), archived: rng.uuid(), subagent: rng.uuid(), underRoot: rng.uuid(), pinned: rng.uuid(), oldPin: rng.uuid() };
+  // A generator of its own, so the threads above keep their ids.
+  const rng2 = new Prng("codex-projects");
+  const y = { worktree: rng2.uuid(), dated: rng2.uuid(), hidden: rng2.uuid(), spawned: rng2.uuid(), orphan: rng2.uuid(), tools: rng2.uuid() };
+  const toolsRoot = join(ctx.home, "work", "tools");
   const row = (id: string, o: { archived?: number; source?: string; threadSource?: string; cwd: string; recency: number; section?: string; position?: number }): void => {
     db.run(
       "INSERT INTO threads (id, title, created_at, archived, source, preview, thread_source, cwd, recency_at_ms, thread_section_id, section_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -435,6 +450,14 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
   row(x.underRoot, { cwd: join(dirs.repo, "packages", "core"), recency: CONTENT_EPOCH + 7 * HOUR });
   row(x.pinned, { cwd: dirs.scratch, recency: CONTENT_EPOCH + 2 * HOUR, section: CODEX_PINNED_SECTION_ID, position: 1000 });
   row(x.oldPin, { cwd: dirs.scratch, recency: CONTENT_EPOCH + HOUR });
+  row(y.worktree, { cwd: join(ctx.home, ".codex", "worktrees", "k3f9", "acme-repo"), recency: CONTENT_EPOCH + 6 * HOUR });
+  row(y.dated, { cwd: join(ctx.home, "Documents", "Codex", "2026-10-12-sketch"), recency: CONTENT_EPOCH + 5 * HOUR });
+  row(y.hidden, { threadSource: "chatgpt_hidden", cwd: dirs.scratch, recency: CONTENT_EPOCH + 4 * HOUR });
+  row(y.spawned, { cwd: dirs.scratch, recency: CONTENT_EPOCH + 3 * HOUR });
+  row(y.orphan, { cwd: join(dirs.scratch, "orphan"), recency: CONTENT_EPOCH + 4.5 * HOUR });
+  row(y.tools, { cwd: toolsRoot, recency: CONTENT_EPOCH + 2.5 * HOUR });
+  db.run("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL)");
+  db.run("INSERT INTO thread_spawn_edges VALUES (?, ?, 'completed')", [c1, y.spawned]);
   void c4; // archived, under the repo's root: never listed
 
   const item = (id: string): string => `codex:thread:local:${id}`;
@@ -444,8 +467,11 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
     "local-projects": {
       "local-repo": { id: "local-repo", name: "acme-repo", rootPaths: [dirs.repo], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
       "local-scratch": { id: "local-scratch", name: "notes", rootPaths: [dirs.scratch], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
+      "local-tools": { id: "local-tools", name: " tools ", rootPaths: [toolsRoot], createdAt: CONTENT_EPOCH, updatedAt: CONTENT_EPOCH },
     },
-    "thread-project-assignments": { [c2]: { projectKind: "local", projectId: "local-repo" } },
+    "project-order": ["local-tools", "local-scratch"],
+    "thread-project-assignments": { [c2]: { projectKind: "local", projectId: "local-repo" }, [y.orphan]: { projectKind: "local", projectId: "local-gone" } },
+    "thread-workspace-root-hints": { [y.worktree]: dirs.repo },
     "projectless-thread-ids": [],
     "sidebar-project-thread-orders": { "local-repo": { threadIds: [c2, x.subagent] } },
     "pinned-thread-ids": [x.oldPin, x.pinned],
@@ -471,6 +497,8 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
       },
       "chatgpt-sidebar-state-v1": { "acct-fixture": { pinnedConversations: [], projects: [], pinnedProjects: [] } },
       "flat-project-sidebar-preferences-v1": { chatSortMode: "updated_at", initialized: true, mode: "project", projectSortMode: "manual" },
+      "sidebar-project-expanded-v1-codex:local-tools": false,
+      "sidebar-collapsed-sections-v1": { chats: false, pinned: false, threads: false },
     },
   });
   const reviewItems = [item(c1), item(x.listed), item(x.archived), item(x.subagent), item(c3)];
@@ -479,10 +507,12 @@ function writeCodexSidebar(ctx: Ctx, db: Database, ids: string[], dirs: { repo: 
   ctx.manifest.codexChange = { file: ".codex/.codex-global-state.json", contentBase64: Buffer.from(JSON.stringify(changed)).toString("base64") };
   ctx.manifest.codexHome = true;
   const section = (id: string, name: string, collapsed: boolean, sessionIds: string[]): ExpectedCodexSection => ({ id, name, collapsed, sessionIds, showEmpty: true });
+  const projectRow = (pid: string, name: string, collapsed: boolean, sessionIds: string[]): ExpectedCodexSection => ({ id: `project:${pid}`, name, sectionName: "Projects", collapsed, sessionIds, showEmpty: true });
   const pinned = section("pinned", "Pinned", false, [x.pinned, x.oldPin]);
-  const old = section("sec-old", "Old work", true, [x.underRoot, c2]);
-  ctx.manifest.expectations.codexSections = [section("sec-review", "Review", false, [c1, x.listed]), pinned, old, section("sec-empty", "Empty", false, [])];
-  ctx.manifest.expectations.codexSectionsAfterChange = [section("sec-review", "Review this week", true, [c1]), pinned, old, section("sec-empty", "Empty", false, [x.listed])];
+  const old = section("sec-old", "Old work", true, [y.worktree, c2]);
+  const below = [projectRow("local-tools", "tools", true, [y.tools]), projectRow("local-scratch", "notes", false, []), section("recents", "Recents", false, [x.underRoot, y.dated])];
+  ctx.manifest.expectations.codexSections = [section("sec-review", "Review", false, [c1, x.listed]), pinned, old, section("sec-empty", "Empty", false, []), ...below];
+  ctx.manifest.expectations.codexSectionsAfterChange = [section("sec-review", "Review this week", true, [c1]), pinned, old, section("sec-empty", "Empty", false, [x.listed]), ...below];
 }
 
 function codexRollout(spec: CodexSessionSpec): { name: string; content: string } {
@@ -872,6 +902,42 @@ function writeScopedCcdStore(
       JSON.stringify({ sessionId: localId, ...(cliSessionId ? { cliSessionId } : {}), title: `Second account session ${idx}`, titleSource: "user", isArchived: false, lastActivityAt: CONTENT_EPOCH + idx * HOUR, cwd: f.repo }),
     );
   }
+  // Side sessions, which CCD draws under the session they were spawned from,
+  // in its group: two under Alpha's member (one with a side session of its
+  // own), an archived one under Gamma's, one under the second account's group,
+  // and two spawned from Alpha's member that are not side sessions (a task
+  // card, a detached lineage). A generator of their own keeps every id above.
+  const rs = new Prng(`${ctx.manifest.seed}:ccd-side`);
+  const side = (parent: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({ spawnedFrom: { sessionId: parent, taskId: `task_${rs.alnum(8)}`, title: "Side task", sideSession: true, name: "side" }, ...extra });
+  const s1 = `local_${rs.uuid()}`;
+  const s1Cli = rs.uuid();
+  const s2 = `local_${rs.uuid()}`;
+  const s3 = `local_${rs.uuid()}`;
+  const s3Cli = rs.uuid();
+  const s4 = `local_${rs.uuid()}`;
+  const s5 = `local_${rs.uuid()}`;
+  const s6 = `local_${rs.uuid()}`;
+  const s6Cli = rs.uuid();
+  const sb = `local_${rs.uuid()}`;
+  const sbCli = rs.uuid();
+  const sideFiles: Array<[string, string, Record<string, unknown>]> = [
+    [A, s1, { cliSessionId: s1Cli, ...side(ids.repoCli) }],
+    [A, s2, side(s1)],
+    [A, s3, { cliSessionId: s3Cli, ...side(ids.repoDesktop), isArchived: true }],
+    [A, s4, { spawnedFrom: { sessionId: ids.repoCli, taskId: "task_card", title: "A card" } }],
+    [A, s5, side(ids.repoCli, { lineageDetached: true })],
+    [A, s6, { cliSessionId: s6Cli, ...side(ids.repoCli) }],
+    [B, sb, { cliSessionId: sbCli, ...side(b1) }],
+  ];
+  // writeCcd, like the other Claude Desktop files: the saved index records
+  // their mtimes and their folders', and the byte check compares them.
+  sideFiles.forEach(([scope, localId, extra], i) => {
+    writeCcd(
+      ctx,
+      `${f.ccdRoot}/claude-code-sessions/${scope}/${localId}.json`,
+      JSON.stringify({ sessionId: localId, title: `Side session ${i}`, titleSource: "user", isArchived: false, lastActivityAt: CONTENT_EPOCH + i * HOUR, cwd: f.repo, ...extra }),
+    );
+  });
   const code = (id: string): string => `code:${id}`;
   const show = { metadata: false, emptyGroups: false, sideChats: false };
   const builtin = (id: string, order: number, extra: Record<string, unknown> = {}): Record<string, unknown> => ({ id, kind: id, v: 2, name: "", order, sortBy: "recency", ascending: false, show, collapsed: false, shown: true, groupBy: "none", ...extra });
@@ -911,18 +977,28 @@ function writeScopedCcdStore(
       },
       codeSidebarByScope: {
         [A]: {
+          // Read as CCD draws them: alpha with a stored false is A to Z; a
+          // group's own `shown` and `show.emptyGroups` are never read (only
+          // Routines can be switched off; "show empty groups" lives on the
+          // Sessions section).
           sections: [
             builtin("pinned", 0, { collapsed: true }),
             builtin("routines", 1, { shown: false }),
-            manual("cg-gamma", "Gamma", 2, [ids.repoDesktop], { sortBy: "alpha", ascending: true }),
-            manual("cg-alpha", alphaName, 3, [ids.repoCli], { collapsed: true }),
+            manual("cg-gamma", "Gamma", 2, [ids.repoDesktop], { sortBy: "alpha", ascending: false }),
+            manual("cg-alpha", alphaName, 3, [ids.repoCli], { collapsed: true, shown: false }),
             manual("cg-beta", "Beta", 4, [ids.unknown, ids.archived, ids.noCli], { show: { ...show, emptyGroups: true } }),
             builtin("sessions", 5),
           ],
           migratedFrom: 1,
           prefsSeeded: true,
         },
-        [B]: { sections: [builtin("pinned", 0), manual("cg-old", "Old Project", 2, [b1, b2]), builtin("sessions", 3)], migratedFrom: 1, prefsSeeded: true },
+        // No stored sort (CCD reads "recency", newest first), and "show empty
+        // groups" switched on.
+        [B]: {
+          sections: [builtin("pinned", 0), manual("cg-old", "Old Project", 2, [b1, b2], { sortBy: undefined, ascending: undefined }), builtin("sessions", 3, { show: { ...show, emptyGroups: true } })],
+          migratedFrom: 1,
+          prefsSeeded: true,
+        },
       },
       pendingLegacyGroupMigration: null,
       lastSidebarScopeKey: live,
@@ -959,24 +1035,29 @@ function writeScopedCcdStore(
   };
 
   const hash16 = (s: string): string => createHash("sha256").update(s).digest("hex").slice(0, 16);
-  const group = (id: string, name: string, collapsed: boolean, sessionIds: string[], sortBy: string, ascending: boolean, showEmpty: boolean) => ({ id, name, subtitle: null, sectionName: null, collapsed, sessionIds, sortBy, ascending, shown: true, showEmpty });
+  const group = (id: string, name: string, collapsed: boolean, sessionIds: string[], sortBy: string, ascending: boolean, showEmpty: boolean, sideSessions: Array<{ id: string; parent: string }> = []) => ({ id, name, subtitle: null, sectionName: null, collapsed, sessionIds, sortBy, ascending, shown: true, showEmpty, sideSessions });
+  // Alpha's member has two side sessions, taken in id order, and s1 has one
+  // of its own: depth first, it comes right after s1.
+  const s1Tree = [{ id: s1Cli, parent: f.repoCli }, { id: s2, parent: s1Cli }];
+  const s6Entry = { id: s6Cli, parent: f.repoCli };
+  const alphaSide = s1 < s6 ? [...s1Tree, s6Entry] : [s6Entry, ...s1Tree];
   const unreadIds = [f.repoCli, f.unknownCli];
   ctx.manifest.expectations.groupMirror = {
     groupingEnabled: true,
     groups: [
-      group("cg-gamma", "Gamma", false, [f.repoDesktop], "alpha", true, false),
-      group("cg-alpha", "Alpha", true, [f.repoCli], "created", false, false),
-      group("cg-beta", "Beta", false, [f.unknownCli, f.archivedCli, ids.noCli], "created", false, true),
+      group("cg-gamma", "Gamma", false, [f.repoDesktop], "alpha", true, false, [{ id: s3Cli, parent: f.repoDesktop }]),
+      group("cg-alpha", "Alpha", true, [f.repoCli], "created", false, false, alphaSide),
+      group("cg-beta", "Beta", false, [f.unknownCli, f.archivedCli, ids.noCli], "created", false, false),
     ],
     unreadIds,
     layout: "sections",
     statusFilter: "active",
-    archivedIds: [f.archivedCli],
+    archivedIds: [f.archivedCli, s3Cli],
     scope: hash16(A),
   };
   ctx.manifest.expectations.groupMirrorAfterSwitch = {
     groupingEnabled: true,
-    groups: [group("cg-old", "Old Project", false, [b1Cli, b2], "created", false, false)],
+    groups: [group("cg-old", "Old Project", false, [b1Cli, b2], "recency", false, true, [{ id: sbCli, parent: b1Cli }])],
     unreadIds,
     layout: "sections",
     statusFilter: "active",

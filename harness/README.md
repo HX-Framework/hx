@@ -39,7 +39,14 @@ long-running `hx watch` killed with SIGKILL, or a long-running `hx watch` left
 to run for a fixed time (a transcript may grow while it runs) and then
 stopped with SIGTERM. The reference runs first, then the candidate, both
 against the same home path (transcript contents embed their cwd, so the
-stored bytes must match byte for byte).
+stored bytes must match byte for byte). HOME isolates everything a binary
+touches except launchd, which keeps one domain per user whatever HOME says:
+on a Mac, a step that starts, restarts or stops the service (`update`,
+`start`, `restart`, `stop`, `uninstall`, `connect` without `--no-start`)
+would replace the Mac's own `ai.let.hx-vision` job with the fixture's. So the
+driver refuses such a scenario on macOS outside GitHub Actions
+(`serviceSteps` in `run/run-scenario.ts`); on 2026-10-28 a local `baseline`
+run left a Mac's daemon down for two days.
 
 ### Fixture shapes
 
@@ -93,7 +100,7 @@ stat pool returned first, an order no port can be held to.
 | `fortress-direct` | a fortress-direct route | Session bytes go to the second gateway with the capability token; sidecars and child lanes stay on the cloud gateway |
 | `daemon-backoff` | a held vault, every workflow upload 503, a transcript grows 12 s in | The long-running daemon for 50 s then SIGTERM: held sessions retry on their 20 s backoff, the workflow sidecar retries on its own backoff (77.12) instead of every tick, the stuck line is logged once per hold, the grown transcript uploads within the run (file events or polling, never a fresh process's first sweep), and `hx status` reads a current snapshot after the stop |
 | `ccd-accounts` | the per-account Claude Desktop store; an account switch 6 s into a 15 s daemon run | The mirror is the live account's drawn groups, from the newest write wherever it sits; after the switch the second account's mirror is uploaded within 3 s (the leveldb watch: the 20 s mirror timer never fires in the run) |
-| `codex-sections` | Codex Desktop's sidebar; a transcript grows before the daemon run, so its first pass has an upload; a change to the sidebar 5 s into a 12 s daemon run, written the way Codex writes it (a temp file renamed over the old one) | The group mirror carries Codex's sections as `codex`; after the change the changed sections are uploaded within 3 s (the watch on the Codex home: the 20 s mirror timer never fires in the run) |
+| `codex-sections` | Codex Desktop's sidebar: sections, Pinned, a project placed in a section, project rows (one collapsed, one empty) in a saved order, Recents; threads in a repo subfolder, a Codex worktree, a dated `~/Documents/Codex` folder; hidden, spawned and orphaned threads; a transcript grows before the daemon run, so its first pass has an upload; a change to the sidebar 5 s into a 12 s daemon run, written the way Codex writes it (a temp file renamed over the old one) | The group mirror carries Codex's sidebar as `codex`; after the change the changed sidebar is uploaded within 3 s (the watch on the Codex home: the 20 s mirror timer never fires in the run) |
 | `paused`, `excluded` | settings | Pause/resume; the personal gate and an exclude rule |
 
 Fault scenarios run with `tuning.uploadConcurrency: 1`, so which file hits a
@@ -110,7 +117,7 @@ fault first is not a race.
 | `ccd-index.json` | The saved Claude Desktop index (77.12), when the reference writes one; a reference that predates it says nothing about the candidate, a candidate that drops it while the reference writes it fails. Compared twice: normalized, and byte for byte per entry (`ccd-index.json bytes`): each file is exactly what `JSON.stringify` writes for its own content, the top-level keys come in the same order, and every `dirs` and `files` entry is byte-identical to the reference's for the same path. Not compared: `savedAtMs` (the save's clock) and the order of the `files` entries, which the reference writes in the order its 32 parallel stat-and-read workers complete, so two reference runs on one tree differ there. The fixture gives the Claude Desktop store fixed mtimes with sub-millisecond fractions (`ccdMtimeSec` in `fixtures/gen-home.ts`), so both runs stat the same stamps |
 | CLI steps | Exit code or signal; normalized stdout and stderr (sorted lines for pooled passes; for a long-running daemon step the SET of distinct lines, with the per-tick `uploaded=`/`failed=` counters summed over the run and the pass-level backoff's length masked — which tick a session's retry lands in follows the clock, and the backoff doubles once per failing tick in a row) |
 | `hx ui` | Every probe's status and normalized JSON |
-| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); with the per-account store, the second account's mirror is uploaded within 3 s of the switch (the check names the measured time); Codex titles come from `state_5.sqlite`; the mirror's `codex` equals the signed-in account's saved sidebar on every platform, and after a change the changed sections are uploaded within 3 s (hx from 77.15.0, hx2 from 78.0.2); every discovered session reached the store |
+| Fixture expectations | The uploaded group mirror equals what the leveldb encodes (macOS); with the per-account store, the second account's mirror is uploaded within 3 s of the switch (the check names the measured time); Codex titles come from `state_5.sqlite`; the mirror's `codex` equals the signed-in account's saved sidebar on every platform, its project rows and Recents included, and after a change the changed sidebar is uploaded within 3 s (hx from 77.16.2, hx2 from 78.0.7); every discovered session reached the store |
 | Coverage | All 24 calls of the protocol appear in the reference recording |
 
 Normalization (`lib/normalize.ts`) hides exactly: the candidate's name (`hx2`
@@ -126,7 +133,11 @@ paths, local ports, pids and launch tokens, and the two numbers in the stuck
 line (`waiting out a retry backoff for another <n> min (<n> consecutive
 failures`): the countdown is measured against the moment the tick ran and the
 failure count climbs with every retry a run had time for, so both follow
-timing — the reason and the hold it names are the fact. Object key order is
+timing — the reason and the hold it names are the fact. The Codex title
+sweep's version is masked too, in its log line (`[retitle] v<n>:`) and in the
+`titleSyncVersion` stamp `state.json` keeps per file: hx 77.16.1 and hx2
+78.0.6 raised it to sweep once more, and a fresh home sweeps every file under
+any version, so the counts and the stamp's presence are the fact. Object key order is
 not compared either: the client adds a top-level key to `state.json` when it
 first records that kind of fact, so the order follows which session it
 ingested first.
@@ -267,7 +278,7 @@ to run outside CI or over an existing path (`harness/run/service-home.ts`).
 pages the allocator has handed back through `malloc_zone_pressure_relief`,
 the footprint does not.
 
-### Contract taught for the per-account Claude Desktop reader (77.14.0, hx2 78.0.1)
+### Contract taught for the per-account Claude Desktop reader (77.15.1, hx2 78.0.3)
 
 Claude Desktop now keeps its sidebar per account, and the drawn sections apart
 from the group list; the reader it replaced read fields current builds no
@@ -275,11 +286,16 @@ longer write. On the flat store every scenario but `ccd-accounts` uses,
 nothing changed: the flat fixture is byte-identical, and so is everything
 compared. On the per-account store a client that predates the reader uploads
 another mirror (77.11.0 latches onto the older build's leftover `frame-store`
-and uploads its stale group), so:
+and uploads its stale group). hx 77.14.0 and 77.15.0 (hx2 78.0.1 and 78.0.2)
+read the per-account store but sent each group's stored sort direction, which
+for alphabetical sorting is the opposite of the one Claude Desktop draws, and
+each group's own "show empty" flag, which Claude Desktop never reads; the
+fixture holds clients to the drawn values, so hx is held from 77.15.1 and hx2
+from 78.0.3. So:
 
 | What a server, a person or the UI can see | Rule |
 | --- | --- |
-| The mirror is the live account's drawn groups, and follows a write within about a second | a run whose version predates the reader (hx before 77.14.0, hx2 before 78.0.1) is not held to the per-account fixture; when the reference predates it, its `/sessions/group-mirror` requests, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison, and the candidate is held to the fixture instead. A reference that has the reader is compared as before |
+| The mirror is the live account's drawn groups, and follows a write within about a second | a run whose version predates the reader (hx before 77.15.1, hx2 before 78.0.3) is not held to the per-account fixture; when the reference predates it, its `/sessions/group-mirror` requests, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison, and the candidate is held to the fixture instead. A reference that has the reader is compared as before |
 
 ### Contract taught for Codex sections in the mirror (77.15.0, hx2 78.0.2)
 
@@ -292,6 +308,35 @@ count and keeps another mirror hash, so:
 | What a server, a person or the UI can see | Rule |
 | --- | --- |
 | The mirror carries Codex's sections, and follows a change to them within about a second | a run whose version predates them (hx before 77.15.0, hx2 before 78.0.2) is not held to the Codex fixture; when the reference predates them, its `/sessions/group-mirror` requests, the stored mirror, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison (the same rule as the per-account reader's), and the candidate is held to the fixture instead. A reference that sends `codex` is compared in full |
+
+### Contract taught for side sessions in the mirror (77.16.0, hx2 78.0.5)
+
+Claude Desktop draws a session spawned as a side session of another under that
+session, in its group, and the side sessions of those in turn. Each group in
+the mirror now lists them as `sideSessions` (each with its `parent`), and the
+archived ones join `archivedIds`. To know a session's parent, each record of
+the saved Claude Desktop index carries `parentId`, so `ccd-index.json` moved to
+format 2. The per-account fixture adds side sessions two levels deep, an
+archived one, one in the second account, and two spawns that are not side
+sessions (a task card, a detached lineage), so:
+
+| What a server, a person or the UI can see | Rule |
+| --- | --- |
+| Each group lists the side sessions Claude Desktop draws in it | a run that reads the per-account store but predates side sessions (hx 77.15.1 and 77.15.2, hx2 78.0.3 and 78.0.4) is held to the fixture without them; when the reference predates them, its mirror requests, the stored mirror, its `[groups]` log lines and its mirror hash leave the comparison, as above |
+| The saved index (`ccd-index.json`) | two runs that save it in different formats are not compared on it; runs in the same format are, as before |
+
+### Contract taught for Codex's project rows and Recents (77.16.2, hx2 78.0.7)
+
+`codex` also carries what Codex draws below its sections: in project mode a
+row per project (`project:<id>`, `sectionName` "Projects"; a pinned project's
+row has `sectionName` "Pinned"), and Recents. A thread belongs to the
+project whose root equals its folder, or the root Codex saved for its
+worktree, as Codex decides it; a client before these versions used the
+deepest root above the folder and sent no rows or Recents, so:
+
+| What a server, a person or the UI can see | Rule |
+| --- | --- |
+| The mirror carries Codex's whole sidebar | a run whose version predates it (hx before 77.16.2, hx2 before 78.0.7) is not held to the Codex fixture; when the reference predates it, its `/sessions/group-mirror` requests, the stored mirror, its `[groups]` log lines and its mirror hash in `state.json` leave the comparison, and the candidate is held to the fixture instead |
 
 ### Goldens
 

@@ -6,7 +6,8 @@ import { join } from "node:path";
 import type { Manifest } from "../fixtures/gen-home.js";
 import { compareRuns, coverageCheck, loadRun } from "../lib/compare.js";
 import type { Scenario } from "../lib/types.js";
-import { runScenario } from "./run-scenario.js";
+import { runScenario, serviceSteps } from "./run-scenario.js";
+import { SCENARIOS } from "./scenarios.js";
 
 // The driver, end to end, against a stub binary: a scenario runs, the
 // recording and the store land in the output dir, two identical runs
@@ -113,4 +114,15 @@ describe.skipIf(process.platform === "win32")("runScenario + compareRuns with a 
       rmSync(work, { recursive: true, force: true });
     }
   }, 60_000);
+});
+
+describe("serviceSteps", () => {
+  it("names the steps that would drive this machine's own service manager", () => {
+    const steps = (args: string[][]): Scenario => ({ ...scenario, steps: args.map((a, i) => ({ kind: "run" as const, name: `s${i}`, args: a })) });
+    expect(serviceSteps(scenario)).toEqual([]);
+    expect(serviceSteps(steps([["update"], ["start"], ["restart"], ["stop"], ["uninstall"]]))).toEqual(["s0", "s1", "s2", "s3", "s4"]);
+    expect(serviceSteps(steps([["connect"], ["connect", "--no-start"], ["status"], ["disconnect"]]))).toEqual(["s0"]);
+    // `baseline` updates the binary, which restarts a loaded service.
+    expect(serviceSteps(SCENARIOS.find((s) => s.name === "baseline")!)).toEqual(["update-same", "update-download"]);
+  });
 });

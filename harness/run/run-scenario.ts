@@ -133,9 +133,30 @@ export function clientEnv(home: string, gateway?: { url: string; token: string }
   return baseEnv(home, gateway);
 }
 
+/** The commands that start, restart or stop the background service. */
+const SERVICE_COMMANDS = new Set(["update", "start", "restart", "stop", "uninstall"]);
+
+/** The scenario's steps that drive the service manager: the commands above,
+ *  and `connect` without `--no-start`. HOME isolates everything else a binary
+ *  touches, but not launchd: it keeps one domain per user, whatever HOME
+ *  says, so on a Mac such a step unloads the Mac's own `ai.let.hx-vision` job
+ *  and loads the fixture's definition in its place. On 2026-10-28 the
+ *  `update` steps of a local `baseline` run did that, and the Mac's daemon
+ *  stayed down until the job was reloaded by hand two days later. */
+export function serviceSteps(scenario: Scenario): string[] {
+  return scenario.steps
+    .filter((s): s is Extract<Step, { kind: "run" }> => s.kind === "run")
+    .filter((s) => SERVICE_COMMANDS.has(s.args[0] ?? "") || (s.args[0] === "connect" && !s.args.includes("--no-start")))
+    .map((s) => s.name);
+}
+
 export async function runScenario(o: DriverOptions): Promise<RunMeta> {
   const log = o.log ?? ((l: string) => process.stderr.write(`${l}\n`));
   const { scenario } = o;
+  const touching = serviceSteps(scenario);
+  if (process.platform === "darwin" && touching.length > 0 && process.env.GITHUB_ACTIONS !== "true") {
+    throw new Error(`scenario ${scenario.name} runs ${touching.join(", ")}, which would replace this Mac's own launchd job: CI runners only`);
+  }
   rmSync(o.outDir, { recursive: true, force: true });
   mkdirSync(join(o.outDir, "steps"), { recursive: true });
   const startedAtMs = Date.now();

@@ -28,7 +28,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import type { RecordedRequest } from "../gateway/gateway.js";
-import type { Manifest } from "../fixtures/gen-home.js";
+import type { ExpectedGroupMirror, Manifest } from "../fixtures/gen-home.js";
 import { isRelTime, normalizeJson, normalizeText, type NormalizeContext, DEFAULT_WINDOW_AFTER_MS, DEFAULT_WINDOW_BEFORE_MS } from "./normalize.js";
 import type { BinaryName, CheckResult, RunMeta, Scenario, StepRecord } from "./types.js";
 
@@ -210,10 +210,13 @@ export interface CompareOptions {
   candidateName: BinaryName;
 }
 
-/** The first versions that read Claude Desktop's per-account store. */
-const SCOPED_CCD_READER: Record<BinaryName, [number, number, number]> = { hx: [77, 14, 0], hx2: [78, 0, 1] };
+/** The first versions that mirror Claude Desktop's per-account sidebar as it
+ *  is drawn. hx 77.14.0 and 77.15.0 (hx2 78.0.1 and 78.0.2) read the store
+ *  but sent the stored sort direction, which for alphabetical sorting is the
+ *  opposite of the drawn one. */
+const SCOPED_CCD_READER: Record<BinaryName, [number, number, number]> = { hx: [77, 15, 1], hx2: [78, 0, 3] };
 
-/** Does this run's binary read the per-account Claude Desktop store? A
+/** Is this run's binary held to the per-account Claude Desktop fixture? A
  *  version that cannot be read is held to it. */
 export function readsScopedCcdStore(meta: Pick<RunMeta, "name" | "version">): boolean {
   const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
@@ -235,16 +238,54 @@ const GROUP_MIRROR_LINE = /\[groups\] (synced \d+ CCD group\(s\)(, \d+ Codex sec
 
 /** The first versions that send Codex Desktop's sections in the group mirror. */
 const CODEX_SECTIONS: Record<BinaryName, [number, number, number]> = { hx: [77, 15, 0], hx2: [78, 0, 2] };
+/** The first versions that send the rest of Codex's sidebar too (its project
+ *  rows and Recents) and match a thread to a project as Codex does. */
+const CODEX_PROJECTS: Record<BinaryName, [number, number, number]> = { hx: [77, 16, 2], hx2: [78, 0, 7] };
+
+/** Is this run's binary at least `since[name]`? A version that cannot be read is. */
+function atLeast(meta: Pick<RunMeta, "name" | "version">, since: Record<BinaryName, [number, number, number]>): boolean {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
+  if (!m) return true;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const s = since[meta.name] ?? since.hx;
+  for (let i = 0; i < 3; i++) if (v[i] !== s[i]) return v[i]! > s[i]!;
+  return true;
+}
 
 /** Does this run's binary send Codex Desktop's sections in the group mirror
  *  (`codex`)? A version that cannot be read is held to it. */
 export function sendsCodexSections(meta: Pick<RunMeta, "name" | "version">): boolean {
+  return atLeast(meta, CODEX_SECTIONS);
+}
+
+/** Does it send Codex's whole sidebar, project rows and Recents included? */
+export function drawsCodexProjects(meta: Pick<RunMeta, "name" | "version">): boolean {
+  return atLeast(meta, CODEX_PROJECTS);
+}
+
+/** The first versions that send each group's side sessions (`sideSessions`). */
+const SIDE_SESSIONS: Record<BinaryName, [number, number, number]> = { hx: [77, 16, 0], hx2: [78, 0, 5] };
+
+/** Does this run's binary send each group's side sessions in the group
+ *  mirror? A version that cannot be read is held to it. */
+export function sendsSideSessions(meta: Pick<RunMeta, "name" | "version">): boolean {
   const m = /(\d+)\.(\d+)\.(\d+)/.exec(meta.version);
   if (!m) return true;
   const v = [Number(m[1]), Number(m[2]), Number(m[3])];
-  const since = CODEX_SECTIONS[meta.name] ?? CODEX_SECTIONS.hx;
+  const since = SIDE_SESSIONS[meta.name] ?? SIDE_SESSIONS.hx;
   for (let i = 0; i < 3; i++) if (v[i] !== since[i]) return v[i]! > since[i]!;
   return true;
+}
+
+/** The fixture's mirror as a client before side sessions uploads it: no
+ *  `sideSessions`, and no archived side session in `archivedIds`. */
+export function withoutSideSessions(want: ExpectedGroupMirror): ExpectedGroupMirror {
+  const side = new Set(want.groups.flatMap((g) => (g.sideSessions ?? []).map((x) => x.id)));
+  return {
+    ...want,
+    groups: want.groups.map(({ sideSessions: _omit, ...g }) => g),
+    ...(want.archivedIds ? { archivedIds: want.archivedIds.filter((id) => !side.has(id)) } : {}),
+  };
 }
 
 export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): CheckResult[] {
@@ -255,24 +296,29 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
   const ctxCand = contextFor(cand, opts.candidateName, versions, tol, "diff");
   const checks: CheckResult[] = [];
 
-  // The per-account Claude Desktop store (77.14.0 / hx2 78.0.1): a reference
-  // that predates its reader uploads another mirror (an older build's
+  // The per-account Claude Desktop store (hx 77.15.1 / hx2 78.0.3): a reference
+  // that predates that mirror uploads another one (an older build's
   // leftover key, or none), logs another group count and keeps another
   // mirror hash. The candidate is held to the fixture instead
   // (fixtureExpectationChecks), so for such a reference those three facts
   // leave the comparison; for a reference that reads the store they stay.
   //
-  // Codex Desktop's sections ride in the same upload (77.15 / hx2 78.0.2): a
-  // reference that sends no `codex` uploads another body, logs another
-  // [groups] line, keeps another hash and makes no upload when only Codex
-  // changed, so the same three facts leave the comparison against it.
+  // Codex Desktop's sidebar rides in the same upload (sections since 77.15 /
+  // hx2 78.0.2; project rows and Recents since 77.16.2 / hx2 78.0.7): a
+  // reference that sends no `codex`, or an older one, uploads another body,
+  // logs another [groups] line, keeps another hash and makes another upload
+  // when only Codex changed, so the same three facts leave the comparison.
+  // So do a group's side sessions (77.16.0 / hx2 78.0.5) on the per-account
+  // store.
   const scopedExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !readsScopedCcdStore(ref.meta);
-  const codexExempt = !sendsCodexSections(ref.meta);
-  const mirrorExempt = scopedExempt || codexExempt;
+  const codexExempt = !drawsCodexProjects(ref.meta);
+  const sideExempt = fixtureManifest(ref)?.ccdLayout === "scoped" && !sendsSideSessions(ref.meta);
+  const mirrorExempt = scopedExempt || codexExempt || sideExempt;
   if (mirrorExempt) {
     const why = [
-      ...(scopedExempt ? ["the per-account Claude Desktop reader"] : []),
-      ...(codexExempt ? ["Codex Desktop's sections in the mirror"] : []),
+      ...(scopedExempt ? ["the per-account Claude Desktop mirror (hx 77.15.1, hx2 78.0.3)"] : []),
+      ...(codexExempt ? ["Codex Desktop's whole sidebar in the mirror (hx 77.16.2, hx2 78.0.7)"] : []),
+      ...(sideExempt ? ["side sessions in the mirror (hx 77.16.0, hx2 78.0.5)"] : []),
     ].join(" and ");
     checks.push({
       name: "group mirror",
@@ -370,6 +416,8 @@ export function compareRuns(ref: RunDir, cand: RunDir, opts: CompareOptions): Ch
     if (a === null && b === null) checks.push({ name: "ccd-index.json", ok: true, details: "neither run wrote one (no Claude Desktop store on this platform, or a client that predates the saved index)" });
     else if (a === null) checks.push({ name: "ccd-index.json", ok: true, details: "the reference predates the saved index; the candidate's is not compared" });
     else if (b === null) checks.push({ name: "ccd-index.json", ok: false, details: "the reference wrote ccd-index.json and the candidate did not" });
+    else if ((a as { v?: unknown }).v !== (b as { v?: unknown }).v)
+      checks.push({ name: "ccd-index.json", ok: true, details: `the runs save the index in different formats (v${String((a as { v?: unknown }).v)} and v${String((b as { v?: unknown }).v)}; v2 gives each record its parentId): not compared` });
     else {
       checks.push(check("ccd-index.json", deepDiff(normalizeJson(a, ctxRef), normalizeJson(b, ctxCand), tolS), "identical after normalization"));
       const refText = readFileSync(join(ref.dir, "ccd-index.json"), "utf8");
@@ -749,11 +797,12 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   const darwin = run.meta.platform === "darwin";
   const scoped = manifest.ccdLayout === "scoped";
   if (scoped && darwin && !readsScopedCcdStore(run.meta)) {
-    checks.push({ name: "fixture: group mirror matches the leveldb", ok: true, details: `${run.meta.name} ${run.meta.version} predates the per-account Claude Desktop reader: not held to this store` });
+    checks.push({ name: "fixture: group mirror matches the leveldb", ok: true, details: `${run.meta.name} ${run.meta.version} predates the per-account Claude Desktop mirror (hx 77.15.1, hx2 78.0.3): not held to this store` });
   } else if (!first) {
     checks.push({ name: "fixture: group mirror uploaded", ok: false, details: "no successful /sessions/group-mirror request" });
   } else {
-    const want = darwin ? manifest.expectations.groupMirror : { groupingEnabled: false, groups: [], unreadIds: [] };
+    const full = manifest.expectations.groupMirror;
+    const want = !darwin ? { groupingEnabled: false, groups: [], unreadIds: [] } : scoped && !sendsSideSessions(run.meta) ? withoutSideSessions(full) : full;
     checks.push(
       check(
         "fixture: group mirror matches the leveldb",
@@ -767,7 +816,8 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   // second account's mirror must be uploaded, and soon — the leveldb watch,
   // not the 20 s mirror timer, which never fires in the run.
   const switched = run.meta.steps.find((s) => s.ccdSwitchTMs !== undefined);
-  const afterWant = manifest.expectations.groupMirrorAfterSwitch;
+  const afterFull = manifest.expectations.groupMirrorAfterSwitch;
+  const afterWant = afterFull && !sendsSideSessions(run.meta) ? withoutSideSessions(afterFull) : afterFull;
   if (scoped && darwin && readsScopedCcdStore(run.meta) && switched && afterWant) {
     const at = switched.ccdSwitchTMs!;
     const hit = mirrors.find((r) => r.tMs >= at && deepDiff(pick(mirrorOf(r) ?? {}, afterWant), afterWant, 0).length === 0);
@@ -786,7 +836,9 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   // Codex does, the changed sections must follow within 3 s: the watch on the
   // Codex home, not the 20 s mirror timer, which never fires in the run. A
   // client before 77.15 (hx2 before 78.0.2) sends no `codex` and is not held
-  // to it.
+  // to it, nor is one before 77.16.2 (hx2 78.0.7), whose `codex` has no
+  // project rows or Recents and files a thread under a project by its folder
+  // rather than as Codex does.
   const codexOf = (r: RecordedRequest | undefined): unknown => {
     const m = mirrorOf(r);
     return m && "codex" in m ? m.codex : undefined;
@@ -794,6 +846,8 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
   const withCodex = mirrors.filter((r) => codexOf(r) !== undefined);
   if (!sendsCodexSections(run.meta)) {
     checks.push({ name: "fixture: codex sections in the group mirror", ok: true, details: `${run.meta.name} ${run.meta.version} predates Codex sections in the mirror: not held to them` });
+  } else if (!drawsCodexProjects(run.meta)) {
+    checks.push({ name: "fixture: codex sections in the group mirror", ok: true, details: `${run.meta.name} ${run.meta.version} predates Codex's project rows and Recents in the mirror: not held to the fixture` });
   } else if (withCodex.length === 0) {
     checks.push({ name: "fixture: codex sections in the group mirror", ok: false, details: "no successful group mirror upload carried `codex`" });
   } else {
@@ -802,7 +856,7 @@ export function fixtureExpectationChecks(run: RunDir, scenario: Scenario): Check
       check(
         "fixture: codex sections in the group mirror",
         deepDiff(codexOf(withCodex[0]), want, 0),
-        want ? `${want.groups.length} sections, ${want.groups.reduce((n, g) => n + g.sessionIds.length, 0)} threads, from the saved sidebar` : "no Codex home: null",
+        want ? `${want.groups.length} groups, ${want.groups.reduce((n, g) => n + g.sessionIds.length, 0)} threads, from the saved sidebar` : "no Codex home: null",
       ),
     );
     const changed = run.meta.steps.find((s) => s.codexChangeTMs !== undefined);
