@@ -64,7 +64,7 @@ describe("classifyUpstreamError", () => {
         {
           vaultOrgId: "org-1",
           reason: "vault_home_unreachable",
-          orgName: "Yaspa Dev",
+          orgName: "Acme Dev",
           orgSlug: null,
           projectId: null,
           projectName: null,
