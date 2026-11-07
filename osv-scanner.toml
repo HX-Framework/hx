@@ -3,7 +3,16 @@
 # ignoreUntil passes, the finding resurfaces in CI and must be re-triaged.
 # See the HX OSS Readiness Plan §1.3 (documented exception per CVE).
 #
-# hx ships zero production dependencies and a small dev toolchain, so there are
-# no active exceptions today. Add an [[IgnoredVulns]] block here — with an id,
-# an ignoreUntil review date, and a reason justifying non-reachability — only
+# hx ships zero production dependencies and a small dev toolchain, so exceptions
+# should stay rare. Add an [[IgnoredVulns]] block here — with an id, an
+# ignoreUntil review date, and a reason justifying non-reachability — only
 # when OSV-Scanner flags an advisory that is genuinely not exploitable here.
+
+# minimatch 10.2.5 is a dev-only dependency of eslint, @eslint/config-array and
+# @typescript-eslint/typescript-estree. The advisory covers >= 7.0.0, < 11.0.1
+# and is fixed only in 11.0.1, while eslint 10 and typescript-eslint 8 require
+# minimatch ^10.2, so no lockfile refresh reaches a fixed version.
+[[IgnoredVulns]]
+id = "GHSA-g3hv-75wg-m249"
+ignoreUntil = 2026-12-07T00:00:00Z
+reason = "Not reachable: the pattern amplification is in firstPhasePreProcess(), which minimatch runs only with optimizationLevel >= 2. The default is 1, and eslint, @eslint/config-array and @typescript-eslint/typescript-estree never set it. minimatch only matches the repository's own lint globs at lint time, and hx ships no production dependencies. Drop this entry once eslint and typescript-eslint accept minimatch 11."
